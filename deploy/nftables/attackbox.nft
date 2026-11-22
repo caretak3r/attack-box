@@ -1,0 +1,143 @@
+#!/usr/sbin/nft -f
+# Attack-box nftables egress firewall
+# Default drop on OUTPUT; allow only New Relic, DNS, NTP, and DHCP
+# Block metadata services before Docker starts
+
+flush ruleset
+
+# New Relic IP ranges (US region)
+define nr_log_api = { 162.247.240.0/22 }
+define nr_metric_api = { 162.247.240.0/22 }
+
+# DNS resolvers (Cloudflare)
+define dns_servers = { 1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001 }
+
+# NTP servers (Cloudflare)
+define ntp_servers = { 162.159.200.123, 162.159.200.1 }
+
+# Metadata service addresses (block)
+define metadata_ipv4 = { 169.254.169.254, 100.100.100.200 }
+define metadata_ipv6 = { fe80:ec2::254/128 }
+
+table inet filter {
+    # Set for shipper UID (populated at runtime)
+    set shipper_uids {
+        type uid
+        flags interval
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+        
+        # Loopback
+        iif lo accept
+        
+        # Established/related
+        ct state established,related accept
+        
+        # ICMP errors (rate-limited)
+        ip protocol icmp icmp type {
+            destination-unreachable,
+            time-exceeded,
+            parameter-problem
+        } limit rate 5/second accept
+        
+        # ICMPv6 NDP and errors
+        icmpv6 type {
+            nd-neighbor-solicit,
+            nd-neighbor-advert,
+            nd-router-advert,
+            destination-unreachable,
+            packet-too-big,
+            time-exceeded,
+            parameter-problem
+        } accept
+        
+        # SSH (comment out after SSH is disabled)
+        tcp dport 22 accept comment "SSH - remove after disablement"
+        
+        # Docker bridge from containers
+        iifname docker0 accept
+        
+        # Drop everything else
+        counter log prefix "INPUT-DROP: " drop
+    }
+    
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        
+        # This chain runs BEFORE Docker's rules due to priority
+        # Established/related for container traffic
+        ct state established,related accept
+        
+        # Block metadata from containers
+        ip daddr $metadata_ipv4 counter log prefix "METADATA-BLOCK: " drop
+        ip6 daddr $metadata_ipv6 counter log prefix "METADATA-BLOCK: " drop
+        
+        # Block private networks from containers
+        ip daddr {
+            10.0.0.0/8,
+            172.16.0.0/12,
+            192.168.0.0/16,
+            127.0.0.0/8
+        } counter log prefix "PRIVATE-BLOCK: " drop
+        
+        # Docker will add its own ACCEPT rules after this
+        # We log and drop everything else
+        counter log prefix "FORWARD-DROP: " drop
+    }
+    
+    chain output {
+        type filter hook output priority filter; policy drop;
+        
+        # Loopback
+        oif lo accept
+        
+        # Established/related
+        ct state established,related accept
+        
+        # Block metadata before anything else
+        ip daddr $metadata_ipv4 counter log prefix "METADATA-BLOCK-OUT: " reject
+        ip6 daddr $metadata_ipv6 counter log prefix "METADATA-BLOCK-OUT: " reject
+        
+        # DNS to Cloudflare only
+        ip daddr $dns_servers udp dport 53 accept
+        ip6 daddr $dns_servers udp dport 53 accept
+        
+        # NTP to Cloudflare only
+        ip daddr $ntp_servers udp dport 123 accept
+        
+        # DHCP client
+        udp sport 68 udp dport 67 accept
+        
+        # New Relic HTTPS (only from shipper UID)
+        # Note: set shipper_uids must be populated by systemd unit
+        skuid @shipper_uids ip daddr $nr_log_api tcp dport 443 accept
+        skuid @shipper_uids ip daddr $nr_metric_api tcp dport 443 accept
+        
+        # Ubuntu security updates (apt)
+        # Allow HTTPS to Ubuntu/Canonical for security updates
+        # Note: This is intentionally broad during setup; narrow post-deployment
+        tcp dport 443 accept comment "HTTPS - narrow post-setup"
+        tcp dport 80 accept comment "HTTP - narrow post-setup"
+        
+        # ICMP errors (rate-limited)
+        ip protocol icmp icmp type {
+            destination-unreachable,
+            time-exceeded,
+            parameter-problem
+        } limit rate 5/second accept
+        
+        # ICMPv6 NDP and errors
+        icmpv6 type {
+            nd-neighbor-solicit,
+            nd-neighbor-advert,
+            destination-unreachable,
+            packet-too-big,
+            time-exceeded
+        } accept
+        
+        # Log and drop everything else
+        counter log prefix "OUTPUT-DROP: " drop
+    }
+}
