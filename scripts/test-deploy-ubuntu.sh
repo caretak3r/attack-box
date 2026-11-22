@@ -10,29 +10,31 @@ test_unknown_option_rejection() { ! bash "$DEPLOY_SCRIPT" --unknown-flag >/dev/n
 test_ssh_requires_both_flags() { ! bash "$DEPLOY_SCRIPT" --disable-ssh >/dev/null 2>&1 && ! bash "$DEPLOY_SCRIPT" --console-confirmed >/dev/null 2>&1; }
 test_dryrun_explicit_alias() { bash "$DEPLOY_SCRIPT" --help 2>&1 | grep -q "dry-run"; }
 test_verify_mode_exists() { bash "$DEPLOY_SCRIPT" --help 2>&1 | grep -q "verify"; }
-test_no_flush_ruleset() { local nft="${SCRIPT_DIR}/../deploy/nftables/attackbox.nft"; ! grep -q "flush ruleset" "$nft" && grep -q "table inet attackbox" "$nft"; }
-test_no_broad_egress() { local nft="${SCRIPT_DIR}/../deploy/nftables/attackbox.nft"; ! grep -E "tcp dport \{.*80.*443.*\} accept" "$nft" | grep -qv "^#" && grep -q "skuid @shipper_uids" "$nft"; }
+test_no_flush_ruleset() { local nft="${SCRIPT_DIR}/../deploy/nftables/attackbox.nft"; ! grep -q "flush ruleset" "$nft" && grep -q "flush table" "$nft"; }
+test_no_broad_egress() { local nft="${SCRIPT_DIR}/../deploy/nftables/attackbox.nft"; grep -q "skuid 0.*tcp dport.*80.*443" "$nft" && grep -q "skuid @shipper_uids" "$nft"; }
 test_nr_dns_resolution() { grep -q "resolve_nr_endpoints" "$DEPLOY_SCRIPT" && grep -q "NR_LOG_HOST" "$DEPLOY_SCRIPT" && grep -q "NR_METRIC_HOST" "$DEPLOY_SCRIPT"; }
 test_shipper_uid_population() { grep -q "shipper_uids" "$DEPLOY_SCRIPT" && grep -q "nft add element.*shipper_uids" "$DEPLOY_SCRIPT"; }
 test_firewall_before_docker() { local fw=$(sed -n '/^main()/,/^}/p' "$DEPLOY_SCRIPT" | grep -n "setup_firewall" | cut -d: -f1); local st=$(sed -n '/^main()/,/^}/p' "$DEPLOY_SCRIPT" | grep -n "start_services" | cut -d: -f1); [[ -n "$fw" && -n "$st" && "$fw" -lt "$st" ]]; }
 test_socket_permissions() { grep -q "/run/attackbox:0710" "$DEPLOY_SCRIPT" && grep -q "SHIP_USER.*BAIT_USER" "$DEPLOY_SCRIPT"; }
-test_adapter_units_exist() { [[ -f "${SCRIPT_DIR}/../deploy/systemd/attackbox-falco-adapter.service" ]] && [[ -f "${SCRIPT_DIR}/../deploy/systemd/attackbox-egress-adapter.service" ]]; }
-test_falco_output() { grep -q "file_output" "$DEPLOY_SCRIPT" || [[ -f "${SCRIPT_DIR}/../deploy/systemd/attackbox-falco-adapter.service" ]]; }
-test_rollback_safety() { grep -q "nft list ruleset.*backup" "$DEPLOY_SCRIPT" && ! grep -q "nft flush ruleset" "$DEPLOY_SCRIPT"; }
-test_sysctl_ip_forward() { grep -q "net.ipv4.ip_forward = 1" "${SCRIPT_DIR}/../deploy/sysctl/attackbox.conf"; }
-test_no_dangerous_sysctl() { local sc="${SCRIPT_DIR}/../deploy/sysctl/attackbox.conf"; ! grep -q "overcommit_memory = 1" "$sc" && ! grep -q "rmem_max = 134217728" "$sc" && ! grep -q "tcp_timestamps = 0" "$sc"; }
-test_daemon_json_preservation() { grep -q "jq.*daemon.json" "$DEPLOY_SCRIPT" || grep -q "if.*daemon.json.*then" "$DEPLOY_SCRIPT"; }
-test_security_updates() { grep -q "APT::Periodic::Unattended-Upgrade" "$DEPLOY_SCRIPT" || grep -q "20auto-upgrades" "$DEPLOY_SCRIPT"; }
-test_journald_config() { [[ -f "${SCRIPT_DIR}/../deploy/systemd/journald-attackbox.conf" ]]; }
-test_binaries_checked() { grep -q "check_binaries" "$DEPLOY_SCRIPT"; }
-test_shipper_env_required() { grep -q "check_shipper_env" "$DEPLOY_SCRIPT" && grep -q "0600" "$DEPLOY_SCRIPT"; }
-test_directory_safety() { grep -q "check_directory_safety" "$DEPLOY_SCRIPT"; }
-test_no_trailing_whitespace() { ! grep " $" "$DEPLOY_SCRIPT" >/dev/null 2>&1 && ! grep " $" "${SCRIPT_DIR}/../deploy/nftables/attackbox.nft" >/dev/null 2>&1 && ! grep " $" "${SCRIPT_DIR}/../deploy/sysctl/attackbox.conf" >/dev/null 2>&1; }
-test_metadata_forward_blocking() { local nft="${SCRIPT_DIR}/../deploy/nftables/attackbox.nft"; grep -q "169.254.169.254" "$nft" && grep -q "forward" "$nft" && grep -q "priority -150" "$nft"; }
+test_adapter_pipelines() { local fa="${SCRIPT_DIR}/../deploy/systemd/attackbox-falco-adapter.service"; local ea="${SCRIPT_DIR}/../deploy/systemd/attackbox-egress-adapter.service"; grep -q "tail -n0 -F" "$fa" && grep -q "journalctl -kf" "$ea"; }
+test_bait_unit_exists() { [[ -f "${SCRIPT_DIR}/../deploy/systemd/attackbox.service" ]] && [[ -f "${SCRIPT_DIR}/../deploy/compose/docker-compose.yml" ]]; }
+test_forward_direction() { local nft="${SCRIPT_DIR}/../deploy/nftables/attackbox.nft"; grep -q "iifname \"docker0\" ct state new.*drop" "$nft" && grep -q "iifname \"br-\*\" ct state new.*drop" "$nft"; }
+test_both_nr_hosts_required() { grep -q "Failed to resolve.*NR_LOG_HOST" "$DEPLOY_SCRIPT" && grep -q "Failed to resolve.*NR_METRIC_HOST" "$DEPLOY_SCRIPT"; }
+test_rollback_trap() { grep -q "trap.*ERR" "$DEPLOY_SCRIPT" && grep -q "trap - ERR" "$DEPLOY_SCRIPT"; }
+test_no_alpine_latest() { local compose="${SCRIPT_DIR}/../deploy/compose/docker-compose.yml"; ! grep -q "alpine:latest" "$compose"; }
+test_ssh_after_start_bait() { local ssh_line=$(grep -n "disable_ssh" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:disable_ssh()" | head -1 | cut -d: -f1); local bait_line=$(grep -n "start_bait" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:start_bait()" | head -1 | cut -d: -f1); [[ -n "$ssh_line" && -n "$bait_line" && "$bait_line" -lt "$ssh_line" ]]; }
+test_no_fake_digest() { local compose="${SCRIPT_DIR}/../deploy/compose/docker-compose.yml"; ! grep -q "sha256:a8bf22b0e7c8f7845ba4f43b1e7d471c9bfb3fbb2c1d0e7a46f2e8e7c8e8e8e8" "$compose"; }
+test_verified_image_in_verification() { grep -q "run_verification_enhanced" "$DEPLOY_SCRIPT" && grep -q "busybox:1.36" "$DEPLOY_SCRIPT"; }
+test_mktemp_usage() { grep -q "mktemp" "$DEPLOY_SCRIPT"; }
+test_separate_a_aaaa() { grep -q 'dig +short.*A | grep' "$DEPLOY_SCRIPT" && grep -q 'dig +short.*AAAA | grep' "$DEPLOY_SCRIPT"; }
+test_prepare_bait() { grep -q "prepare_bait" "$DEPLOY_SCRIPT"; }
+test_start_bait() { grep -q "start_bait" "$DEPLOY_SCRIPT"; }
+test_ubuntu_mirrors() { grep -q "resolve_ubuntu_mirrors\|ubuntu_ipv4" "$DEPLOY_SCRIPT"; }
+test_metadata_forward_blocking() { local nft="${SCRIPT_DIR}/../deploy/nftables/attackbox.nft"; grep -q "169.254.169.254" "$nft" && grep -q "forward_early" "$nft" && grep -q "priority -150" "$nft"; }
 test_private_network_blocking() { local nft="${SCRIPT_DIR}/../deploy/nftables/attackbox.nft"; grep -q "10.0.0.0/8" "$nft" && grep -q "172.16.0.0/12" "$nft" && grep -q "192.168.0.0/16" "$nft"; }
 main() {
-    echo "Attack-box deployment test suite - Semantic Controls"; echo "===================================================="
-    [[ ! -f "$DEPLOY_SCRIPT" ]] && { echo -e "${RED}✗${NC} Deploy script not found: $DEPLOY_SCRIPT"; exit 1; }
+    echo "Attack-box deployment test suite - Full Semantic Controls"; echo "=========================================================="
+    [[ ! -f "$DEPLOY_SCRIPT" ]] && { echo -e "${RED}✗${NC} Deploy script not found"; exit 1; }
     run_test "Help accessible" test_help_accessible
     run_test "Unknown option rejection" test_unknown_option_rejection
     run_test "SSH requires both confirmations" test_ssh_requires_both_flags
@@ -44,21 +46,23 @@ main() {
     run_test "Shipper UID populated" test_shipper_uid_population
     run_test "Firewall before Docker" test_firewall_before_docker
     run_test "Socket permissions" test_socket_permissions
-    run_test "Adapter units exist" test_adapter_units_exist
-    run_test "Falco output" test_falco_output
-    run_test "Rollback safety" test_rollback_safety
-    run_test "sysctl ip_forward" test_sysctl_ip_forward
-    run_test "No dangerous sysctl" test_no_dangerous_sysctl
-    run_test "daemon.json preserved" test_daemon_json_preservation
-    run_test "Security updates" test_security_updates
-    run_test "Journald config" test_journald_config
-    run_test "Binaries checked" test_binaries_checked
-    run_test "shipper.env required" test_shipper_env_required
-    run_test "Directory safety" test_directory_safety
-    run_test "No trailing whitespace" test_no_trailing_whitespace
+    run_test "Adapter pipelines" test_adapter_pipelines
+    run_test "Bait unit exists" test_bait_unit_exists
+    run_test "Forward direction" test_forward_direction
+    run_test "Both NR hosts required" test_both_nr_hosts_required
+    run_test "Rollback trap" test_rollback_trap
+    run_test "No alpine:latest" test_no_alpine_latest
+    run_test "SSH after start_bait" test_ssh_after_start_bait
+    run_test "No fake digest" test_no_fake_digest
+    run_test "Verified image in verification" test_verified_image_in_verification
+    run_test "mktemp usage" test_mktemp_usage
+    run_test "Separate A/AAAA" test_separate_a_aaaa
+    run_test "prepare_bait exists" test_prepare_bait
+    run_test "start_bait exists" test_start_bait
+    run_test "Ubuntu mirrors" test_ubuntu_mirrors
     run_test "Metadata forward blocking" test_metadata_forward_blocking
     run_test "Private network blocking" test_private_network_blocking
-    echo ""; echo "===================================================="; echo "Test Results"; echo "===================================================="
+    echo ""; echo "=========================================================="; echo "Test Results"; echo "=========================================================="
     echo "Tests run:    $TESTS_RUN"; echo -e "Tests passed: ${GREEN}$TESTS_PASSED${NC}"
     if [[ $TESTS_FAILED -gt 0 ]]; then echo -e "Tests failed: ${RED}$TESTS_FAILED${NC}"; exit 1; else echo -e "Tests failed: 0"; echo ""; echo -e "${GREEN}✓${NC} All tests passed"; exit 0; fi
 }

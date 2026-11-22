@@ -1,6 +1,6 @@
 services:
   proxy:
-    image: nginxinc/nginx-unprivileged:1.27-alpine@sha256:a8bf22b0e7c8f7845ba4f43b1e7d471c9bfb3fbb2c1d0e7a46f2e8e7c8e8e8e8
+    image: nginxinc/nginx-unprivileged:1.27-alpine
     pull_policy: never
     runtime: runsc
     read_only: true

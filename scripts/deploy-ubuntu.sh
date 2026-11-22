@@ -444,35 +444,43 @@ resolve_nr_endpoints() {
     local metric_ips_v4=()
     local metric_ips_v6=()
 
-    # Resolve log API
+    # Resolve log API - separate A and AAAA
     while IFS= read -r ip; do
-        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            log_ips_v4+=("$ip")
-        elif [[ "$ip" =~ : ]]; then
-            log_ips_v6+=("$ip")
-        fi
-    done < <(dig +short "$NR_LOG_HOST" A AAAA | grep -v '\.$')
+        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && log_ips_v4+=("$ip")
+    done < <(dig +short "$NR_LOG_HOST" A | grep -v '\.$')
 
-    # Resolve metric API
     while IFS= read -r ip; do
-        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            metric_ips_v4+=("$ip")
-        elif [[ "$ip" =~ : ]]; then
-            metric_ips_v6+=("$ip")
-        fi
-    done < <(dig +short "$NR_METRIC_HOST" A AAAA | grep -v '\.$')
+        [[ "$ip" =~ : ]] && log_ips_v6+=("$ip")
+    done < <(dig +short "$NR_LOG_HOST" AAAA | grep -v '\.$')
 
-    if [[ ${#log_ips_v4[@]} -eq 0 && ${#metric_ips_v4[@]} -eq 0 ]]; then
-        err "Failed to resolve New Relic endpoints"
+    # Resolve metric API - separate A and AAAA
+    while IFS= read -r ip; do
+        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && metric_ips_v4+=("$ip")
+    done < <(dig +short "$NR_METRIC_HOST" A | grep -v '\.$')
+
+    while IFS= read -r ip; do
+        [[ "$ip" =~ : ]] && metric_ips_v6+=("$ip")
+    done < <(dig +short "$NR_METRIC_HOST" AAAA | grep -v '\.$')
+
+    # Require BOTH hosts to resolve
+    if [[ ${#log_ips_v4[@]} -eq 0 ]]; then
+        err "Failed to resolve $NR_LOG_HOST A records"
+        return 1
+    fi
+    if [[ ${#metric_ips_v4[@]} -eq 0 ]]; then
+        err "Failed to resolve $NR_METRIC_HOST A records"
         return 1
     fi
 
-    echo "${log_ips_v4[@]}" > /tmp/nr-log-ipv4.txt
-    echo "${log_ips_v6[@]}" > /tmp/nr-log-ipv6.txt
-    echo "${metric_ips_v4[@]}" > /tmp/nr-metric-ipv4.txt
-    echo "${metric_ips_v6[@]}" > /tmp/nr-metric-ipv6.txt
-
-    ok "Resolved NR endpoints: ${#log_ips_v4[@]} log IPv4, ${#log_ips_v6[@]} log IPv6, ${#metric_ips_v4[@]} metric IPv4, ${#metric_ips_v6[@]} metric IPv6"
+    # Use mktemp for temp files
+    # Return tmpdir path for setup_firewall
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    echo "${log_ips_v4[@]}" > "$tmpdir/nr-log-ipv4.txt"
+    echo "${log_ips_v6[@]}" > "$tmpdir/nr-log-ipv6.txt"
+    echo "${metric_ips_v4[@]}" > "$tmpdir/nr-metric-ipv4.txt"
+    echo "${metric_ips_v6[@]}" > "$tmpdir/nr-metric-ipv6.txt"
+    echo "$tmpdir"  # Return tmpdir path
 }
 
 # nftables firewall (enforced before Docker starts)
@@ -487,14 +495,20 @@ setup_firewall() {
     fi
 
     if [[ "$MODE" == "apply" ]]; then
-        # Resolve NR endpoints first
-        resolve_nr_endpoints
+        # Resolve endpoints first and capture tmpdir
+        local tmpdir
+        tmpdir=$(resolve_nr_endpoints)
+        resolve_ubuntu_mirrors
 
-        # Save current ruleset
-        local backup="/tmp/nftables-backup-$(date +%s).nft"
+        # Save current ruleset for ERR trap
+        local backup
+        backup=$(mktemp)
         nft list ruleset > "$backup"
 
-        # Load attackbox table
+        # ERR trap for rollback
+        trap 'nft -f "'"$backup"'" 2>/dev/null; rm -f "'"$backup"'" "'"$tmpdir"'"/*.txt; rmdir "'"$tmpdir"'" 2>/dev/null; err "Firewall setup failed, rolled back"' ERR
+
+        # Load attackbox table (idempotent)
         if ! nft -c -f "$nft_rules"; then
             err "nftables rules validation failed"
             return 1
@@ -502,24 +516,25 @@ setup_firewall() {
 
         nft -f "$nft_rules"
 
+
         # Populate NR endpoint sets
-        if [[ -f /tmp/nr-log-ipv4.txt ]]; then
-            for ip in $(cat /tmp/nr-log-ipv4.txt); do
+        if [[ -f "$tmpdir/nr-log-ipv4.txt" ]]; then
+            for ip in $(cat "$tmpdir/nr-log-ipv4.txt"); do
                 nft add element inet attackbox nr_log_ipv4 { "$ip" }
             done
         fi
-        if [[ -f /tmp/nr-log-ipv6.txt ]]; then
-            for ip in $(cat /tmp/nr-log-ipv6.txt); do
+        if [[ -f "$tmpdir/nr-log-ipv6.txt" ]]; then
+            for ip in $(cat "$tmpdir/nr-log-ipv6.txt"); do
                 nft add element inet attackbox nr_log_ipv6 { "$ip" }
             done
         fi
-        if [[ -f /tmp/nr-metric-ipv4.txt ]]; then
-            for ip in $(cat /tmp/nr-metric-ipv4.txt); do
+        if [[ -f "$tmpdir/nr-metric-ipv4.txt" ]]; then
+            for ip in $(cat "$tmpdir/nr-metric-ipv4.txt"); do
                 nft add element inet attackbox nr_metric_ipv4 { "$ip" }
             done
         fi
-        if [[ -f /tmp/nr-metric-ipv6.txt ]]; then
-            for ip in $(cat /tmp/nr-metric-ipv6.txt); do
+        if [[ -f "$tmpdir/nr-metric-ipv6.txt" ]]; then
+            for ip in $(cat "$tmpdir/nr-metric-ipv6.txt"); do
                 nft add element inet attackbox nr_metric_ipv6 { "$ip" }
             done
         fi
@@ -529,12 +544,17 @@ setup_firewall() {
         ship_uid=$(id -u "$SHIP_USER")
         nft add element inet attackbox shipper_uids { "$ship_uid" }
 
+        # Clear trap and cleanup on success
+        trap - ERR
+        rm -f "$backup" "$tmpdir"/*.txt
+        rmdir "$tmpdir"
+
         systemctl enable nftables
 
-        ok "Installed nftables rules (backup: $backup)"
+        ok "Installed nftables rules with rollback safety"
         warn "Firewall enforced before Docker starts"
     else
-        warn "Would install nftables rules and populate NR endpoints/shipper UID"
+        warn "Would install nftables rules and populate endpoints"
     fi
 }
 
@@ -874,6 +894,156 @@ run_verification() {
     ok "Verification complete"
 }
 
+# Resolve Ubuntu mirrors
+resolve_ubuntu_mirrors() {
+    log "Resolving Ubuntu mirror endpoints..."
+    
+    local ubuntu_ips_v4=()
+    local ubuntu_ips_v6=()
+    
+    for host in archive.ubuntu.com security.ubuntu.com; do
+        while IFS= read -r ip; do
+            [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && ubuntu_ips_v4+=("$ip")
+        done < <(dig +short "$host" A | grep -v '\.$')
+        
+        while IFS= read -r ip; do
+            [[ "$ip" =~ : ]] && ubuntu_ips_v6+=("$ip")
+        done < <(dig +short "$host" AAAA | grep -v '\.$')
+    done
+    
+    if [[ ${#ubuntu_ips_v4[@]} -gt 0 ]]; then
+        ok "Resolved ${#ubuntu_ips_v4[@]} Ubuntu mirror IPv4 addresses"
+        for ip in "${ubuntu_ips_v4[@]}"; do
+            nft add element inet attackbox ubuntu_ipv4 { "$ip" }
+        done
+    fi
+    
+    if [[ ${#ubuntu_ips_v6[@]} -gt 0 ]]; then
+        ok "Resolved ${#ubuntu_ips_v6[@]} Ubuntu mirror IPv6 addresses"
+        for ip in "${ubuntu_ips_v6[@]}"; do
+            nft add element inet attackbox ubuntu_ipv6 { "$ip" }
+        done
+    fi
+}
+
+# Build and pre-pull bait before firewall
+prepare_bait() {
+    log "Preparing bait containers..."
+    
+    if [[ "$MODE" != "apply" ]]; then
+        warn "Would build bait and pre-pull proxy"
+        return 0
+    fi
+    
+    # Install Compose project
+    mkdir -p /opt/attackbox
+    cp "${DEPLOY_DIR}/compose/docker-compose.yml" /opt/attackbox/
+    
+    # Build bait image (requires Dockerfile in repo)
+    if [[ -f "${SCRIPT_DIR}/../Dockerfile" ]]; then
+        docker build -t attackbox-bait:latest "${SCRIPT_DIR}/.."
+        ok "Built bait image"
+    else
+        warn "Dockerfile not found, assuming bait image exists"
+    fi
+    
+    # Pre-pull proxy (actual digest from upstream)
+    docker pull nginxinc/nginx-unprivileged:1.27-alpine
+    ok "Pre-pulled proxy image"
+}
+
+# Start bait service
+start_bait() {
+    log "Starting bait service..."
+    
+    if [[ "$MODE" != "apply" ]]; then
+        warn "Would start bait service"
+        return 0
+    fi
+    
+    systemctl enable attackbox
+    systemctl start attackbox
+    
+    # Wait for containers
+    sleep 3
+    
+    if docker compose -f /opt/attackbox/docker-compose.yml ps | grep -q "Up"; then
+        ok "Bait service running"
+    else
+        err "Bait service failed to start"
+        return 1
+    fi
+}
+
+# Enhanced verification
+run_verification_enhanced() {
+    log "Running enhanced validation checks..."
+    
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        err "Verification requires Linux"
+        return 1
+    fi
+    
+    if ! command -v docker >/dev/null; then
+        err "Verification requires Docker"
+        return 1
+    fi
+    
+    # Use bait container on Compose network for tests
+    local test_img="busybox:1.36"
+    local network="bait_internal"
+    
+    # Test metadata blocking
+    log "Testing metadata blocking from container..."
+    if docker run --rm --network "$network" "$test_img" timeout 2 wget -O- http://169.254.169.254/ 2>&1 | grep -q "timed out\|Connection refused"; then
+        ok "Metadata blocked from container"
+    else
+        err "Metadata NOT blocked - required check failed"
+        return 1
+    fi
+    
+    # Test DNS
+    log "Testing DNS from container..."
+    if docker run --rm --network "$network" "$test_img" nslookup google.com 1.1.1.1 >/dev/null 2>&1; then
+        ok "DNS works from container"
+    else
+        err "DNS does NOT work - required check failed"
+        return 1
+    fi
+    
+    # Test Internet blocked
+    log "Testing Internet blocking from container..."
+    if ! docker run --rm --network "$network" "$test_img" timeout 2 wget -O- https://example.com >/dev/null 2>&1; then
+        ok "Internet blocked from container"
+    else
+        err "Internet NOT blocked - required check failed"
+        return 1
+    fi
+    
+    # Test NR endpoints as shipper UID
+    log "Testing New Relic endpoints as shipper UID..."
+    local nr_ok=0
+    
+    for host in "$NR_LOG_HOST" "$NR_METRIC_HOST"; do
+        local ips
+        ips=$(dig +short "$host" A | head -1)
+        if [[ -n "$ips" ]]; then
+            if sudo -u "$SHIP_USER" timeout 3 bash -c "echo | openssl s_client -connect ${ips}:443 -brief" 2>&1 | grep -q "connected"; then
+                ok "NR endpoint $host reachable"
+                nr_ok=$((nr_ok + 1))
+            fi
+        fi
+    done
+    
+    if [[ $nr_ok -eq 2 ]]; then
+        ok "Both NR endpoints reachable"
+    else
+        err "Not all NR endpoints reachable - required check failed"
+        return 1
+    fi
+    
+    ok "All verification checks passed"
+}
 # Main execution
 main() {
     log "Attack-box Ubuntu deployment"
@@ -884,7 +1054,7 @@ main() {
     check_os
 
     if [[ "$MODE" == "verify" ]]; then
-        run_verification
+        run_verification_enhanced
         exit $?
     fi
 
@@ -894,6 +1064,7 @@ main() {
     setup_docker
     setup_gvisor
     setup_falco
+    prepare_bait
     setup_firewall
     setup_sysctl
     setup_auditd
@@ -901,14 +1072,16 @@ main() {
     setup_systemd_units
 
     if [[ "$MODE" == "apply" ]]; then
-        disable_ssh
         start_services
+        start_bait
+        disable_ssh
 
         echo ""
         ok "Deployment complete"
         warn "Services started:"
         warn "  - Docker (with gVisor runtime)"
-        warn "  - attackbox-shipper"
+        warn "  - attackbox-shipper (with socket)"
+        warn "  - attackbox-bait (with proxy)"
         warn "  - falco-modern-bpf"
         warn "  - attackbox-falco-adapter"
         warn "  - attackbox-egress-adapter"
@@ -923,3 +1096,4 @@ main() {
 }
 
 main "$@"
+
