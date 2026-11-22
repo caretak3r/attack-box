@@ -410,6 +410,86 @@ func (n *NewRelic) record(name string, count bool, value float64, attrs map[stri
 	s.at = now
 }
 
+// ShipEvent ships one event synchronously, chunking and POSTing it directly
+// without using the queue. It returns only when New Relic accepts it or the
+// error is permanent. Use this for the shipper's durable queue drain, where
+// delivery must be confirmed before checkpointing.
+func (n *NewRelic) ShipEvent(e Event) error {
+	if e.Timestamp.IsZero() {
+		e.Timestamp = n.cfg.Now()
+	}
+	e.Attrs = maps.Clone(e.Attrs)
+	e.TaskLabels = slices.Clone(e.TaskLabels)
+	chunks := Chunk(e, MaxChunk)
+
+	items := make([][]byte, 0, len(chunks))
+	for _, c := range chunks {
+		b, err := logItem(c)
+		if err != nil {
+			return fmt.Errorf("marshal event: %w", err)
+		}
+		items = append(items, b)
+	}
+
+	common, err := json.Marshal(map[string]any{"attributes": n.cfg.Common})
+	if err != nil {
+		return fmt.Errorf("marshal common: %w", err)
+	}
+
+	retry, perm := n.postAll(n.cfg.LogURL, common, "logs", items)
+	if len(perm) > 0 {
+		return fmt.Errorf("permanently rejected %d chunks", len(perm))
+	}
+	if len(retry) > 0 {
+		return fmt.Errorf("transient failure on %d chunks", len(retry))
+	}
+	return nil
+}
+
+// ShipMetric ships one metric synchronously, POSTing it directly without
+// using the in-memory series aggregation. It returns only when New Relic
+// accepts it or the error is permanent.
+func (n *NewRelic) ShipMetric(name string, kind string, value float64, at time.Time, attrs map[string]string) error {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return nil // silently drop invalid values like record() does
+	}
+	labels := SafeLabels(attrs)
+	var typ string
+	switch kind {
+	case "count":
+		typ = "count"
+	case "gauge":
+		typ = "gauge"
+	default:
+		return fmt.Errorf("invalid metric kind %q", kind)
+	}
+
+	item, err := json.Marshal(map[string]any{
+		"name":       name,
+		"type":       typ,
+		"value":      value,
+		"timestamp":  at.UnixMilli(),
+		"attributes": labels,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal metric: %w", err)
+	}
+
+	common, err := json.Marshal(map[string]any{"attributes": n.cfg.Common})
+	if err != nil {
+		return fmt.Errorf("marshal common: %w", err)
+	}
+
+	retry, perm := n.postAll(n.cfg.MetricURL, common, "metrics", [][]byte{item})
+	if len(perm) > 0 {
+		return fmt.Errorf("permanently rejected")
+	}
+	if len(retry) > 0 {
+		return fmt.Errorf("transient failure")
+	}
+	return nil
+}
+
 func seriesKey(name string, count bool, labels map[string]string) string {
 	keys := make([]string, 0, len(labels))
 	for k := range labels {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"attackbox/internal/shipper"
@@ -25,15 +26,22 @@ func drain(ctx context.Context, q *shipper.Queue, nr *telemetry.NewRelic, uncert
 	defer ticker.Stop()
 
 	var (
-		pending  []shipper.Entry
-		toAck    int
-		lastAck  time.Time
-		retryAt  time.Time
-		metricAt uint64
+		pending   []shipper.Entry
+		toAck     int
+		lastAck   time.Time
+		delivered int
+		retryAt   time.Time
+		metricAt  uint64
 	)
 
 	if uncertain {
 		metricAt = uncertainThrough
+		// Emit metric_replay_gap to signal suppressed metrics
+		if err := nr.ShipMetric("attackbox.metric_replay_gap", "gauge", 1, time.Now(), map[string]string{
+			"uncertain_through": fmt.Sprintf("%d", uncertainThrough),
+		}); err != nil {
+			// Log but don't fail on this signal metric
+		}
 	}
 
 	for {
@@ -55,48 +63,47 @@ func drain(ctx context.Context, q *shipper.Queue, nr *telemetry.NewRelic, uncert
 			pending = entries
 			retryAt = time.Time{}
 		}
-		var delivered int
-		// Try to deliver pending entries
+		// Deliver pending entries synchronously
+		delivered = 0
 		for i, e := range pending {
-			// If we're in retry mode, wait
-			if !retryAt.IsZero() && time.Now().Before(retryAt) {
-				break
+			var rec telemetry.Record
+			if err := json.Unmarshal(e.Data, &rec); err != nil {
+				// Corrupt JSON: fail closed, do not Ack
+				return fmt.Errorf("corrupt queue payload at seq %d: %w", e.Seq, err)
 			}
 
-			// Unmarshal the admitted record
-			var adm shipper.Admitted
-			if err := json.Unmarshal(e.Data, &adm); err != nil {
-				// Skip corrupted entry
-				delivered = i + 1
-				continue
-			}
-
-			if adm.Record.Event != nil {
-				if !nr.TryEmit(*adm.Record.Event) {
-					// Queue full, retry later
-					retryAt = time.Now().Add(250 * time.Millisecond)
+			if rec.Event != nil {
+				// ShipEvent blocks until delivered or permanently failed
+				if err := nr.ShipEvent(*rec.Event); err != nil {
+					// Transient failure: stop, Rewind will replay from here
+					q.Rewind()
+					time.Sleep(250 * time.Millisecond)
 					break
 				}
-			} else if adm.Record.Metric != nil {
+			} else if rec.Metric != nil {
 				// Skip metrics in uncertain range
 				if uncertain && e.Seq <= metricAt {
-					// Skip, but mark as delivered
 					delivered = i + 1
 					continue
 				}
-				switch adm.Record.Metric.Kind {
-				case "count":
-					nr.Count(adm.Record.Metric.Name, adm.Record.Metric.Value, adm.Record.Metric.Attrs)
-				case "gauge":
-					nr.Gauge(adm.Record.Metric.Name, adm.Record.Metric.Value, adm.Record.Metric.Attrs)
+				// ShipMetric blocks until delivered or permanently failed
+				if err := nr.ShipMetric(rec.Metric.Name, rec.Metric.Kind, rec.Metric.Value, rec.Metric.At, rec.Metric.Attrs); err != nil {
+					// Transient failure: stop, Rewind will replay
+					q.Rewind()
+					time.Sleep(250 * time.Millisecond)
+					break
 				}
+			}
+			// If context was cancelled during ShipEvent/ShipMetric, Rewind and exit
+			if ctx.Err() != nil {
+				q.Rewind()
+				return ctx.Err()
 			}
 			delivered = i + 1
 		}
 		if delivered > 0 {
 			pending = pending[delivered:]
 			toAck += delivered
-			retryAt = time.Time{}
 		}
 
 		// Checkpoint if we've accumulated enough or enough time has passed
@@ -122,41 +129,8 @@ func drain(ctx context.Context, q *shipper.Queue, nr *telemetry.NewRelic, uncert
 		// Check for context cancellation
 		select {
 		case <-ctx.Done():
-			// Drain what we can within timeout
-			deadline := time.Now().Add(timeout)
-			for time.Now().Before(deadline) && len(pending) > 0 {
-				delivered := 0
-				for i, e := range pending {
-					var adm shipper.Admitted
-					if err := json.Unmarshal(e.Data, &adm); err != nil {
-						delivered = i + 1
-						continue
-					}
-					if adm.Record.Event != nil {
-						if !nr.TryEmit(*adm.Record.Event) {
-							break
-						}
-					} else if adm.Record.Metric != nil {
-						if uncertain && e.Seq <= metricAt {
-							delivered = i + 1
-							continue
-						}
-						switch adm.Record.Metric.Kind {
-						case "count":
-							nr.Count(adm.Record.Metric.Name, adm.Record.Metric.Value, adm.Record.Metric.Attrs)
-						case "gauge":
-							nr.Gauge(adm.Record.Metric.Name, adm.Record.Metric.Value, adm.Record.Metric.Attrs)
-						}
-					}
-					delivered = i + 1
-				}
-				if delivered > 0 {
-					pending = pending[delivered:]
-					toAck += delivered
-				} else {
-					time.Sleep(100 * time.Millisecond)
-				}
-			}
+			// Ack what we delivered before cancellation, but don't try to drain more
+			// because shutdown cannot acknowledge queued-only records
 			if toAck > 0 {
 				q.Ack(toAck)
 			}
