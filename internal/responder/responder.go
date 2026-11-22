@@ -84,6 +84,10 @@ type Decision struct {
 func (r *Responder) Decide(key string, req Request) Decision {
 	sess, created := r.store.Get(key)
 	now := r.store.Now()
+	// Scrubbing and JSON work stay outside the session lock.
+	decls := r.declarations(req, now)
+	corpus := req.Text + "\n" + req.Untrusted + "\n" + flatten(req.Metadata)
+	class := Classify(req.Input)
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 
@@ -92,7 +96,6 @@ func (r *Responder) Decide(key string, req Request) Decision {
 		SessionID: sess.ID, Ticket: sess.Ticket, NewSession: created,
 		Nonce: sess.Nonce, Behavior: sess.Behavior, SessionAge: now.Sub(sess.Created),
 	}
-	corpus := req.Text + "\n" + req.Untrusted + "\n" + flatten(req.Metadata)
 
 	if obs, ok := canaryReuse(sess, corpus); ok {
 		d.Observations = append(d.Observations, obs)
@@ -102,8 +105,9 @@ func (r *Responder) Decide(key string, req Request) Decision {
 		d.Observations = append(d.Observations, r.followup(sess, req, corpus, now))
 		sess.pending = nil
 	}
-	d.Declarations = r.declare(sess, req, now)
-	d.Class = Classify(req.Input)
+	d.Declarations = decls
+	r.record(sess, decls)
+	d.Class = class
 
 	p := r.next(sess, d.Class.Task, d.Declarations)
 	if p.Question() {
@@ -163,15 +167,21 @@ var emailLike = regexp.MustCompile(`[^\s@"'<>(){}\[\],;:]+@[^\s@"'<>(){}\[\],;:]
 
 const maxDeclValue = 256
 
-// sanitize removes credentials and email addresses, then bounds the value to
-// 256 bytes on a UTF-8 boundary.
+// maxScrubInput bounds what the scrubber sees; real declarations are far
+// smaller than this.
+const maxScrubInput = 4 << 10
+
+// sanitize clips the input, removes credentials and email addresses, then
+// bounds the value to 256 bytes on a UTF-8 boundary.
 func (r *Responder) sanitize(v string) string {
-	return clip(emailLike.ReplaceAllString(secret.Scrub(v, r.cfg.Fingerprint), "[email-redacted]"), maxDeclValue)
+	v = secret.Scrub(clip(v, maxScrubInput), r.cfg.Fingerprint)
+	return clip(emailLike.ReplaceAllString(v, "[email-redacted]"), maxDeclValue)
 }
 
-// declare extracts identification fields. Credential values are compared
-// with canaries in followup and never stored as declarations.
-func (r *Responder) declare(sess *Session, req Request, now time.Time) []Declaration {
+// declarations extracts identification fields. Credential values are
+// compared with canaries in followup and never stored as declarations. It
+// reads no session state.
+func (r *Responder) declarations(req Request, now time.Time) []Declaration {
 	var out []Declaration
 	add := func(field, value string, valid bool) {
 		value = strings.TrimSpace(value)
@@ -198,6 +208,12 @@ func (r *Responder) declare(sess *Session, req Request, now time.Time) []Declara
 		}
 	}
 	add("user", req.User, true)
+	return out
+}
+
+// record stores declarations within the per-session bounds. Caller holds
+// sess.mu.
+func (r *Responder) record(sess *Session, out []Declaration) {
 	perField := map[string]int{}
 	for _, d := range sess.Declarations {
 		perField[d.Field]++
@@ -209,7 +225,6 @@ func (r *Responder) declare(sess *Session, req Request, now time.Time) []Declara
 		perField[d.Field]++
 		sess.Declarations = append(sess.Declarations, d)
 	}
-	return out
 }
 
 func stringify(v any) string {
