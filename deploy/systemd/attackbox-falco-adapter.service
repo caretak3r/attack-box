@@ -1,0 +1,37 @@
+[Unit]
+Description=Attack-box Falco runtime event adapter
+Documentation=https://github.com/example/attack-box
+After=falco-modern-bpf.service attackbox-shipper.service
+Requires=falco-modern-bpf.service attackbox-shipper.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Read Falco output and send to shipper
+ExecStart=/usr/local/bin/attackbox-shipper -stdin-stream runtime
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/
+
+# Logging
+StandardInput=file:/var/log/falco-events.jsonl
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=attackbox-falco-adapter
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+
+# Resource limits
+MemoryMax=64M
+TasksMax=50
+
+[Install]
+WantedBy=multi-user.target

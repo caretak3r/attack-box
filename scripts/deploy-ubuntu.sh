@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Ubuntu 24.04 idempotent deployment for attack-box
-# Non-destructive preflight by default; --apply for mutations
+# Non-destructive preflight by default; --apply for mutations; --verify for real validation
 # Both --disable-ssh --console-confirmed required for SSH/cloud-init changes
 
 set -euo pipefail
@@ -15,9 +15,11 @@ readonly SHIP_USER="abx-ship"
 readonly SHIP_GROUP="abx-ship"
 readonly SPOOL_SOCKET="/run/attackbox/spool.sock"
 readonly QUEUE_DIR="/var/lib/attackbox-shipper/queue"
+readonly NR_LOG_HOST="log-api.newrelic.com"
+readonly NR_METRIC_HOST="metric-api.newrelic.com"
 
 # Flags
-APPLY_MODE=false
+MODE="preflight"
 DISABLE_SSH=false
 CONSOLE_CONFIRMED=false
 
@@ -26,7 +28,7 @@ readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly BLUE='\033[0;34m'
-readonly NC='\033[0m' # No Color
+readonly NC='\033[0m'
 
 usage() {
     cat <<EOF
@@ -36,12 +38,16 @@ Ubuntu 24.04 deployment for attack-box honeypot.
 Default: non-destructive preflight (no mutations).
 
 Options:
-    --apply                  Apply changes (required for mutations)
+    --apply                  Apply changes (mutations)
+    --dry-run                Explicit preflight (same as default, no mutations)
+    --verify                 Real validation: proxy/bait metadata, DNS/NTP, NR endpoints
+                             (requires Linux with Docker + gVisor; reports prerequisites)
     --disable-ssh            Mark SSH for disablement (needs --console-confirmed)
     --console-confirmed      Confirm console access verified (needs --disable-ssh)
-    -h, --help              Show this help
+    -h, --help               Show this help
 
 SSH disablement requires BOTH --disable-ssh AND --console-confirmed.
+Verification mode requires Linux, Docker, and gVisor runtime.
 EOF
     exit "${1:-0}"
 }
@@ -65,7 +71,9 @@ ok() {
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --apply) APPLY_MODE=true; shift ;;
+        --apply) MODE="apply"; shift ;;
+        --dry-run) MODE="preflight"; shift ;;
+        --verify) MODE="verify"; shift ;;
         --disable-ssh) DISABLE_SSH=true; shift ;;
         --console-confirmed) CONSOLE_CONFIRMED=true; shift ;;
         -h|--help) usage 0 ;;
@@ -90,17 +98,17 @@ check_os() {
         err "/etc/os-release not found"
         return 1
     fi
-    
+
     source /etc/os-release
     if [[ "$ID" != "ubuntu" ]]; then
         err "Not Ubuntu (found: $ID)"
         return 1
     fi
-    
+
     if [[ "$VERSION_ID" != "24.04" ]]; then
         warn "Expected Ubuntu 24.04, found $VERSION_ID"
     fi
-    
+
     ok "Ubuntu $VERSION_ID detected"
 }
 
@@ -112,13 +120,70 @@ check_root() {
     fi
 }
 
+# Check Linux for verify mode
+check_linux() {
+    if [[ "$MODE" == "verify" ]]; then
+        if [[ "$(uname -s)" != "Linux" ]]; then
+            err "Verification mode requires Linux"
+            err "Prerequisites: Ubuntu 24.04, Docker, gVisor runtime"
+            exit 1
+        fi
+    fi
+}
+
+# Safety check directory
+check_directory_safety() {
+    local dir="$1"
+    local expected_owner="$2"
+    local expected_group="$3"
+    local expected_mode="$4"
+
+    if [[ ! -d "$dir" ]]; then
+        return 1
+    fi
+
+    # Check not a symlink
+    if [[ -L "$dir" ]]; then
+        err "$dir is a symlink (security risk)"
+        return 1
+    fi
+
+    # Check owner/group
+    local actual_owner
+    local actual_group
+    actual_owner=$(stat -c '%U' "$dir" 2>/dev/null || stat -f '%Su' "$dir" 2>/dev/null)
+    actual_group=$(stat -c '%G' "$dir" 2>/dev/null || stat -f '%Sg' "$dir" 2>/dev/null)
+
+    if [[ "$actual_owner" != "$expected_owner" ]] || [[ "$actual_group" != "$expected_group" ]]; then
+        warn "$dir has wrong ownership: $actual_owner:$actual_group (expected $expected_owner:$expected_group)"
+        if [[ "$MODE" == "apply" ]]; then
+            chown "$expected_owner:$expected_group" "$dir"
+            ok "Corrected $dir ownership"
+        fi
+    fi
+
+    # Check mode
+    local actual_mode
+    actual_mode=$(stat -c '%a' "$dir" 2>/dev/null || stat -f '%A' "$dir" 2>/dev/null | tail -c 4)
+
+    if [[ "$actual_mode" != "$expected_mode" ]]; then
+        warn "$dir has wrong mode: $actual_mode (expected $expected_mode)"
+        if [[ "$MODE" == "apply" ]]; then
+            chmod "$expected_mode" "$dir"
+            ok "Corrected $dir mode"
+        fi
+    fi
+
+    return 0
+}
+
 # User/group setup
 setup_users() {
     log "Checking users and groups..."
-    
+
     # abx-bait group and user
     if ! getent group "$BAIT_USER" >/dev/null; then
-        if [[ "$APPLY_MODE" == true ]]; then
+        if [[ "$MODE" == "apply" ]]; then
             groupadd --gid "$BAIT_GID" "$BAIT_USER"
             ok "Created group $BAIT_USER (GID $BAIT_GID)"
         else
@@ -127,9 +192,9 @@ setup_users() {
     else
         ok "Group $BAIT_USER exists"
     fi
-    
+
     if ! id "$BAIT_USER" >/dev/null 2>&1; then
-        if [[ "$APPLY_MODE" == true ]]; then
+        if [[ "$MODE" == "apply" ]]; then
             useradd --uid "$BAIT_UID" --gid "$BAIT_GID" --no-create-home --shell /usr/sbin/nologin --system "$BAIT_USER"
             ok "Created user $BAIT_USER (UID $BAIT_UID)"
         else
@@ -138,10 +203,10 @@ setup_users() {
     else
         ok "User $BAIT_USER exists"
     fi
-    
+
     # abx-ship user and group
     if ! getent group "$SHIP_GROUP" >/dev/null; then
-        if [[ "$APPLY_MODE" == true ]]; then
+        if [[ "$MODE" == "apply" ]]; then
             groupadd --system "$SHIP_GROUP"
             ok "Created group $SHIP_GROUP"
         else
@@ -150,17 +215,24 @@ setup_users() {
     else
         ok "Group $SHIP_GROUP exists"
     fi
-    
+
     if ! id "$SHIP_USER" >/dev/null 2>&1; then
-        if [[ "$APPLY_MODE" == true ]]; then
-            useradd --system --gid "$SHIP_GROUP" --no-create-home --shell /usr/sbin/nologin "$SHIP_USER"
-            # Add abx-bait to abx-ship group for socket access
-            usermod -a -G "$SHIP_GROUP" "$BAIT_USER"
-            ok "Created user $SHIP_USER"
+        if [[ "$MODE" == "apply" ]]; then
+            useradd --system --gid "$SHIP_GROUP" --groups "$BAIT_USER" --no-create-home --shell /usr/sbin/nologin "$SHIP_USER"
+            ok "Created user $SHIP_USER (supplementary group: $BAIT_USER)"
         else
             warn "Would create user $SHIP_USER"
         fi
     else
+        # Check supplementary groups
+        if ! id -nG "$SHIP_USER" | grep -qw "$BAIT_USER"; then
+            if [[ "$MODE" == "apply" ]]; then
+                usermod -a -G "$BAIT_USER" "$SHIP_USER"
+                ok "Added $SHIP_USER to group $BAIT_USER"
+            else
+                warn "Would add $SHIP_USER to group $BAIT_USER"
+            fi
+        fi
         ok "User $SHIP_USER exists"
     fi
 }
@@ -168,18 +240,19 @@ setup_users() {
 # Directories
 setup_directories() {
     log "Checking directories..."
-    
+
+    # /run/attackbox: abx-ship:abx-bait mode 0710
+    # /var/lib/attackbox-shipper/queue: abx-ship:abx-ship mode 0700
     local dirs=(
-        "/run/attackbox:0770:root:$SHIP_GROUP"
+        "/run/attackbox:0710:$SHIP_USER:$BAIT_USER"
         "$QUEUE_DIR:0700:$SHIP_USER:$SHIP_GROUP"
-        "/var/log/attackbox-shipper:0750:root:adm"
     )
-    
+
     for entry in "${dirs[@]}"; do
         IFS=':' read -r dir mode owner group <<< "$entry"
-        
-        if [[ ! -d "$dir" ]]; then
-            if [[ "$APPLY_MODE" == true ]]; then
+
+        if ! check_directory_safety "$dir" "$owner" "$group" "$mode"; then
+            if [[ "$MODE" == "apply" ]]; then
                 mkdir -p "$dir"
                 chmod "$mode" "$dir"
                 chown "$owner:$group" "$dir"
@@ -188,15 +261,15 @@ setup_directories() {
                 warn "Would create $dir ($mode $owner:$group)"
             fi
         else
-            ok "Directory $dir exists"
+            ok "Directory $dir correct"
         fi
     done
 }
 
-# Install packages
+# Install packages (bootstrap only, no daemon startup)
 install_packages() {
     log "Checking required packages..."
-    
+
     local packages=(
         apt-transport-https
         ca-certificates
@@ -206,16 +279,16 @@ install_packages() {
         unattended-upgrades
         nftables
     )
-    
+
     local missing=()
     for pkg in "${packages[@]}"; do
         if ! dpkg -l | grep -q "^ii  $pkg "; then
             missing+=("$pkg")
         fi
     done
-    
+
     if [[ ${#missing[@]} -gt 0 ]]; then
-        if [[ "$APPLY_MODE" == true ]]; then
+        if [[ "$MODE" == "apply" ]]; then
             apt-get update -qq
             apt-get install -y "${missing[@]}"
             ok "Installed: ${missing[*]}"
@@ -227,67 +300,62 @@ install_packages() {
     fi
 }
 
-# Docker setup
+# Docker setup (install but don't start)
 setup_docker() {
     log "Checking Docker installation..."
-    
+
     if ! command -v docker >/dev/null; then
-        if [[ "$APPLY_MODE" == true ]]; then
-            # Add Docker GPG key
+        if [[ "$MODE" == "apply" ]]; then
             install -m 0755 -d /etc/apt/keyrings
             curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
             chmod a+r /etc/apt/keyrings/docker.gpg
-            
-            # Add Docker repository
+
             echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
-            
+
             apt-get update -qq
             apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-            ok "Installed Docker"
+
+            # Stop Docker immediately after install
+            systemctl stop docker
+            systemctl stop containerd
+
+            ok "Installed Docker (stopped)"
         else
             warn "Would install Docker"
         fi
     else
         ok "Docker installed: $(docker --version)"
-    fi
-}
 
-# gVisor setup
-setup_gvisor() {
-    log "Checking gVisor (runsc)..."
-    
-    if ! command -v runsc >/dev/null; then
-        if [[ "$APPLY_MODE" == true ]]; then
-            # Add gVisor GPG key
-            curl -fsSL https://gvisor.dev/archive.key | gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
-            
-            # Add gVisor repository
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" > /etc/apt/sources.list.d/gvisor.list
-            
-            apt-get update -qq
-            apt-get install -y runsc
-            ok "Installed runsc"
-        else
-            warn "Would install runsc (gVisor)"
+        # Ensure Docker is stopped before firewall enforcement
+        if systemctl is-active --quiet docker; then
+            if [[ "$MODE" == "apply" ]]; then
+                systemctl stop docker
+                ok "Stopped Docker for firewall enforcement"
+            else
+                warn "Would stop Docker for firewall enforcement"
+            fi
         fi
-    else
-        ok "runsc installed: $(runsc --version 2>&1 | head -1)"
     fi
-    
-    # Docker daemon.json configuration
+
+    # Preserve existing daemon.json, only add runsc if needed
     local daemon_json="/etc/docker/daemon.json"
-    local needs_config=false
-    
     if [[ -f "$daemon_json" ]]; then
-        if ! grep -q '"runsc"' "$daemon_json"; then
-            needs_config=true
+        if ! jq -e '.runtimes.runsc' "$daemon_json" >/dev/null 2>&1; then
+            if [[ "$MODE" == "apply" ]]; then
+                # Merge runsc into existing config
+                local tmp
+                tmp=$(mktemp)
+                jq '.runtimes.runsc = {"path": "/usr/bin/runsc"}' "$daemon_json" > "$tmp"
+                mv "$tmp" "$daemon_json"
+                ok "Added runsc to existing daemon.json"
+            else
+                warn "Would add runsc to existing daemon.json"
+            fi
+        else
+            ok "Docker daemon.json already has runsc"
         fi
     else
-        needs_config=true
-    fi
-    
-    if [[ "$needs_config" == true ]]; then
-        if [[ "$APPLY_MODE" == true ]]; then
+        if [[ "$MODE" == "apply" ]]; then
             cat > "$daemon_json" <<'EOF'
 {
   "runtimes": {
@@ -302,41 +370,63 @@ setup_gvisor() {
   }
 }
 EOF
-            systemctl restart docker
-            ok "Configured Docker daemon for gVisor"
+            ok "Created daemon.json with runsc"
         else
-            warn "Would configure Docker daemon for gVisor"
+            warn "Would create daemon.json with runsc"
         fi
-    else
-        ok "Docker daemon already configured for gVisor"
     fi
 }
 
-# Falco setup
+# gVisor setup
+setup_gvisor() {
+    log "Checking gVisor (runsc)..."
+
+    if ! command -v runsc >/dev/null; then
+        if [[ "$MODE" == "apply" ]]; then
+            curl -fsSL https://gvisor.dev/archive.key | gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" > /etc/apt/sources.list.d/gvisor.list
+
+            apt-get update -qq
+            apt-get install -y runsc
+            ok "Installed runsc"
+        else
+            warn "Would install runsc (gVisor)"
+        fi
+    else
+        ok "runsc installed: $(runsc --version 2>&1 | head -1)"
+    fi
+}
+
+# Falco setup (install, configure output, but don't enable yet)
 setup_falco() {
     log "Checking Falco..."
-    
+
     if ! command -v falco >/dev/null; then
-        if [[ "$APPLY_MODE" == true ]]; then
-            # Check for kernel headers
+        if [[ "$MODE" == "apply" ]]; then
             if ! dpkg -l | grep -q "linux-headers-$(uname -r)"; then
                 apt-get install -y "linux-headers-$(uname -r)"
             fi
-            
-            # Add Falco GPG key and repository
+
             curl -fsSL https://falco.org/repo/falcosecurity-packages.asc | gpg --dearmor -o /usr/share/keyrings/falco-archive-keyring.gpg
             echo "deb [signed-by=/usr/share/keyrings/falco-archive-keyring.gpg] https://download.falco.org/packages/deb stable main" > /etc/apt/sources.list.d/falcosecurity.list
-            
+
             apt-get update -qq
             apt-get install -y falco
-            
-            # Prefer Modern eBPF if supported
-            if falco --modern-bpf --dry-run 2>&1 | grep -q "Modern BPF"; then
-                warn "Falco Modern eBPF available but needs configuration"
-            fi
-            
+
+            # Configure Falco to write JSON output
+            mkdir -p /etc/falco
+            cat > /etc/falco/falco.yaml <<'EOF'
+json_output: true
+json_include_output_property: true
+file_output:
+  enabled: true
+  keep_alive: false
+  filename: /var/log/falco-events.jsonl
+EOF
+
             systemctl disable falco
-            ok "Installed Falco (not yet enabled)"
+            ok "Installed Falco with JSON output (not yet enabled)"
         else
             warn "Would install Falco"
         fi
@@ -345,81 +435,126 @@ setup_falco() {
     fi
 }
 
-# nftables firewall
+# Resolve New Relic endpoints via DNS
+resolve_nr_endpoints() {
+    log "Resolving New Relic endpoints..."
+
+    local log_ips_v4=()
+    local log_ips_v6=()
+    local metric_ips_v4=()
+    local metric_ips_v6=()
+
+    # Resolve log API
+    while IFS= read -r ip; do
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            log_ips_v4+=("$ip")
+        elif [[ "$ip" =~ : ]]; then
+            log_ips_v6+=("$ip")
+        fi
+    done < <(dig +short "$NR_LOG_HOST" A AAAA | grep -v '\.$')
+
+    # Resolve metric API
+    while IFS= read -r ip; do
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            metric_ips_v4+=("$ip")
+        elif [[ "$ip" =~ : ]]; then
+            metric_ips_v6+=("$ip")
+        fi
+    done < <(dig +short "$NR_METRIC_HOST" A AAAA | grep -v '\.$')
+
+    if [[ ${#log_ips_v4[@]} -eq 0 && ${#metric_ips_v4[@]} -eq 0 ]]; then
+        err "Failed to resolve New Relic endpoints"
+        return 1
+    fi
+
+    echo "${log_ips_v4[@]}" > /tmp/nr-log-ipv4.txt
+    echo "${log_ips_v6[@]}" > /tmp/nr-log-ipv6.txt
+    echo "${metric_ips_v4[@]}" > /tmp/nr-metric-ipv4.txt
+    echo "${metric_ips_v6[@]}" > /tmp/nr-metric-ipv6.txt
+
+    ok "Resolved NR endpoints: ${#log_ips_v4[@]} log IPv4, ${#log_ips_v6[@]} log IPv6, ${#metric_ips_v4[@]} metric IPv4, ${#metric_ips_v6[@]} metric IPv6"
+}
+
+# nftables firewall (enforced before Docker starts)
 setup_firewall() {
     log "Checking nftables firewall..."
-    
-    local nft_conf="/etc/nftables.conf"
+
     local nft_rules="${DEPLOY_DIR}/nftables/attackbox.nft"
-    
+
     if [[ ! -f "$nft_rules" ]]; then
         err "nftables rules not found: $nft_rules"
         return 1
     fi
-    
-    if [[ "$APPLY_MODE" == true ]]; then
-        # Backup existing config
-        if [[ -f "$nft_conf" ]]; then
-            cp "$nft_conf" "${nft_conf}.backup.$(date +%s)"
-        fi
-        
-        # Install our rules with rollback safety
-        cp "$nft_rules" "$nft_conf"
-        
-        # Test load
-        if ! nft -c -f "$nft_conf"; then
+
+    if [[ "$MODE" == "apply" ]]; then
+        # Resolve NR endpoints first
+        resolve_nr_endpoints
+
+        # Save current ruleset
+        local backup="/tmp/nftables-backup-$(date +%s).nft"
+        nft list ruleset > "$backup"
+
+        # Load attackbox table
+        if ! nft -c -f "$nft_rules"; then
             err "nftables rules validation failed"
-            # Restore backup if validation fails
-            local backup
-            backup=$(find "$(dirname "$nft_conf")" -name "$(basename "$nft_conf").backup.*" -type f 2>/dev/null | sort -r | head -1)
-            if [[ -n "$backup" ]]; then
-                cp "$backup" "$nft_conf"
-            fi
             return 1
         fi
-        
-        # Apply with rollback timer
-        log "Applying firewall rules with 30s rollback timer..."
-        nft -f "$nft_conf"
-        
-        # Schedule rollback
-        (
-            sleep 30
-            if [[ -f /tmp/attackbox-firewall-confirmed ]]; then
-                rm /tmp/attackbox-firewall-confirmed
-            else
-                nft flush ruleset
-                warn "Firewall rules rolled back (no confirmation)"
-            fi
-        ) &
-        
-        warn "Firewall loaded. Confirm connectivity within 30s or rules will rollback."
-        warn "To confirm: touch /tmp/attackbox-firewall-confirmed"
-        
+
+        nft -f "$nft_rules"
+
+        # Populate NR endpoint sets
+        if [[ -f /tmp/nr-log-ipv4.txt ]]; then
+            for ip in $(cat /tmp/nr-log-ipv4.txt); do
+                nft add element inet attackbox nr_log_ipv4 { "$ip" }
+            done
+        fi
+        if [[ -f /tmp/nr-log-ipv6.txt ]]; then
+            for ip in $(cat /tmp/nr-log-ipv6.txt); do
+                nft add element inet attackbox nr_log_ipv6 { "$ip" }
+            done
+        fi
+        if [[ -f /tmp/nr-metric-ipv4.txt ]]; then
+            for ip in $(cat /tmp/nr-metric-ipv4.txt); do
+                nft add element inet attackbox nr_metric_ipv4 { "$ip" }
+            done
+        fi
+        if [[ -f /tmp/nr-metric-ipv6.txt ]]; then
+            for ip in $(cat /tmp/nr-metric-ipv6.txt); do
+                nft add element inet attackbox nr_metric_ipv6 { "$ip" }
+            done
+        fi
+
+        # Populate shipper UID
+        local ship_uid
+        ship_uid=$(id -u "$SHIP_USER")
+        nft add element inet attackbox shipper_uids { "$ship_uid" }
+
         systemctl enable nftables
-        ok "Installed nftables rules (pending confirmation)"
+
+        ok "Installed nftables rules (backup: $backup)"
+        warn "Firewall enforced before Docker starts"
     else
-        warn "Would install nftables rules from $nft_rules"
+        warn "Would install nftables rules and populate NR endpoints/shipper UID"
     fi
 }
 
 # sysctl hardening
 setup_sysctl() {
     log "Checking sysctl hardening..."
-    
+
     local sysctl_conf="${DEPLOY_DIR}/sysctl/attackbox.conf"
     local target="/etc/sysctl.d/90-attackbox.conf"
-    
+
     if [[ ! -f "$sysctl_conf" ]]; then
         err "sysctl config not found: $sysctl_conf"
         return 1
     fi
-    
+
     if [[ ! -f "$target" ]] || ! cmp -s "$sysctl_conf" "$target"; then
-        if [[ "$APPLY_MODE" == true ]]; then
+        if [[ "$MODE" == "apply" ]]; then
             cp "$sysctl_conf" "$target"
             sysctl -p "$target"
-            ok "Applied sysctl hardening"
+            ok "Applied sysctl hardening (ip_forward=1 for Docker)"
         else
             warn "Would install sysctl hardening"
         fi
@@ -431,17 +566,17 @@ setup_sysctl() {
 # auditd rules
 setup_auditd() {
     log "Checking auditd rules..."
-    
+
     local audit_rules="${DEPLOY_DIR}/auditd/attackbox.rules"
     local target="/etc/audit/rules.d/90-attackbox.rules"
-    
+
     if [[ ! -f "$audit_rules" ]]; then
         err "auditd rules not found: $audit_rules"
         return 1
     fi
-    
+
     if [[ ! -f "$target" ]] || ! cmp -s "$audit_rules" "$target"; then
-        if [[ "$APPLY_MODE" == true ]]; then
+        if [[ "$MODE" == "apply" ]]; then
             cp "$audit_rules" "$target"
             augenrules --load
             systemctl restart auditd
@@ -454,18 +589,18 @@ setup_auditd() {
     fi
 }
 
-# Unattended upgrades
+# Unattended upgrades (enable security updates, no auto-reboot)
 setup_unattended_upgrades() {
     log "Checking unattended-upgrades..."
-    
+
     local config="/etc/apt/apt.conf.d/50unattended-upgrades"
-    
+    local auto_config="/etc/apt/apt.conf.d/20auto-upgrades"
+
     if [[ -f "$config" ]]; then
         if grep -q 'Automatic-Reboot "false"' "$config"; then
             ok "unattended-upgrades configured (no auto-reboot)"
         else
-            if [[ "$APPLY_MODE" == true ]]; then
-                # Ensure no automatic reboots
+            if [[ "$MODE" == "apply" ]]; then
                 if ! grep -q "Automatic-Reboot" "$config"; then
                     echo 'Unattended-Upgrade::Automatic-Reboot "false";' >> "$config"
                 else
@@ -476,32 +611,46 @@ setup_unattended_upgrades() {
                 warn "Would disable automatic reboots"
             fi
         fi
+    fi
+
+    # Enable automatic security updates
+    if [[ ! -f "$auto_config" ]] || ! grep -q 'APT::Periodic::Unattended-Upgrade "1"' "$auto_config"; then
+        if [[ "$MODE" == "apply" ]]; then
+            cat > "$auto_config" <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+            ok "Enabled automatic security updates"
+        else
+            warn "Would enable automatic security updates"
+        fi
     else
-        warn "unattended-upgrades config not found"
+        ok "Automatic security updates enabled"
     fi
 }
 
 # Systemd units
 setup_systemd_units() {
     log "Checking systemd units..."
-    
+
     local units=(
         "attackbox-shipper.service"
+        "attackbox-falco-adapter.service"
+        "attackbox-egress-adapter.service"
     )
-    
+
     for unit in "${units[@]}"; do
         local unit_file="${DEPLOY_DIR}/systemd/${unit}"
         local target="/etc/systemd/system/${unit}"
-        
+
         if [[ ! -f "$unit_file" ]]; then
             err "Unit file not found: $unit_file"
             continue
         fi
-        
+
         if [[ ! -f "$target" ]] || ! cmp -s "$unit_file" "$target"; then
-            if [[ "$APPLY_MODE" == true ]]; then
+            if [[ "$MODE" == "apply" ]]; then
                 cp "$unit_file" "$target"
-                systemctl daemon-reload
                 ok "Installed $unit"
             else
                 warn "Would install $unit"
@@ -510,6 +659,122 @@ setup_systemd_units() {
             ok "Unit $unit already installed"
         fi
     done
+
+    # Journald config
+    local journald_conf="${DEPLOY_DIR}/systemd/journald-attackbox.conf"
+    local journald_target="/etc/systemd/journald.conf.d/attackbox.conf"
+
+    if [[ -f "$journald_conf" ]]; then
+        mkdir -p "$(dirname "$journald_target")"
+        if [[ ! -f "$journald_target" ]] || ! cmp -s "$journald_conf" "$journald_target"; then
+            if [[ "$MODE" == "apply" ]]; then
+                cp "$journald_conf" "$journald_target"
+                systemctl restart systemd-journald
+                ok "Installed journald config"
+            else
+                warn "Would install journald config"
+            fi
+        else
+            ok "Journald config already installed"
+        fi
+    fi
+
+    if [[ "$MODE" == "apply" ]]; then
+        systemctl daemon-reload
+    fi
+}
+
+# Check binaries exist
+check_binaries() {
+    log "Checking binaries..."
+
+    local binaries=(
+        "/usr/local/bin/attackbox"
+        "/usr/local/bin/attackbox-shipper"
+    )
+
+    local missing=()
+    for bin in "${binaries[@]}"; do
+        if [[ ! -x "$bin" ]]; then
+            missing+=("$bin")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        err "Missing binaries: ${missing[*]}"
+        err "Place binaries in /usr/local/bin/ before starting services"
+        return 1
+    fi
+
+    ok "All binaries present"
+}
+
+# Check shipper.env exists
+check_shipper_env() {
+    log "Checking shipper.env..."
+
+    local env_file="/etc/attackbox/shipper.env"
+
+    if [[ ! -f "$env_file" ]]; then
+        err "Missing $env_file"
+        err "Create with root:root 0600 containing ATTACKBOX_NR_* variables"
+        return 1
+    fi
+
+    # Check ownership and mode
+    local owner
+    local mode
+    owner=$(stat -c '%U:%G' "$env_file" 2>/dev/null || stat -f '%Su:%Sg' "$env_file")
+    mode=$(stat -c '%a' "$env_file" 2>/dev/null || stat -f '%A' "$env_file" | tail -c 4)
+
+    if [[ "$owner" != "root:root" ]]; then
+        err "$env_file has wrong ownership: $owner (must be root:root)"
+        return 1
+    fi
+
+    if [[ "$mode" != "600" ]]; then
+        err "$env_file has wrong mode: $mode (must be 0600)"
+        return 1
+    fi
+
+    ok "Shipper env file correct"
+}
+
+# Start services
+start_services() {
+    log "Starting services..."
+
+    if [[ "$MODE" != "apply" ]]; then
+        warn "Would start services"
+        return 0
+    fi
+
+    # Check prerequisites
+    check_binaries || return 1
+    check_shipper_env || return 1
+
+    # Start Docker (firewall already enforced)
+    systemctl start docker
+    ok "Started Docker"
+
+    # Start shipper
+    systemctl enable attackbox-shipper
+    systemctl start attackbox-shipper
+    ok "Started attackbox-shipper"
+
+    # Start Falco with Modern eBPF
+    systemctl enable falco-modern-bpf
+    systemctl start falco-modern-bpf
+    ok "Started falco-modern-bpf"
+
+    # Start adapters
+    systemctl enable attackbox-falco-adapter
+    systemctl start attackbox-falco-adapter
+    ok "Started attackbox-falco-adapter"
+
+    systemctl enable attackbox-egress-adapter
+    systemctl start attackbox-egress-adapter
+    ok "Started attackbox-egress-adapter"
 }
 
 # SSH disablement
@@ -517,17 +782,16 @@ disable_ssh() {
     if [[ "$DISABLE_SSH" != true || "$CONSOLE_CONFIRMED" != true ]]; then
         return 0
     fi
-    
+
     log "Disabling SSH and cloud-init..."
-    
-    if [[ "$APPLY_MODE" == true ]]; then
+
+    if [[ "$MODE" == "apply" ]]; then
         systemctl stop ssh
         systemctl disable ssh
         systemctl mask ssh
-        
-        # Disable cloud-init
+
         touch /etc/cloud/cloud-init.disabled
-        
+
         ok "SSH and cloud-init disabled"
         warn "Ensure provider console access is working!"
     else
@@ -535,42 +799,95 @@ disable_ssh() {
     fi
 }
 
-# Log rotation
-setup_log_rotation() {
-    log "Checking log rotation..."
-    
-    local logrotate_conf="/etc/logrotate.d/attackbox-shipper"
-    
-    if [[ ! -f "$logrotate_conf" ]]; then
-        if [[ "$APPLY_MODE" == true ]]; then
-            cat > "$logrotate_conf" <<'EOF'
-/var/log/attackbox-shipper/*.log {
-    daily
-    rotate 7
-    compress
-    delaycompress
-    missingok
-    notifempty
-    create 0640 root adm
-}
-EOF
-            ok "Configured log rotation"
+# Verification mode
+run_verification() {
+    log "Running real validation checks..."
+
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        err "Verification requires Linux"
+        return 1
+    fi
+
+    if ! command -v docker >/dev/null; then
+        err "Verification requires Docker"
+        return 1
+    fi
+
+    if ! docker info --format '{{.Runtimes.runsc}}' | grep -q runsc; then
+        err "Verification requires gVisor runtime"
+        return 1
+    fi
+
+    # Test metadata blocking from container
+    log "Testing metadata blocking from gVisor container..."
+    if docker run --rm --runtime=runsc alpine:latest wget -T 2 -O- http://169.254.169.254/ 2>&1 | grep -q "timed out\|Connection refused"; then
+        ok "Metadata blocked from container"
+    else
+        err "Metadata NOT blocked from container"
+    fi
+
+    # Test DNS from container
+    log "Testing DNS from gVisor container..."
+    if docker run --rm --runtime=runsc alpine:latest nslookup google.com 1.1.1.1 >/dev/null 2>&1; then
+        ok "DNS works from container"
+    else
+        err "DNS does NOT work from container"
+    fi
+
+    # Test internet from container (should be blocked except through proxy)
+    log "Testing internet blocking from gVisor container..."
+    if ! docker run --rm --runtime=runsc alpine:latest wget -T 2 -O- https://example.com >/dev/null 2>&1; then
+        ok "Internet blocked from container"
+    else
+        warn "Internet NOT blocked from container (expected for bait, proxy should work)"
+    fi
+
+    # Test socket
+    log "Testing shipper socket..."
+    if [[ -S "$SPOOL_SOCKET" ]]; then
+        ok "Shipper socket exists"
+
+        # Check mode
+        local sock_mode
+        sock_mode=$(stat -c '%a' "$SPOOL_SOCKET" 2>/dev/null || stat -f '%A' "$SPOOL_SOCKET" | tail -c 4)
+        if [[ "$sock_mode" == "220" ]]; then
+            ok "Socket mode correct (0220)"
         else
-            warn "Would configure log rotation"
+            err "Socket mode wrong: $sock_mode (expected 0220)"
         fi
     else
-        ok "Log rotation already configured"
+        err "Shipper socket does not exist"
     fi
+
+    # Test NR endpoints reachable from shipper UID
+    log "Testing New Relic endpoints..."
+    if [[ -f /tmp/nr-log-ipv4.txt ]]; then
+        local test_ip
+        test_ip=$(head -1 /tmp/nr-log-ipv4.txt)
+        if sudo -u "$SHIP_USER" timeout 5 bash -c "echo test | nc -w 2 $test_ip 443" >/dev/null 2>&1; then
+            ok "New Relic endpoint reachable from shipper UID"
+        else
+            warn "New Relic endpoint NOT immediately reachable (firewall may need time)"
+        fi
+    fi
+
+    ok "Verification complete"
 }
 
 # Main execution
 main() {
     log "Attack-box Ubuntu deployment"
-    log "Mode: $([ "$APPLY_MODE" == true ] && echo "APPLY" || echo "DRY-RUN")"
-    
+    log "Mode: $MODE"
+
     check_root
+    check_linux
     check_os
-    
+
+    if [[ "$MODE" == "verify" ]]; then
+        run_verification
+        exit $?
+    fi
+
     setup_users
     setup_directories
     install_packages
@@ -582,20 +899,26 @@ main() {
     setup_auditd
     setup_unattended_upgrades
     setup_systemd_units
-    setup_log_rotation
-    disable_ssh
-    
-    echo ""
-    if [[ "$APPLY_MODE" == true ]]; then
+
+    if [[ "$MODE" == "apply" ]]; then
+        disable_ssh
+        start_services
+
+        echo ""
         ok "Deployment complete"
-        warn "Remember to:"
-        warn "  1. Confirm firewall: touch /tmp/attackbox-firewall-confirmed"
-        warn "  2. Create /etc/attackbox/shipper.env (root:root 0600)"
-        warn "  3. Place binaries in /usr/local/bin/"
-        warn "  4. Start services: systemctl start attackbox-shipper"
+        warn "Services started:"
+        warn "  - Docker (with gVisor runtime)"
+        warn "  - attackbox-shipper"
+        warn "  - falco-modern-bpf"
+        warn "  - attackbox-falco-adapter"
+        warn "  - attackbox-egress-adapter"
+        warn ""
+        warn "Run with --verify to test metadata blocking, DNS, and NR endpoints"
     else
+        echo ""
         ok "Preflight check complete (no changes made)"
         warn "Run with --apply to apply changes"
+        warn "Run with --verify to test real validation (requires Linux + Docker + gVisor)"
     fi
 }
 

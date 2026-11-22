@@ -1,0 +1,36 @@
+[Unit]
+Description=Attack-box egress event adapter
+Documentation=https://github.com/example/attack-box
+After=nftables.service attackbox-shipper.service
+Requires=attackbox-shipper.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Monitor nftables log and send to shipper
+ExecStart=/usr/bin/nft monitor trace | /usr/local/bin/attackbox-shipper -stdin-stream egress
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=attackbox-egress-adapter
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+
+# Resource limits
+MemoryMax=64M
+TasksMax=50
+
+[Install]
+WantedBy=multi-user.target

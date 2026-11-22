@@ -3,16 +3,18 @@ Description=Attack-box telemetry shipper
 Documentation=https://github.com/example/attack-box
 After=network-online.target nftables.service
 Wants=network-online.target
+Before=docker.service
 
 [Service]
 Type=simple
 User=abx-ship
 Group=abx-ship
+SupplementaryGroups=abx-bait
 
-# Environment from root-owned file
+# Environment from root-owned file (must exist before startup)
 EnvironmentFile=/etc/attackbox/shipper.env
 
-# Binary
+# Binary (must exist)
 ExecStart=/usr/local/bin/attackbox-shipper
 
 # Hardening
@@ -21,17 +23,17 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadOnlyPaths=/
-ReadWritePaths=/run/attackbox /var/lib/attackbox-shipper /var/log/attackbox-shipper
+ReadWritePaths=/run/attackbox /var/lib/attackbox-shipper
 
 # State directory (mode 0700, owned by abx-ship)
 StateDirectory=attackbox-shipper
 StateDirectoryMode=0700
 
-# Runtime directory
+# Runtime directory (mode 0710, owned by abx-ship:abx-bait)
 RuntimeDirectory=attackbox
-RuntimeDirectoryMode=0770
+RuntimeDirectoryMode=0710
 
-# Logging
+# Logging to journal with bounded size
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=attackbox-shipper
@@ -60,8 +62,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 ProtectClock=yes
 
-# Network
-# Note: shipper needs network for New Relic egress
+# Network access for New Relic egress
 PrivateNetwork=no
 
 # System calls
