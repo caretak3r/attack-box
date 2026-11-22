@@ -87,7 +87,7 @@ If you do not set any listener, the bait exits with an error.
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `ATTACKBOX_INSTANCE` | `attackbox` | Instance label for New Relic. Use 1-64 characters from `[A-Za-z0-9._-]`. |
-| `ATTACKBOX_MODELS` | _(empty)_ | Comma-separated fake model names. Example: `gpt-4,gpt-3.5-turbo`. If empty, the bait accepts any model name. |
+| `ATTACKBOX_MODELS` | `qwen3:8b,gpt-oss:20b,llama3.1:8b` | Comma-separated fake model names. If empty, the bait uses these three defaults. |
 | `ATTACKBOX_TRUSTED_PROXIES` | _(empty)_ | Comma-separated CIDRs. The bait trusts `X-Forwarded-For` from these IPs only. |
 | `ATTACKBOX_MAX_SESSIONS` | `10000` | Concurrent session limit (1 to 100000). |
 | `ATTACKBOX_MAX_BODY_BYTES` | `1048576` | Request body size limit in bytes (1 to 16777216). |
