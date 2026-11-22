@@ -31,6 +31,7 @@ const (
 	licenseKeyLen    = 40
 
 	defaultPayloadBytes = 900_000
+	minPayloadBytes     = 64 << 10
 	maxPayloadBytes     = 950_000 // New Relic rejects bodies over 1MB
 	closeGrace          = time.Second
 
@@ -174,7 +175,7 @@ func NewNewRelic(cfg NRConfig) (*NewRelic, error) {
 	if cfg.MaxPayloadBytes <= 0 {
 		cfg.MaxPayloadBytes = defaultPayloadBytes
 	}
-	cfg.MaxPayloadBytes = min(cfg.MaxPayloadBytes, maxPayloadBytes)
+	cfg.MaxPayloadBytes = min(max(cfg.MaxPayloadBytes, minPayloadBytes), maxPayloadBytes)
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -506,6 +507,8 @@ func logItem(e Event) ([]byte, error) {
 // limitAttrs flattens e within New Relic's attribute limits, which otherwise
 // make it drop the whole record. Extra Attrs past maxExtraAttrs are dropped in
 // key order, and long keys and values are cut; any cut sets attrs_truncated.
+// Values that are not scalars or string slices are shipped as a JSON string,
+// because New Relic would flatten them into one attribute per leaf.
 func limitAttrs(e Event) map[string]any {
 	cut := len(e.Attrs) > maxExtraAttrs
 	if cut {
@@ -534,6 +537,14 @@ func limitAttrs(e Event) map[string]any {
 				c[i] = clip(s, maxAttrValue)
 			}
 			v = c
+		case nil, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64,
+			float32, float64, json.Number:
+		default:
+			b, err := json.Marshal(x)
+			if err != nil {
+				b = []byte(fmt.Sprintf("[unmarshalable %T]", x))
+			}
+			v = clip(string(b), maxAttrValue)
 		}
 		out[clip(k, maxAttrKey)] = v
 	}
@@ -603,12 +614,14 @@ func (n *NewRelic) flushLogs(events []Event) {
 		n.fail(fmt.Errorf("newrelic: marshal common: %w", err), len(items))
 		return
 	}
-	failed := n.postAll(n.cfg.LogURL, common, "logs", items)
-	n.lost.Add(int64(len(failed)))
+	retry, perm := n.postAll(n.cfg.LogURL, common, "logs", items)
+	n.lost.Add(int64(len(retry) + len(perm)))
 }
 
-// flushMetrics ships the pending series. Series from a failed POST are merged
-// back for the next flush, or counted lost when final is set.
+// flushMetrics ships the pending series. Series from a POST that failed for a
+// transient reason are merged back for the next flush, or counted lost when
+// final is set. A permanently rejected POST is counted lost at once, so the
+// same payload is not sent again. The shipper's own gauges are never counted.
 func (n *NewRelic) flushMetrics(final bool) {
 	now := n.cfg.Now()
 	n.mu.Lock()
@@ -668,16 +681,28 @@ func (n *NewRelic) flushMetrics(final bool) {
 		n.fail(fmt.Errorf("newrelic: marshal common: %w", err), len(items))
 		return
 	}
-	failed := n.postAll(n.cfg.MetricURL, common, "metrics", items)
+	retry, perm := n.postAll(n.cfg.MetricURL, common, "metrics", items)
+	lost := 0
+	for _, i := range perm {
+		if !pending[itemKeys[i]].internal {
+			lost++
+		}
+	}
 	if final {
-		n.lost.Add(int64(len(failed)))
+		for _, i := range retry {
+			if !pending[itemKeys[i]].internal {
+				lost++
+			}
+		}
+		n.lost.Add(int64(lost))
 		return
 	}
-	retry := make(map[string]*series, len(failed))
-	for _, i := range failed {
-		retry[itemKeys[i]] = pending[itemKeys[i]]
+	n.lost.Add(int64(lost))
+	requeue := make(map[string]*series, len(retry))
+	for _, i := range retry {
+		requeue[itemKeys[i]] = pending[itemKeys[i]]
 	}
-	n.requeue(retry)
+	n.requeue(requeue)
 }
 
 // requeue folds series from a failed POST back into the live set: counts add
@@ -707,9 +732,10 @@ func (n *NewRelic) requeue(failed map[string]*series) {
 const payloadTail = `]}]`
 
 // postAll packs items into POSTs of at most MaxPayloadBytes uncompressed and
-// returns the indexes of items whose POST failed. An item too large for any
-// POST is counted lost and not returned.
-func (n *NewRelic) postAll(endpoint string, common []byte, field string, items [][]byte) (failed []int) {
+// returns the indexes of items whose POST failed: retry for transient
+// failures, perm for rejections that a resend will not clear. An item too
+// large for any POST is counted lost and not returned.
+func (n *NewRelic) postAll(endpoint string, common []byte, field string, items [][]byte) (retry, perm []int) {
 	head := append(append([]byte(`[{"common":`), common...), []byte(`,"`+field+`":[`)...)
 	limit := n.cfg.MaxPayloadBytes - len(head) - len(payloadTail)
 
@@ -717,7 +743,8 @@ func (n *NewRelic) postAll(endpoint string, common []byte, field string, items [
 	size := 0
 	flush := func() {
 		if len(group) > 0 {
-			failed = append(failed, n.postGroup(endpoint, head, items, group)...)
+			r, p := n.postGroup(endpoint, head, items, group)
+			retry, perm = append(retry, r...), append(perm, p...)
 		}
 		group, size = nil, 0
 	}
@@ -738,14 +765,15 @@ func (n *NewRelic) postAll(endpoint string, common []byte, field string, items [
 		size += extra
 	}
 	flush()
-	return failed
+	return retry, perm
 }
 
 // postGroup sends items[group] in one POST. On 413 a multi-item group is split
-// in half and each half sent on its own. It returns the indexes that failed.
-func (n *NewRelic) postGroup(endpoint string, head []byte, items [][]byte, group []int) []int {
+// in half and each half sent on its own. It returns the indexes that failed,
+// split by whether a later resend could succeed.
+func (n *NewRelic) postGroup(endpoint string, head []byte, items [][]byte, group []int) (retry, perm []int) {
 	if n.ctx.Err() != nil {
-		return group
+		return group, nil
 	}
 	payload := append([]byte(nil), head...)
 	for i, idx := range group {
@@ -756,18 +784,23 @@ func (n *NewRelic) postGroup(endpoint string, head []byte, items [][]byte, group
 	}
 	payload = append(payload, payloadTail...)
 
-	err := n.post(endpoint, payload)
+	transient, err := n.post(endpoint, payload)
 	if err == nil {
 		n.sent.Add(int64(len(group)))
-		return nil
+		return nil, nil
 	}
 	var se *statusError
 	if errors.As(err, &se) && se.status == http.StatusRequestEntityTooLarge && len(group) > 1 {
 		mid := len(group) / 2
-		return append(n.postGroup(endpoint, head, items, group[:mid]), n.postGroup(endpoint, head, items, group[mid:])...)
+		r1, p1 := n.postGroup(endpoint, head, items, group[:mid])
+		r2, p2 := n.postGroup(endpoint, head, items, group[mid:])
+		return append(r1, r2...), append(p1, p2...)
 	}
 	n.recordErr(err)
-	return group
+	if transient {
+		return group, nil
+	}
+	return nil, group
 }
 
 func gzipBody(payload []byte) ([]byte, error) {
@@ -793,28 +826,29 @@ func (n *NewRelic) postOnce(endpoint string, payload []byte, items int) {
 }
 
 // post gzips and sends payload, retrying transient failures. The caller
-// counts the outcome.
-func (n *NewRelic) post(endpoint string, payload []byte) error {
+// counts the outcome. transient reports whether the final failure is one a
+// later resend could clear.
+func (n *NewRelic) post(endpoint string, payload []byte) (transient bool, err error) {
 	body, err := gzipBody(payload)
 	if err != nil {
-		return err
+		return false, err
 	}
 	for attempt := 0; ; attempt++ {
 		var retry bool
 		var after time.Duration
 		retry, after, err = n.try(endpoint, body)
 		if err == nil {
-			return nil
+			return false, nil
 		}
 		if !retry || attempt >= len(n.cfg.Backoff) {
-			return err
+			return retry, err
 		}
 		// The larger of the backoff step and Retry-After, always capped.
 		wait := min(max(n.cfg.Backoff[attempt], after), n.cfg.MaxRetryAfter)
 		select {
 		case <-time.After(wait):
 		case <-n.ctx.Done():
-			return err
+			return true, err
 		}
 		// Counted only once the next POST is certain to run.
 		n.retries.Add(1)

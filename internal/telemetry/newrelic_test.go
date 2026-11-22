@@ -238,9 +238,10 @@ func TestMetricShape(t *testing.T) {
 func TestBatchSplitByPayloadSize(t *testing.T) {
 	srv := newServer(t, 202)
 	cfg := srv.cfg()
-	cfg.MaxPayloadBytes = 1500
+	cfg.MaxPayloadBytes = minPayloadBytes
 	n := start(t, cfg)
-	for i := 0; i < 10; i++ {
+	const events = 400
+	for i := 0; i < events; i++ {
 		n.Emit(Event{Stream: StreamEdge, Body: strings.Repeat("x", 300)})
 	}
 	closeNR(t, n)
@@ -260,7 +261,7 @@ func TestBatchSplitByPayloadSize(t *testing.T) {
 		}
 		total += len(lp[0].Logs)
 	}
-	if total != 10 {
+	if total != events {
 		t.Errorf("events delivered = %d", total)
 	}
 }
@@ -268,9 +269,13 @@ func TestBatchSplitByPayloadSize(t *testing.T) {
 func TestOversizedItemDropped(t *testing.T) {
 	srv := newServer(t, 202)
 	cfg := srv.cfg()
-	cfg.MaxPayloadBytes = 400
+	cfg.MaxPayloadBytes = minPayloadBytes
 	n := start(t, cfg)
-	n.Emit(Event{Stream: StreamEdge, Body: strings.Repeat("x", 1000)})
+	big := map[string]any{}
+	for i := 0; i < 20; i++ {
+		big[fmt.Sprintf("k%d", i)] = strings.Repeat("x", 4000)
+	}
+	n.Emit(Event{Stream: StreamEdge, Attrs: big})
 	closeNR(t, n)
 	st := n.Stats()
 	if st.Errors != 1 || st.Lost != 1 || len(srv.posts("/log/v1")) != 0 {
