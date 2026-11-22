@@ -375,11 +375,16 @@ var cookieAttrs = map[string]bool{
 func scrubCookie(v string, set bool, mark func(string) string) string {
 	parts := strings.Split(v, ";")
 	for i, p := range parts {
-		body := strings.TrimSpace(p)
+		// Offsets come from trimming, not strings.Index: the trimmed body can
+		// also occur inside the leading whitespace bytes (U+2000 is E2 80 80,
+		// body "\x80"), and a split rune makes the next pass disagree.
+		trimmed := strings.TrimLeftFunc(p, unicode.IsSpace)
+		lead := len(p) - len(trimmed)
+		body := strings.TrimRightFunc(trimmed, unicode.IsSpace)
+		end := lead + len(body)
 		if body == "" {
 			continue
 		}
-		lead := strings.Index(p, body)
 		eq := strings.IndexByte(body, '=')
 		name := body
 		if eq >= 0 {
@@ -401,7 +406,7 @@ func scrubCookie(v string, set bool, mark func(string) string) string {
 				body = body[:eq+1] + q + mark(inner) + q
 			}
 		}
-		parts[i] = p[:lead] + body + p[lead+len(strings.TrimSpace(p)):]
+		parts[i] = p[:lead] + body + p[end:]
 	}
 	return strings.Join(parts, ";")
 }

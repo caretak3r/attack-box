@@ -78,3 +78,21 @@ func TestScrubBearerFingerprintParity(t *testing.T) {
 		}
 	}
 }
+
+// FuzzScrub corpus 8783b3da9bc4b3bc: the cookie body "\x80" also occurs
+// inside the leading U+2000 (E2 80 80). Locating it with strings.Index split
+// the rune, so a second pass re-fingerprinted the whole suffix.
+func TestScrubCookieUnicodeSpaceInvalidUTF8(t *testing.T) {
+	in := "Cookie: \x80"
+	want := "Cookie: [redacted:" + fp("\x80") + "]"
+	once := Scrub(in, fp)
+	if once != want {
+		t.Fatalf("got %q, want %q", once, want)
+	}
+	if twice := Scrub(once, fp); twice != once {
+		t.Fatalf("not idempotent: %q -> %q", once, twice)
+	}
+	if !strings.HasPrefix(once, "Cookie: ") {
+		t.Fatalf("leading U+2000 split: %q", once)
+	}
+}
