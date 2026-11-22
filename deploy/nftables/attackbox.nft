@@ -67,6 +67,11 @@ table inet attackbox {
         # Established/related
         ct state established,related accept
 
+        # Host to proxy/bait containers (docker-proxy for the loopback
+        # published ports, health checks). Only the two listener ports.
+        oifname "docker0" ct state new tcp dport { 8080, 8443 } accept
+        oifname "br-*" ct state new tcp dport { 8080, 8443 } accept
+
         # Block metadata
         ip daddr $metadata_ipv4 counter log prefix "METADATA-BLOCK-OUT: " reject
         ip6 daddr $metadata_ipv6 counter log prefix "METADATA-BLOCK-OUT: " reject

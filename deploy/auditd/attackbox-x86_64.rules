@@ -1,0 +1,7 @@
+# Attack-box auditd rules: legacy syscalls that exist on x86_64 only
+# Loaded from /etc/audit/rules.d/91-attackbox-x86_64.rules (x86_64 hosts only).
+# arm64 has no unlink or rename syscall; auditctl rejects the name there.
+
+# File deletion (covering tracks): glibc unlink()/rename() use these on x86_64
+-a always,exit -F arch=b64 -S unlink -S rename -k delete
+-a always,exit -F arch=b32 -S unlink -S rename -k delete

@@ -51,8 +51,11 @@
 -a always,exit -F arch=b32 -S socket -S connect -k network_connect
 
 # File deletion (covering tracks)
--a always,exit -F arch=b64 -S unlink -S unlinkat -S rename -S renameat -k delete
--a always,exit -F arch=b32 -S unlink -S unlinkat -S rename -S renameat -k delete
+# unlinkat/renameat/renameat2 exist on every arch. Legacy unlink/rename are
+# missing on arm64 and make augenrules reject the whole file, so they live in
+# attackbox-x86_64.rules, which the deploy script installs on x86_64 only.
+-a always,exit -F arch=b64 -S unlinkat -S renameat -S renameat2 -k delete
+-a always,exit -F arch=b32 -S unlinkat -S renameat -S renameat2 -k delete
 
 # Privilege escalation attempts
 -a always,exit -F arch=b64 -S setuid -S setgid -F a0!=0 -k privilege_change

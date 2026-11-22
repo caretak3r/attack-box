@@ -9,8 +9,12 @@ Type=simple
 User=root
 Group=root
 
+# Own socket on the shipper: the spool.sock default only admits the bait uid
+Environment=ATTACKBOX_SPOOL_SOCKET=/run/attackbox/egress.sock
+
 # Follow kernel log for nftables drops, convert to JSONL for shipper
-ExecStart=/bin/bash -c 'exec journalctl -kf -o json --no-pager | grep -a "OUTPUT-DROP\\|CONTAINER-EGRESS-BLOCK\\|METADATA-BLOCK" | /usr/local/bin/attackbox-shipper -stdin-stream egress'
+# (--line-buffered: grep block-buffers on a pipe and would hold events back)
+ExecStart=/bin/bash -c 'exec journalctl -kf -o json --no-pager | grep -a --line-buffered "OUTPUT-DROP\\|CONTAINER-EGRESS-BLOCK\\|METADATA-BLOCK" | /usr/local/bin/attackbox-shipper -stdin-stream egress'
 
 # Hardening
 NoNewPrivileges=yes

@@ -14,6 +14,8 @@ readonly BAIT_USER="abx-bait"
 readonly SHIP_USER="abx-ship"
 readonly SHIP_GROUP="abx-ship"
 readonly SPOOL_SOCKET="/run/attackbox/spool.sock"
+readonly SECRETS_DIR="/opt/attackbox/secrets"
+readonly REFRESH_BIN="/usr/local/sbin/attackbox-deploy"
 readonly QUEUE_DIR="/var/lib/attackbox-shipper/queue"
 readonly NR_LOG_HOST="log-api.newrelic.com"
 readonly NR_METRIC_HOST="metric-api.newrelic.com"
@@ -42,6 +44,8 @@ Options:
     --dry-run                Explicit preflight (same as default, no mutations)
     --verify                 Real validation: proxy/bait metadata, DNS/NTP, NR endpoints
                              (requires Linux with Docker + gVisor; reports prerequisites)
+    --refresh-sets           Re-resolve NR/Ubuntu endpoints into the nftables sets
+                             (run by attackbox-nft-refresh.timer; needs the table loaded)
     --disable-ssh            Mark SSH for disablement (needs --console-confirmed)
     --console-confirmed      Confirm console access verified (needs --disable-ssh)
     -h, --help               Show this help
@@ -74,6 +78,7 @@ while [[ $# -gt 0 ]]; do
         --apply) MODE="apply"; shift ;;
         --dry-run) MODE="preflight"; shift ;;
         --verify) MODE="verify"; shift ;;
+        --refresh-sets) MODE="refresh"; shift ;;
         --disable-ssh) DISABLE_SSH=true; shift ;;
         --console-confirmed) CONSOLE_CONFIRMED=true; shift ;;
         -h|--help) usage 0 ;;
@@ -241,10 +246,10 @@ setup_users() {
 setup_directories() {
     log "Checking directories..."
 
-    # /run/attackbox: abx-ship:abx-bait mode 0710
+    # /run/attackbox: abx-ship:abx-bait mode 2710 (setgid: sockets inherit abx-bait)
     # /var/lib/attackbox-shipper/queue: abx-ship:abx-ship mode 0700
     local dirs=(
-        "/run/attackbox:0710:$SHIP_USER:$BAIT_USER"
+        "/run/attackbox:2710:$SHIP_USER:$BAIT_USER"
         "$QUEUE_DIR:0700:$SHIP_USER:$SHIP_GROUP"
     )
 
@@ -278,6 +283,10 @@ install_packages() {
         auditd
         unattended-upgrades
         nftables
+        dnsutils
+        jq
+        openssl
+        lsb-release
     )
 
     local missing=()
@@ -337,22 +346,27 @@ setup_docker() {
         fi
     fi
 
-    # Preserve existing daemon.json, only add runsc if needed
+    # Preserve existing daemon.json, only add runsc if needed. The bait reaches
+    # the shipper through a host unix socket, which gVisor blocks unless runsc
+    # runs with --host-uds=open, so an existing runsc entry is patched too.
     local daemon_json="/etc/docker/daemon.json"
     if [[ -f "$daemon_json" ]]; then
-        if ! jq -e '.runtimes.runsc' "$daemon_json" >/dev/null 2>&1; then
+        if ! jq -e '(.runtimes.runsc.runtimeArgs // []) | any(. == "--host-uds=open")' "$daemon_json" >/dev/null 2>&1; then
             if [[ "$MODE" == "apply" ]]; then
-                # Merge runsc into existing config
+                # Merge runsc (path + --host-uds=open) into existing config
                 local tmp
                 tmp=$(mktemp)
-                jq '.runtimes.runsc = {"path": "/usr/bin/runsc"}' "$daemon_json" > "$tmp"
-                mv "$tmp" "$daemon_json"
-                ok "Added runsc to existing daemon.json"
+                jq '.runtimes.runsc = ((.runtimes.runsc // {"path": "/usr/bin/runsc"})
+                    | .runtimeArgs = (((.runtimeArgs // []) | map(select(startswith("--host-uds=") | not))) + ["--host-uds=open"]))' \
+                    "$daemon_json" > "$tmp"
+                cat "$tmp" > "$daemon_json"
+                rm -f "$tmp"
+                ok "Set runsc runtime with --host-uds=open in existing daemon.json"
             else
-                warn "Would add runsc to existing daemon.json"
+                warn "Would set runsc runtime with --host-uds=open in existing daemon.json"
             fi
         else
-            ok "Docker daemon.json already has runsc"
+            ok "Docker daemon.json already has runsc with --host-uds=open"
         fi
     else
         if [[ "$MODE" == "apply" ]]; then
@@ -360,7 +374,8 @@ setup_docker() {
 {
   "runtimes": {
     "runsc": {
-      "path": "/usr/bin/runsc"
+      "path": "/usr/bin/runsc",
+      "runtimeArgs": ["--host-uds=open"]
     }
   },
   "log-driver": "json-file",
@@ -370,7 +385,7 @@ setup_docker() {
   }
 }
 EOF
-            ok "Created daemon.json with runsc"
+            ok "Created daemon.json with runsc (--host-uds=open)"
         else
             warn "Would create daemon.json with runsc"
         fi
@@ -427,9 +442,22 @@ setup_falco() {
             apt-get update -qq
             apt-get install -y falco
 
-            # Configure Falco to write JSON output
-            mkdir -p /etc/falco
-            cat > /etc/falco/falco.yaml <<'EOF'
+            systemctl disable falco
+            ok "Installed Falco (not yet enabled)"
+        else
+            warn "Would install Falco"
+        fi
+    else
+        ok "Falco installed"
+    fi
+
+    # JSON output via a config.d drop-in: the packaged falco.yaml (rules_files,
+    # engine, outputs) stays intact and the drop-in survives package upgrades.
+    if command -v falco >/dev/null; then
+        local dropin_dir="/etc/falco/config.d"
+        local dropin="${dropin_dir}/attackbox.yaml"
+        local want
+        want=$(cat <<'EOF'
 json_output: true
 json_include_output_property: true
 file_output:
@@ -437,20 +465,28 @@ file_output:
   keep_alive: false
   filename: /var/log/falco-events.jsonl
 EOF
-
-            systemctl disable falco
-            ok "Installed Falco with JSON output (not yet enabled)"
+)
+        if [[ ! -f "$dropin" ]] || [[ "$(cat "$dropin")" != "$want" ]]; then
+            if [[ "$MODE" == "apply" ]]; then
+                mkdir -p "$dropin_dir"
+                printf '%s\n' "$want" > "$dropin"
+                ok "Installed Falco JSON output drop-in"
+            else
+                warn "Would install Falco JSON output drop-in"
+            fi
         else
-            warn "Would install Falco"
+            ok "Falco JSON output drop-in already installed"
         fi
-    else
-        ok "Falco installed"
+        if [[ -f /etc/falco/falco.yaml ]] && ! grep -q 'config\.d' /etc/falco/falco.yaml; then
+            warn "falco.yaml has no config_files entry for $dropin_dir (needs Falco >= 0.38); drop-in is inactive"
+        fi
     fi
 }
 
 # Resolve New Relic endpoints via DNS
 resolve_nr_endpoints() {
-    log "Resolving New Relic endpoints..."
+    # stdout is captured by the caller as the tmpdir path: log to stderr
+    log "Resolving New Relic endpoints..." >&2
 
     local log_ips_v4=()
     local log_ips_v6=()
@@ -494,6 +530,43 @@ resolve_nr_endpoints() {
     echo "${metric_ips_v4[@]}" > "$tmpdir/nr-metric-ipv4.txt"
     echo "${metric_ips_v6[@]}" > "$tmpdir/nr-metric-ipv6.txt"
     echo "$tmpdir"  # Return tmpdir path
+}
+
+# Host DNS/NTP must match what the nftables output policy allows (Cloudflare
+# only). Install before any firewall loads, or host lookups time out.
+setup_host_dns_ntp() {
+    log "Checking host DNS/NTP configuration..."
+
+    local entries=(
+        "resolved-attackbox.conf:/etc/systemd/resolved.conf.d/attackbox.conf:systemd-resolved"
+        "timesyncd-attackbox.conf:/etc/systemd/timesyncd.conf.d/attackbox.conf:systemd-timesyncd"
+    )
+
+    local entry name target svc src
+    for entry in "${entries[@]}"; do
+        IFS=':' read -r name target svc <<< "$entry"
+        src="${DEPLOY_DIR}/systemd/${name}"
+
+        if [[ ! -f "$src" ]]; then
+            err "Config not found: $src"
+            return 1
+        fi
+
+        if [[ ! -f "$target" ]] || ! cmp -s "$src" "$target"; then
+            if [[ "$MODE" == "apply" ]]; then
+                mkdir -p "$(dirname "$target")"
+                cp "$src" "$target"
+                systemctl restart "$svc"
+                ok "Installed $target"
+            else
+                warn "Would install $target"
+            fi
+        else
+            ok "$target already installed"
+        fi
+    done
+
+    warn "DHCP-provided per-link DNS is overridden by Domains=~. (set use-dns: false in netplan to be explicit)"
 }
 
 # nftables firewall (enforced before Docker starts)
@@ -569,6 +642,31 @@ EOF
     ok "Loaded bootstrap firewall (metadata blocking + root registry)"
 }
 
+# Add resolved New Relic IPs (files written by resolve_nr_endpoints) and the
+# shipper UID to the attackbox sets.
+populate_nr_sets() {
+    local tmpdir="$1"
+    local entry set_name file ip
+    local ips=()
+
+    for entry in nr_log_ipv4:nr-log-ipv4 nr_log_ipv6:nr-log-ipv6 \
+                 nr_metric_ipv4:nr-metric-ipv4 nr_metric_ipv6:nr-metric-ipv6; do
+        set_name="${entry%%:*}"
+        file="$tmpdir/${entry##*:}.txt"
+        [[ -f "$file" ]] || continue
+        ips=()
+        read -ra ips < "$file" || true
+        for ip in "${ips[@]}"; do
+            nft add element inet attackbox "$set_name" { "$ip" }
+        done
+    done
+
+    # Populate shipper UID
+    local ship_uid
+    ship_uid=$(id -u "$SHIP_USER")
+    nft add element inet attackbox shipper_uids { "$ship_uid" }
+}
+
 setup_firewall() {
     log "Checking nftables firewall..."
 
@@ -584,10 +682,11 @@ setup_firewall() {
         local tmpdir
         tmpdir=$(resolve_nr_endpoints)
 
-        # Save current ruleset for ERR trap
+        # Save current ruleset for ERR trap. "nft list ruleset" output only
+        # adds, so the restore must flush first or it collides with live rules.
         local backup
         backup=$(mktemp)
-        nft list ruleset > "$backup"
+        { echo "flush ruleset"; nft list ruleset; } > "$backup"
 
         # ERR trap for rollback
         trap 'nft -f "'"$backup"'" 2>/dev/null; rm -f "'"$backup"'" "'"$tmpdir"'"/*.txt; rmdir "'"$tmpdir"'" 2>/dev/null; err "Firewall setup failed, rolled back"' ERR
@@ -607,32 +706,17 @@ setup_firewall() {
         resolve_ubuntu_mirrors
 
 
-        # Populate NR endpoint sets
-        if [[ -f "$tmpdir/nr-log-ipv4.txt" ]]; then
-            for ip in $(cat "$tmpdir/nr-log-ipv4.txt"); do
-                nft add element inet attackbox nr_log_ipv4 { "$ip" }
-            done
-        fi
-        if [[ -f "$tmpdir/nr-log-ipv6.txt" ]]; then
-            for ip in $(cat "$tmpdir/nr-log-ipv6.txt"); do
-                nft add element inet attackbox nr_log_ipv6 { "$ip" }
-            done
-        fi
-        if [[ -f "$tmpdir/nr-metric-ipv4.txt" ]]; then
-            for ip in $(cat "$tmpdir/nr-metric-ipv4.txt"); do
-                nft add element inet attackbox nr_metric_ipv4 { "$ip" }
-            done
-        fi
-        if [[ -f "$tmpdir/nr-metric-ipv6.txt" ]]; then
-            for ip in $(cat "$tmpdir/nr-metric-ipv6.txt"); do
-                nft add element inet attackbox nr_metric_ipv6 { "$ip" }
-            done
-        fi
+        # Populate NR endpoint sets and shipper UID
+        populate_nr_sets "$tmpdir"
 
-        # Populate shipper UID
-        local ship_uid
-        ship_uid=$(id -u "$SHIP_USER")
-        nft add element inet attackbox shipper_uids { "$ship_uid" }
+        # Persist across reboot: nftables.service loads /etc/nftables.conf. The
+        # sets come back empty, attackbox-nft-refresh.timer repopulates them.
+        if [[ -f /etc/nftables.conf ]] && ! cmp -s "$nft_rules" /etc/nftables.conf \
+            && [[ ! -f /etc/nftables.conf.pre-attackbox ]]; then
+            cp -p /etc/nftables.conf /etc/nftables.conf.pre-attackbox
+        fi
+        install -m 0644 -o root -g root "$nft_rules" /etc/nftables.conf
+        install -m 0750 -o root -g root "${SCRIPT_DIR}/deploy-ubuntu.sh" "$REFRESH_BIN"
 
         # Clear trap and cleanup on success
         trap - ERR
@@ -642,6 +726,7 @@ setup_firewall() {
         systemctl enable nftables
 
         ok "Installed nftables rules with rollback safety"
+        ok "Persisted rules to /etc/nftables.conf (sets refreshed by attackbox-nft-refresh.timer)"
         warn "Firewall enforced before Docker starts"
     else
         warn "Would install nftables rules and populate endpoints"
@@ -677,25 +762,39 @@ setup_sysctl() {
 setup_auditd() {
     log "Checking auditd rules..."
 
-    local audit_rules="${DEPLOY_DIR}/auditd/attackbox.rules"
-    local target="/etc/audit/rules.d/90-attackbox.rules"
-
-    if [[ ! -f "$audit_rules" ]]; then
-        err "auditd rules not found: $audit_rules"
-        return 1
+    # Legacy unlink/rename syscalls do not exist on arm64 and make augenrules
+    # reject the file, so they ship in a separate file for x86_64 only.
+    local entries=("attackbox.rules:90-attackbox.rules")
+    if [[ "$(uname -m)" == "x86_64" ]]; then
+        entries+=("attackbox-x86_64.rules:91-attackbox-x86_64.rules")
     fi
 
-    if [[ ! -f "$target" ]] || ! cmp -s "$audit_rules" "$target"; then
-        if [[ "$MODE" == "apply" ]]; then
-            cp "$audit_rules" "$target"
-            augenrules --load
-            systemctl restart auditd
-            ok "Applied auditd rules"
-        else
-            warn "Would install auditd rules"
+    local entry src target changed=false
+    for entry in "${entries[@]}"; do
+        src="${DEPLOY_DIR}/auditd/${entry%%:*}"
+        target="/etc/audit/rules.d/${entry##*:}"
+
+        if [[ ! -f "$src" ]]; then
+            err "auditd rules not found: $src"
+            return 1
         fi
-    else
-        ok "auditd rules already applied"
+
+        if [[ ! -f "$target" ]] || ! cmp -s "$src" "$target"; then
+            if [[ "$MODE" == "apply" ]]; then
+                cp "$src" "$target"
+                changed=true
+            else
+                warn "Would install $target"
+            fi
+        else
+            ok "auditd rules $target already applied"
+        fi
+    done
+
+    if [[ "$changed" == true ]]; then
+        augenrules --load
+        systemctl restart auditd
+        ok "Applied auditd rules"
     fi
 }
 
@@ -748,6 +847,8 @@ setup_systemd_units() {
         "attackbox-falco-adapter.service"
         "attackbox-egress-adapter.service"
         "attackbox.service"
+        "attackbox-nft-refresh.service"
+        "attackbox-nft-refresh.timer"
     )
 
     for unit in "${units[@]}"; do
@@ -886,6 +987,10 @@ start_services() {
     systemctl enable attackbox-egress-adapter
     systemctl start attackbox-egress-adapter
     ok "Started attackbox-egress-adapter"
+
+    # Keep nftables NR/Ubuntu sets fresh (they are empty after a reboot)
+    systemctl enable --now attackbox-nft-refresh.timer
+    ok "Enabled attackbox-nft-refresh.timer"
 }
 
 # SSH disablement
@@ -943,6 +1048,26 @@ resolve_ubuntu_mirrors() {
     fi
 }
 
+# Re-resolve endpoints into the live sets (timer entry point). Sets are
+# additive: stale IPs stay until the next boot or reload of /etc/nftables.conf.
+refresh_endpoint_sets() {
+    log "Refreshing nftables endpoint sets..."
+
+    if ! nft list table inet attackbox >/dev/null 2>&1; then
+        err "nftables table inet attackbox not loaded"
+        return 1
+    fi
+
+    local tmpdir
+    tmpdir=$(resolve_nr_endpoints)
+    populate_nr_sets "$tmpdir"
+    rm -f "$tmpdir"/*.txt
+    rmdir "$tmpdir"
+
+    resolve_ubuntu_mirrors
+    ok "Endpoint sets refreshed"
+}
+
 # Build and pre-pull bait before firewall
 prepare_bait() {
     log "Preparing bait containers..."
@@ -961,22 +1086,33 @@ prepare_bait() {
     cp -r "$repo_root/docker" /opt/attackbox/
 
     # Create secrets directory with safe permissions
-    mkdir -p /opt/attackbox/secrets
-    chmod 700 /opt/attackbox/secrets
+    mkdir -p "$SECRETS_DIR"
+    chmod 700 "$SECRETS_DIR"
 
     # Create secrets if they don't exist (don't overwrite existing)
-    if [[ ! -f /opt/attackbox/secrets/redaction.key ]]; then
-        (umask 077; head -c 32 /dev/urandom | base64 > /opt/attackbox/secrets/redaction.key)
+    if [[ ! -f "$SECRETS_DIR/redaction.key" ]]; then
+        (umask 077; head -c 32 /dev/urandom | base64 > "$SECRETS_DIR/redaction.key")
         ok "Generated redaction.key"
     fi
 
-    if [[ ! -f /opt/attackbox/secrets/server.crt ]] || [[ ! -f /opt/attackbox/secrets/server.key ]]; then
+    if [[ ! -f "$SECRETS_DIR/server.crt" ]] || [[ ! -f "$SECRETS_DIR/server.key" ]]; then
         (umask 077; openssl req -x509 -newkey rsa:2048 -nodes \
-            -keyout /opt/attackbox/secrets/server.key \
-            -out /opt/attackbox/secrets/server.crt \
+            -keyout "$SECRETS_DIR/server.key" \
+            -out "$SECRETS_DIR/server.crt" \
             -days 365 -subj "/CN=attackbox-proxy" 2>/dev/null)
         ok "Generated TLS certificate"
     fi
+
+    # Compose file secrets are bind mounts: the container sees the host owner
+    # and mode and ignores the uid/mode keys in compose.yaml. Bait and proxy
+    # both run as 65532 and bait refuses any group/other mode bit. Also fixes
+    # files left root:root by an earlier run.
+    local secret
+    for secret in redaction.key server.key server.crt; do
+        chown "${BAIT_UID}:${BAIT_GID}" "$SECRETS_DIR/$secret"
+        chmod 0400 "$SECRETS_DIR/$secret"
+    done
+    ok "Secrets owned by ${BAIT_UID}:${BAIT_GID} mode 0400"
 
     # Build bait image (dev tag for compose.yaml)
     if [[ -f "$repo_root/Dockerfile" ]]; then
@@ -1050,7 +1186,8 @@ run_verification_enhanced() {
 
     # Test metadata blocking
     log "Testing metadata blocking from container..."
-    if docker run --rm --runtime=runsc --network "$network" "$test_img" timeout 2 wget -O- http://169.254.169.254/ 2>&1 | grep -q "timed out\|Connection refused"; then
+    # Any failure counts as blocked: busybox wget wording varies by failure mode
+    if ! docker run --rm --runtime=runsc --network "$network" "$test_img" timeout 2 wget -O- http://169.254.169.254/ >/dev/null 2>&1; then
         ok "Metadata blocked from container"
     else
         err "Metadata NOT blocked - required check failed"
@@ -1117,6 +1254,12 @@ main() {
     log "Mode: $MODE"
 
     check_root
+
+    if [[ "$MODE" == "refresh" ]]; then
+        refresh_endpoint_sets
+        exit $?
+    fi
+
     check_linux
     check_os
 
@@ -1131,6 +1274,7 @@ main() {
     setup_docker
     setup_gvisor
     setup_falco
+    setup_host_dns_ntp
     bootstrap_firewall
     start_docker
     prepare_bait
