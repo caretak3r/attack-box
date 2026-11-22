@@ -17,14 +17,17 @@ test_shipper_uid_population() { grep -q "shipper_uids" "$DEPLOY_SCRIPT" && grep 
 test_firewall_before_docker() { local fw=$(sed -n '/^main()/,/^}/p' "$DEPLOY_SCRIPT" | grep -n "setup_firewall" | cut -d: -f1); local st=$(sed -n '/^main()/,/^}/p' "$DEPLOY_SCRIPT" | grep -n "start_services" | cut -d: -f1); [[ -n "$fw" && -n "$st" && "$fw" -lt "$st" ]]; }
 test_socket_permissions() { grep -q "/run/attackbox:0710" "$DEPLOY_SCRIPT" && grep -q "SHIP_USER.*BAIT_USER" "$DEPLOY_SCRIPT"; }
 test_adapter_pipelines() { local fa="${SCRIPT_DIR}/../deploy/systemd/attackbox-falco-adapter.service"; local ea="${SCRIPT_DIR}/../deploy/systemd/attackbox-egress-adapter.service"; grep -q "tail -n0 -F" "$fa" && grep -q "journalctl -kf" "$ea"; }
-test_bait_unit_exists() { [[ -f "${SCRIPT_DIR}/../deploy/systemd/attackbox.service" ]] && [[ -f "${SCRIPT_DIR}/../deploy/compose/docker-compose.yml" ]]; }
+test_bait_unit_exists() { [[ -f "${SCRIPT_DIR}/../deploy/systemd/attackbox.service" ]] && [[ -f "${SCRIPT_DIR}/../compose.yaml" ]]; }
 test_forward_direction() { local nft="${SCRIPT_DIR}/../deploy/nftables/attackbox.nft"; grep -q "iifname \"docker0\" ct state new.*drop" "$nft" && grep -q "iifname \"br-\*\" ct state new.*drop" "$nft"; }
 test_both_nr_hosts_required() { grep -q "Failed to resolve.*NR_LOG_HOST" "$DEPLOY_SCRIPT" && grep -q "Failed to resolve.*NR_METRIC_HOST" "$DEPLOY_SCRIPT"; }
 test_rollback_trap() { grep -q "trap.*ERR" "$DEPLOY_SCRIPT" && grep -q "trap - ERR" "$DEPLOY_SCRIPT"; }
-test_no_alpine_latest() { local compose="${SCRIPT_DIR}/../deploy/compose/docker-compose.yml"; ! grep -q "alpine:latest" "$compose"; }
+test_no_attackbox_bait_latest() { ! grep -q "attackbox-bait:latest" "$DEPLOY_SCRIPT"; }
 test_ssh_after_start_bait() { local ssh_line=$(grep -n "disable_ssh" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:disable_ssh()" | head -1 | cut -d: -f1); local bait_line=$(grep -n "start_bait" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:start_bait()" | head -1 | cut -d: -f1); [[ -n "$ssh_line" && -n "$bait_line" && "$bait_line" -lt "$ssh_line" ]]; }
-test_no_fake_digest() { local compose="${SCRIPT_DIR}/../deploy/compose/docker-compose.yml"; ! grep -q "sha256:a8bf22b0e7c8f7845ba4f43b1e7d471c9bfb3fbb2c1d0e7a46f2e8e7c8e8e8e8" "$compose"; }
-test_verified_image_in_verification() { grep -q "run_verification_enhanced" "$DEPLOY_SCRIPT" && grep -q "busybox:1.36" "$DEPLOY_SCRIPT"; }
+test_no_nginxinc_image() { ! grep -q "nginxinc/" "$DEPLOY_SCRIPT"; }
+test_verified_digest_in_verification() { grep -q "run_verification_enhanced" "$DEPLOY_SCRIPT" && grep -q "busybox@sha256:" "$DEPLOY_SCRIPT"; }
+test_no_attackbox_listeners() { ! grep -q "ATTACKBOX_LISTENERS" "$DEPLOY_SCRIPT"; }
+test_service_uses_root_compose() { grep -q "/opt/attackbox/compose.yaml" "${SCRIPT_DIR}/../deploy/systemd/attackbox.service"; }
+test_uses_chainguard_nginx() { grep -q "cgr.dev/chainguard/nginx@sha256:" "$DEPLOY_SCRIPT"; }
 test_mktemp_usage() { grep -q "mktemp" "$DEPLOY_SCRIPT"; }
 test_separate_a_aaaa() { grep -q 'dig +short.*A | grep' "$DEPLOY_SCRIPT" && grep -q 'dig +short.*AAAA | grep' "$DEPLOY_SCRIPT"; }
 test_prepare_bait() { grep -q "prepare_bait" "$DEPLOY_SCRIPT"; }
@@ -51,10 +54,13 @@ main() {
     run_test "Forward direction" test_forward_direction
     run_test "Both NR hosts required" test_both_nr_hosts_required
     run_test "Rollback trap" test_rollback_trap
-    run_test "No alpine:latest" test_no_alpine_latest
+    run_test "No attackbox-bait:latest" test_no_attackbox_bait_latest
     run_test "SSH after start_bait" test_ssh_after_start_bait
-    run_test "No fake digest" test_no_fake_digest
-    run_test "Verified image in verification" test_verified_image_in_verification
+    run_test "No nginxinc image" test_no_nginxinc_image
+    run_test "Verified digest in verification" test_verified_digest_in_verification
+    run_test "No ATTACKBOX_LISTENERS" test_no_attackbox_listeners
+    run_test "Service uses root compose.yaml" test_service_uses_root_compose
+    run_test "Uses Chainguard nginx" test_uses_chainguard_nginx
     run_test "mktemp usage" test_mktemp_usage
     run_test "Separate A/AAAA" test_separate_a_aaaa
     run_test "prepare_bait exists" test_prepare_bait

@@ -10,10 +10,10 @@ RemainAfterExit=yes
 WorkingDirectory=/opt/attackbox
 
 # Start Compose project
-ExecStart=/usr/bin/docker compose up -d --wait
+ExecStart=/usr/bin/docker compose -f /opt/attackbox/compose.yaml up -d --wait
 
 # Stop Compose project
-ExecStop=/usr/bin/docker compose down
+ExecStop=/usr/bin/docker compose -f /opt/attackbox/compose.yaml down
 
 # Restart policy
 Restart=on-failure

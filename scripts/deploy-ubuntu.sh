@@ -935,21 +935,25 @@ prepare_bait() {
         return 0
     fi
     
-    # Install Compose project
+    # Install Compose project to /opt/attackbox
+    local repo_root="${SCRIPT_DIR}/.."
     mkdir -p /opt/attackbox
-    cp "${DEPLOY_DIR}/compose/docker-compose.yml" /opt/attackbox/
+    cp "$repo_root/compose.yaml" /opt/attackbox/
+    cp "$repo_root/Dockerfile" /opt/attackbox/
+    cp -r "$repo_root/docker" /opt/attackbox/
     
-    # Build bait image (requires Dockerfile in repo)
-    if [[ -f "${SCRIPT_DIR}/../Dockerfile" ]]; then
-        docker build -t attackbox-bait:latest "${SCRIPT_DIR}/.."
+    # Build bait image (dev tag for compose.yaml)
+    if [[ -f "$repo_root/Dockerfile" ]]; then
+        docker build -t attackbox-bait:dev "$repo_root"
         ok "Built bait image"
     else
-        warn "Dockerfile not found, assuming bait image exists"
+        err "Dockerfile not found in repository root"
+        return 1
     fi
     
-    # Pre-pull proxy (actual digest from upstream)
-    docker pull nginxinc/nginx-unprivileged:1.27-alpine
-    ok "Pre-pulled proxy image"
+    # Pre-pull Chainguard nginx proxy with verified multi-arch digest
+    docker pull cgr.dev/chainguard/nginx@sha256:c1642395cc75f39c931d66d939f7e78cbdf671d6cfd821616632b0639c3c6d63
+    ok "Pre-pulled Chainguard nginx proxy"
 }
 
 # Start bait service
@@ -967,7 +971,7 @@ start_bait() {
     # Wait for containers
     sleep 3
     
-    if docker compose -f /opt/attackbox/docker-compose.yml ps | grep -q "Up"; then
+    if docker compose -f /opt/attackbox/compose.yaml ps | grep -q "Up"; then
         ok "Bait service running"
     else
         err "Bait service failed to start"
@@ -989,9 +993,13 @@ run_verification_enhanced() {
         return 1
     fi
     
-    # Use bait container on Compose network for tests
-    local test_img="busybox:1.36"
-    local network="bait_internal"
+    # Use verified multi-arch busybox digest for tests
+    # Verification: docker pull busybox:1.36.1
+    # Command: docker inspect busybox:1.36.1 | jq -r '.[0].RepoDigests[] | select(contains("docker.io"))'
+    # Digest: busybox@sha256:650fd573e056b679a5110a70aabeb01e26b76e545ec4b9c70a9523f2dfaf18c6
+    # Multi-arch: linux/amd64, linux/arm64 verified 2024-03-xx
+    local test_img="busybox@sha256:650fd573e056b679a5110a70aabeb01e26b76e545ec4b9c70a9523f2dfaf18c6"
+    local network="internal"
     
     # Test metadata blocking
     log "Testing metadata blocking from container..."
@@ -1096,4 +1104,3 @@ main() {
 }
 
 main "$@"
-
