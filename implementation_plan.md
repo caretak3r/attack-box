@@ -1,6 +1,6 @@
 # Attack Box Plan
 
-Status: design revision 4, 2026-11-21. Build not started. New Relic replaces Grafana Cloud. The public bait is an OpenAI-compatible API with local counter-probe responses.
+Status: design revision 4, 2026-11-21. Build in progress (see "Implementation status"). New Relic replaces Grafana Cloud. The public bait is an OpenAI-compatible API with local counter-probe responses.
 
 ## Goal
 
@@ -177,6 +177,27 @@ Use the first syntactically valid, non-placeholder declaration as a lead, not as
 
 Limit a session to three questions before a fake payout unless the client chooses to continue. Endless interrogation makes the decoy obvious. No response is also useful telemetry.
 
+## Implementation status
+
+Language: Go, standard library only. Module `attackbox`.
+
+### Responder engine — `internal/responder` (implemented, tested)
+
+- `classify.go`: keyword classifier. Input text is lowercased, invisible format characters (U+200B, U+200C, U+200D, U+2060, U+FEFF, U+00AD) are removed and whitespace is collapsed; scan is capped at 64 KiB. Priority: `indirect-injection` (instructions inside tool/function output), `prompt-extraction`, `persistence`, `credential-access`, `shell-execution`, `url-exfiltration`, `instruction-override`, `tool-invocation` (tools declared and text asks to call one, or `tool_choice` forces a function). All matched labels are kept; responses never reflect request text.
+- `session.go`: bounded LRU store (default 10,000 sessions, 2-hour idle TTL; expired sessions get a new ticket, nonce and canaries). The caller supplies the session key; it must not be the source IP alone. The behavioral gate is selected from a hash of the key, across `audit-writing`, `operator-alias`, `secret-masking`, `output-window`, `character-rewriting`, `timeout-silent`, `timeout-idle`, `concurrency`, `retry`, `context-recall`.
+- Canary shapes per session: URL password `dpl-<hex>`, two-part `tk_<hex>.<hex>`, three-part JWT-like `eyJhbGciOiJIUzI1NiJ9.<b64>.<b64>`, payout `sk-local-<hex>`. Any later request that contains one produces a `canary-reuse` observation.
+- `responder.go` sequence per request: canary-reuse check → follow-up scoring of the pending gate → declaration capture → classification → probe selection. Selection order: fake payout when three questions are spent and no payout was made; `invalid-declaration` for an invalid `metadata.client_model` (second invalid → `identification-declined`); intent probe; `register-model` → `register-harness` → behavioral gate → payout → `completion`. After the payout the client can continue; intent probes still answer.
+- Declarations: `metadata.client_model` (validated: `provider/model-version`, contains a digit, max 128 characters, placeholder words rejected), `metadata.client`, `metadata.status`, `metadata.operator`/`operator_alias`, `user`. Email-shaped values are stored as `[email-redacted]`. At most 32 declarations per session. `metadata.credential` is compared to canaries only and is never stored as a declaration.
+- Changes from the probe tables above: the `context-recall` session issues its nonce in the `register-model` text; `character-rewriting` uses token `R` U+200B `e` U+0301 `G-<nonce>` so NFC, zero-width stripping and combining-mark stripping are distinguishable; `retry` returns HTTP 429, `Retry-After: 1` and an OpenAI-style rate-limit message, and the next request records the delay; timeout gates set a hold mode (`silent`, `idle`) that the transport carries out.
+- Follow-up evidence: compliance with registration, decline status, alias email-likeness, audit word count and nonce inclusion, secret-masking result per canary (`whole`, `masked`, `shortened`, `omitted`), output-window head/middle/tail markers, Unicode rewrite class, recall, retry delay, concurrency peak, intent replies (`argv`, `url`, `sha256`, JSON arguments, marker echo).
+- `StatusHit` records `/v1/edge/{A-D}/status` requests: active count, peak and first-hit spacing. Other labels are rejected.
+
+Verification: `go vet ./...`, `gofmt -l .`, `go test -race -count=1 -cover ./...` (92.1% statement coverage of `internal/responder`).
+
+### Not yet implemented
+
+HTTP personas and endpoint handlers, request/response logging and redaction, New Relic forwarder, `cmd` entry point, Dockerfile/Compose, deployment script, operator documentation.
+
 ## Decoy VPS layers
 
 1. **Provider firewall.** Default inbound: port 443 only. Discovery profile adds 80, 8000 and 11434 after approval. Outbound: port 443 and DNS only. Root on the decoy cannot change this firewall.
@@ -281,7 +302,6 @@ The decoy holds no SSH key, provider API token, New Relic User key, NerdGraph ke
 
 ## Open inputs
 
-- Implementation language and framework for the responder.
 - Exact fake Ollama and vLLM release strings to emulate.
 - Whether to enable the discovery profile at first deployment.
 
