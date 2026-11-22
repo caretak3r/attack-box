@@ -130,8 +130,10 @@ func streamForRole(r shipper.Role) string {
 	}
 }
 
-func run(ctx context.Context, cfg config, stderr io.Writer) error {
-	qcfg := shipper.QueueConfig{
+// queueConfig derives the queue bounds from cfg. MaxPayload covers the largest
+// admitted record, and loadConfig keeps every role cap above one such frame.
+func queueConfig(cfg config) shipper.QueueConfig {
+	return shipper.QueueConfig{
 		Dir:          cfg.queueDir,
 		SegmentBytes: cfg.segmentBytes,
 		MaxBytes:     cfg.queueBytes,
@@ -140,35 +142,16 @@ func run(ctx context.Context, cfg config, stderr io.Writer) error {
 			shipper.RoleRuntime: (cfg.queueBytes * 20) / 100,
 			shipper.RoleEgress:  (cfg.queueBytes * 20) / 100,
 		},
-		MaxPayload: telemetry.MinPayloadBytes - shipper.FrameHeader,
+		MaxPayload: shipper.MaxData,
 	}
-	q, rec, err := shipper.OpenQueue(qcfg)
+}
+
+func run(ctx context.Context, cfg config, stderr io.Writer) error {
+	q, rec, err := shipper.OpenQueue(queueConfig(cfg))
 	if err != nil {
 		return err
 	}
 	defer q.Close()
-
-	nrcfg := telemetry.NRConfig{
-		LicenseKey:        cfg.nrLicenseKey,
-		LogURL:            cfg.nrLogURL,
-		MetricURL:         cfg.nrMetricURL,
-		QueueSize:         20000,
-		FlushInterval:     5 * time.Second,
-		MaxPayloadBytes:   900_000,
-		HeartbeatInterval: 30 * time.Second,
-		Now:               time.Now,
-		Common: map[string]any{
-			"service.name": "attackbox",
-			"hostname":     cfg.hostname,
-		},
-		OnError: func(err error) {
-			fmt.Fprintln(stderr, "newrelic:", err)
-		},
-	}
-	nr, err := telemetry.NewNewRelic(nrcfg)
-	if err != nil {
-		return err
-	}
 
 	ing, err := shipper.NewIngest(shipper.IngestConfig{
 		Endpoints: cfg.endpoints,
@@ -182,59 +165,79 @@ func run(ctx context.Context, cfg config, stderr io.Writer) error {
 		return err
 	}
 
-	var drainDone, ingestDone chan error
-	drainDone = make(chan error, 1)
-	nrcfg.HeartbeatAttrs = func() map[string]any {
-		stats := ing.Stats()
-		baitStats, ok := stats[shipper.RoleBait]
-		baitConn := ok && baitStats.Conns > 0
-		lastAge := int64(-1)
-		if ok && !baitStats.LastRecord.IsZero() {
-			lastAge = time.Since(baitStats.LastRecord).Milliseconds()
-		}
-		qstats := q.Stats()
-		return map[string]any{
-			"source":                  "shipper",
-			"bait_connected":          baitConn,
-			"last_bait_record_age_ms": lastAge,
-			"spool_clients":           baitStats.Conns,
-			"queue_bytes":             qstats.Total,
-			"queue_backlog_bytes":     qstats.Total,
-			"ship_dropped_total":      qstats.Dropped,
-		}
-	}
-
-	nr, err = telemetry.NewNewRelic(nrcfg)
+	nr, err := telemetry.NewNewRelic(telemetry.NRConfig{
+		LicenseKey:        cfg.nrLicenseKey,
+		LogURL:            cfg.nrLogURL,
+		MetricURL:         cfg.nrMetricURL,
+		QueueSize:         20000,
+		FlushInterval:     5 * time.Second,
+		MaxPayloadBytes:   900_000,
+		HeartbeatInterval: 30 * time.Second,
+		Now:               time.Now,
+		Common: map[string]any{
+			"service.name": "attackbox",
+			"hostname":     cfg.hostname,
+		},
+		HeartbeatAttrs: func() map[string]any {
+			stats := ing.Stats()
+			baitStats, ok := stats[shipper.RoleBait]
+			baitConn := ok && baitStats.Conns > 0
+			lastAge := int64(-1)
+			if ok && !baitStats.LastRecord.IsZero() {
+				lastAge = time.Since(baitStats.LastRecord).Milliseconds()
+			}
+			qstats := q.Stats()
+			return map[string]any{
+				"source":                  "shipper",
+				"bait_connected":          baitConn,
+				"last_bait_record_age_ms": lastAge,
+				"spool_clients":           baitStats.Conns,
+				"queue_bytes":             qstats.Total,
+				"queue_backlog_bytes":     qstats.Total,
+				"ship_dropped_total":      qstats.Dropped,
+			}
+		},
+		OnError: func(err error) {
+			fmt.Fprintln(stderr, "newrelic:", err)
+		},
+	})
 	if err != nil {
+		// Serve was never started; a canceled context just releases the sockets.
+		stopped, cancel := context.WithCancel(ctx)
+		cancel()
+		ing.Serve(stopped)
 		return err
 	}
 
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	drainDone := make(chan error, 1)
+	ingestDone := make(chan error, 1)
 	go func() {
-		drainDone <- drain(ctx, q, nr, rec.Uncertain, rec.UncertainThrough, cfg.shutdownTimeout/2)
+		drainDone <- drain(runCtx, q, nr, rec.Uncertain, rec.UncertainThrough, cfg.shutdownTimeout/2)
 	}()
 	go func() {
-		ingestDone <- ing.Serve(ctx)
+		ingestDone <- ing.Serve(runCtx)
 	}()
 
+	// Whichever side ends first stops the other. Read each channel once.
+	var drainErr, ingestErr error
+	var drainSeen, ingestSeen bool
 	select {
 	case <-ctx.Done():
-	case err := <-drainDone:
-		if err != nil {
-			return err
-		}
-	case err := <-ingestDone:
-		if err != nil {
-			return err
-		}
+	case drainErr, drainSeen = <-drainDone:
+	case ingestErr, ingestSeen = <-ingestDone:
+	}
+	cancelRun()
+	if !ingestSeen {
+		ingestErr = <-ingestDone
+	}
+	if !drainSeen {
+		drainErr = <-drainDone
 	}
 
 	flushCtx, cancel := context.WithTimeout(context.Background(), cfg.shutdownTimeout)
 	defer cancel()
-
-	if err := <-ingestDone; err != nil && !errors.Is(err, context.Canceled) {
-		fmt.Fprintln(stderr, "ingest:", err)
-	}
-	drainErr := <-drainDone
 	if closeErr := nr.Close(flushCtx); closeErr != nil {
 		fmt.Fprintln(stderr, "newrelic close:", closeErr)
 	}
@@ -254,5 +257,14 @@ func run(ctx context.Context, cfg config, stderr io.Writer) error {
 		},
 	})
 
-	return drainErr
+	// A graceful stop ends both sides with context.Canceled. A broken queue
+	// arrives as ErrQueueBroken from either side and must exit non-zero.
+	return errors.Join(ignoreCanceled(ingestErr), ignoreCanceled(drainErr))
+}
+
+func ignoreCanceled(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
 }

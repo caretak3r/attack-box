@@ -40,6 +40,12 @@ const (
 	maxFuture     = 5 * time.Minute
 )
 
+// MaxData bounds Admitted.Data, the queue payload. JSON writes a body byte as
+// up to six bytes (\u00XX), so MaxBody takes 6 MiB; attrs, fixed fields and
+// structure stay far inside the remaining 2 MiB. The queue MaxPayload must be
+// at least MaxData.
+const MaxData = 8 << 20
+
 // itemHeadroom is what a POST keeps for the envelope and common attributes
 // around an item.
 const itemHeadroom = 8 << 10
@@ -199,6 +205,9 @@ func Admit(role Role, line []byte, now time.Time) (Admitted, error) {
 	a.Record = r
 	if a.Data, err = json.Marshal(r); err != nil {
 		return Admitted{}, reject("encode", err)
+	}
+	if len(a.Data) > MaxData {
+		return Admitted{}, reject("encoded_size", nil)
 	}
 	return a, nil
 }

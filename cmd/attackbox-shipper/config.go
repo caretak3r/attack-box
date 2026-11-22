@@ -11,6 +11,10 @@ import (
 	"attackbox/internal/telemetry"
 )
 
+// minQueueBytes keeps the smallest role cap (20% of the queue) above one
+// maximum-size frame, so no admitted record can be refused as oversize.
+const minQueueBytes = 5 * (shipper.MaxData + shipper.FrameHeader)
+
 type config struct {
 	endpoints       []shipper.Endpoint
 	queueDir        string
@@ -34,8 +38,8 @@ func loadConfig(getenv func(string) string) (config, error) {
 	}
 
 	c.queueBytes = parseBytes(getenv("ATTACKBOX_SHIP_QUEUE_BYTES"), 256<<20)
-	if c.queueBytes < 16<<20 || c.queueBytes > 8<<30 {
-		errs = append(errs, errors.New("ATTACKBOX_SHIP_QUEUE_BYTES must be 16MB..8GB"))
+	if c.queueBytes < minQueueBytes || c.queueBytes > 8<<30 {
+		errs = append(errs, fmt.Errorf("ATTACKBOX_SHIP_QUEUE_BYTES must be %d..%d", int64(minQueueBytes), int64(8<<30)))
 	}
 
 	c.segmentBytes = parseBytes(getenv("ATTACKBOX_SHIP_SEGMENT_BYTES"), 16<<20)
@@ -114,7 +118,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 			UIDs:     []uint32{0}, // root (Falco)
 			MaxConns: 2,
 			Rate:     256 << 10, // 256 KB/s
-			Burst:    1 << 20,
+			Burst:    4 << 20,   // above MaxLine
 		})
 	}
 
@@ -131,7 +135,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 			UIDs:     []uint32{0}, // root (nft log converter)
 			MaxConns: 2,
 			Rate:     128 << 10, // 128 KB/s
-			Burst:    512 << 10,
+			Burst:    4 << 20,   // above MaxLine
 		})
 	}
 

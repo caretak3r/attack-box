@@ -9,167 +9,130 @@ import (
 	"attackbox/internal/telemetry"
 )
 
-// drain reads entries from the queue and delivers them to New Relic. It
-// checkpoints only after successful delivery, so a crash or New Relic outage
-// replays unacknowledged records. Uncertain recovery suppresses metrics up to
-// uncertainThrough to avoid double-counting.
-func drain(ctx context.Context, q *shipper.Queue, nr *telemetry.NewRelic, uncertain bool, uncertainThrough uint64, timeout time.Duration) error {
-	const (
-		readMax      = 200 // entries per Read
-		readMaxBytes = 512 << 10
-		ackEvery     = 200 // checkpoint after this many delivered records
-		ackInterval  = time.Second
-	)
+// drainQueue is the part of shipper.Queue the drain loop uses.
+type drainQueue interface {
+	Read(max, maxBytes int) ([]shipper.Entry, error)
+	Ack(n int) error
+}
 
-	ticker := time.NewTicker(ackInterval)
-	defer ticker.Stop()
+// drainSink is the part of telemetry.NewRelic the drain loop uses.
+type drainSink interface {
+	TryEmit(telemetry.Event) bool
+	Count(name string, value float64, attrs map[string]string)
+	Gauge(name string, value float64, attrs map[string]string)
+}
 
-	var (
-		pending  []shipper.Entry
-		toAck    int
-		lastAck  time.Time
-		retryAt  time.Time
-		metricAt uint64
-	)
+const (
+	drainReadMax      = 200 // entries per Read
+	drainReadMaxBytes = 512 << 10
+	drainAckEvery     = 200 // checkpoint after this many delivered records
+	drainAckInterval  = time.Second
+	drainIdlePoll     = 100 * time.Millisecond // wait before re-reading an empty queue
+	drainRetryWait    = 250 * time.Millisecond // wait after the sink refused an event
+)
 
+// drain reads entries from the queue and hands them to New Relic. It
+// checkpoints after the sink accepts a record, so a crash replays records the
+// checkpoint does not cover. Note the sink queue is in memory: ack-after-enqueue
+// is at-most-once for what the sink still holds when the process dies.
+// Uncertain recovery suppresses metrics up to uncertainThrough to avoid
+// double-counting.
+func drain(ctx context.Context, q drainQueue, nr drainSink, uncertain bool, uncertainThrough uint64, timeout time.Duration) error {
+	var skipThrough uint64
 	if uncertain {
-		metricAt = uncertainThrough
+		skipThrough = uncertainThrough
 	}
 
-	for {
-		if len(pending) == 0 && toAck == 0 {
-			// Read more from queue
-			entries, err := q.Read(readMax, readMaxBytes)
+	var (
+		pending []shipper.Entry
+		toAck   int
+		lastAck = time.Now()
+	)
+	// finish gives the sink a last chance at pending, then checkpoints.
+	finish := func() error {
+		deadline := time.Now().Add(timeout)
+		for len(pending) > 0 && time.Now().Before(deadline) {
+			n, _ := deliver(nr, pending, skipThrough)
+			pending = pending[n:]
+			toAck += n
+			if len(pending) > 0 {
+				time.Sleep(min(drainIdlePoll, time.Until(deadline)))
+			}
+		}
+		if toAck > 0 {
+			if err := q.Ack(toAck); err != nil {
+				return err
+			}
+		}
+		return ctx.Err()
+	}
+
+	for ctx.Err() == nil {
+		idle := false
+		if len(pending) == 0 {
+			entries, err := q.Read(drainReadMax, drainReadMaxBytes)
 			if err != nil {
 				return err
 			}
-			if len(entries) == 0 {
-				// Queue is empty; wait for context or new data
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(100 * time.Millisecond):
-					continue
-				}
-			}
 			pending = entries
-			retryAt = time.Time{}
-		}
-		var delivered int
-		// Try to deliver pending entries
-		for i, e := range pending {
-			// If we're in retry mode, wait
-			if !retryAt.IsZero() && time.Now().Before(retryAt) {
-				break
-			}
-
-			// Unmarshal the admitted record
-			var adm shipper.Admitted
-			if err := json.Unmarshal(e.Data, &adm); err != nil {
-				// Skip corrupted entry
-				delivered = i + 1
-				continue
-			}
-
-			if adm.Record.Event != nil {
-				if !nr.TryEmit(*adm.Record.Event) {
-					// Queue full, retry later
-					retryAt = time.Now().Add(250 * time.Millisecond)
-					break
-				}
-			} else if adm.Record.Metric != nil {
-				// Skip metrics in uncertain range
-				if uncertain && e.Seq <= metricAt {
-					// Skip, but mark as delivered
-					delivered = i + 1
-					continue
-				}
-				switch adm.Record.Metric.Kind {
-				case "count":
-					nr.Count(adm.Record.Metric.Name, adm.Record.Metric.Value, adm.Record.Metric.Attrs)
-				case "gauge":
-					nr.Gauge(adm.Record.Metric.Name, adm.Record.Metric.Value, adm.Record.Metric.Attrs)
-				}
-			}
-			delivered = i + 1
-		}
-		if delivered > 0 {
-			pending = pending[delivered:]
-			toAck += delivered
-			retryAt = time.Time{}
+			idle = len(entries) == 0
 		}
 
-		// Checkpoint if we've accumulated enough or enough time has passed
-		now := time.Now()
-		shouldAck := toAck >= ackEvery || (toAck > 0 && now.Sub(lastAck) >= ackInterval)
+		n, blocked := deliver(nr, pending, skipThrough)
+		pending = pending[n:]
+		toAck += n
 
-		select {
-		case <-ticker.C:
-			if toAck > 0 {
-				shouldAck = true
-			}
-		default:
-		}
-
-		if shouldAck {
+		if toAck >= drainAckEvery || (toAck > 0 && time.Since(lastAck) >= drainAckInterval) {
 			if err := q.Ack(toAck); err != nil {
 				return err
 			}
 			toAck = 0
-			lastAck = now
+			lastAck = time.Now()
 		}
 
-		// Check for context cancellation
+		var wait time.Duration
+		switch {
+		case blocked:
+			wait = drainRetryWait
+		case idle:
+			wait = drainIdlePoll
+		default:
+			continue
+		}
+		t := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
-			// Drain what we can within timeout
-			deadline := time.Now().Add(timeout)
-			for time.Now().Before(deadline) && len(pending) > 0 {
-				delivered := 0
-				for i, e := range pending {
-					var adm shipper.Admitted
-					if err := json.Unmarshal(e.Data, &adm); err != nil {
-						delivered = i + 1
-						continue
-					}
-					if adm.Record.Event != nil {
-						if !nr.TryEmit(*adm.Record.Event) {
-							break
-						}
-					} else if adm.Record.Metric != nil {
-						if uncertain && e.Seq <= metricAt {
-							delivered = i + 1
-							continue
-						}
-						switch adm.Record.Metric.Kind {
-						case "count":
-							nr.Count(adm.Record.Metric.Name, adm.Record.Metric.Value, adm.Record.Metric.Attrs)
-						case "gauge":
-							nr.Gauge(adm.Record.Metric.Name, adm.Record.Metric.Value, adm.Record.Metric.Attrs)
-						}
-					}
-					delivered = i + 1
-				}
-				if delivered > 0 {
-					pending = pending[delivered:]
-					toAck += delivered
-				} else {
-					time.Sleep(100 * time.Millisecond)
-				}
-			}
-			if toAck > 0 {
-				q.Ack(toAck)
-			}
-			return ctx.Err()
-		default:
+		case <-t.C:
 		}
-
-		// If we're waiting for retry, sleep a bit
-		if !retryAt.IsZero() && len(pending) > 0 {
-			waitFor := time.Until(retryAt)
-			if waitFor > 0 {
-				time.Sleep(waitFor)
-			}
-		}
+		t.Stop()
 	}
+	return finish()
+}
+
+// deliver hands entries to the sink in order and returns how many were taken
+// from the front. blocked reports that the sink refused an event, so the rest
+// must wait. Metrics at or below skipThrough are taken but not counted.
+func deliver(nr drainSink, entries []shipper.Entry, skipThrough uint64) (n int, blocked bool) {
+	for _, e := range entries {
+		var rec telemetry.Record
+		if err := json.Unmarshal(e.Data, &rec); err != nil {
+			n++ // corrupted entry; skip it
+			continue
+		}
+		switch {
+		case rec.Event != nil:
+			if !nr.TryEmit(*rec.Event) {
+				return n, true
+			}
+		case rec.Metric != nil && e.Seq > skipThrough:
+			switch rec.Metric.Kind {
+			case "count":
+				nr.Count(rec.Metric.Name, rec.Metric.Value, rec.Metric.Attrs)
+			case "gauge":
+				nr.Gauge(rec.Metric.Name, rec.Metric.Value, rec.Metric.Attrs)
+			}
+		}
+		n++
+	}
+	return n, false
 }
