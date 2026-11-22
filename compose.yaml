@@ -1,0 +1,263 @@
+services:
+  bait:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: attackbox-bait:dev
+    pull_policy: never
+    container_name: attackbox-bait
+    
+    # Non-root user 65532:65532 (Chainguard nonroot, matches host abx-bait group)
+    user: "65532:65532"
+    
+    # gVisor: layer compose.gvisor.yaml on hosts that have runsc installed
+    
+    # Read-only root filesystem
+    read_only: true
+    
+    # Drop all capabilities
+    cap_drop:
+      - ALL
+    
+    # Security hardening
+    security_opt:
+      - no-new-privileges:true
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 512M
+          pids: 100
+        reservations:
+          cpus: '0.5'
+          memory: 128M
+    # Writable paths (bounded tmpfs)
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+
+    # Spool socket mount (host shipper listener, read-only mount)
+    volumes:
+      - type: bind
+        source: /run/attackbox
+        target: /run/attackbox
+        read_only: true
+
+    # Redaction secret. readSecret rejects any group/other mode bit and bait
+    # runs as 65532, so the file must be owned by 65532 with mode 0400.
+    secrets:
+      - source: attackbox_secret
+        target: attackbox_secret
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+
+    # Environment configuration
+    environment:
+      # Listener addresses (internal only)
+      ATTACKBOX_OPENAI_ADDR: "0.0.0.0:8080"
+      ATTACKBOX_VLLM_ADDR: "off"
+      ATTACKBOX_OLLAMA_ADDR: "off"
+
+      # Models
+      ATTACKBOX_MODELS: "gpt-4o,gpt-4o-mini,gpt-3.5-turbo,claude-3-5-sonnet,claude-3-opus"
+
+      # Trusted proxies (nginx internal network)
+      ATTACKBOX_TRUSTED_PROXIES: "172.30.0.0/24"
+
+      # Instance identifier
+      ATTACKBOX_INSTANCE: "attackbox-bait"
+
+      # Redaction secret from Docker secret
+      ATTACKBOX_SECRET_FILE: "/run/secrets/attackbox_secret"
+
+      # Spool socket (no New Relic key in bait)
+      ATTACKBOX_SPOOL_SOCKET: "/run/attackbox/spool.sock"
+      ATTACKBOX_SPOOL_QUEUE: "10000"
+      ATTACKBOX_SPOOL_TIMEOUT: "5s"
+
+      # Resource limits
+      ATTACKBOX_MAX_SESSIONS: "5000"
+      ATTACKBOX_MAX_BODY_BYTES: "1048576"
+      ATTACKBOX_MAX_LOG_BODY: "131072"
+      ATTACKBOX_MAX_PER_SOURCE: "8"
+      ATTACKBOX_MAX_IN_FLIGHT: "256"
+
+      # Timing configuration
+      ATTACKBOX_HOLD_SILENT: "150s"
+      ATTACKBOX_IDLE_INTERVAL: "45s"
+      ATTACKBOX_MAX_STREAM: "180s"
+      ATTACKBOX_TIMING: "true"
+
+      # HTTP timeouts
+      ATTACKBOX_READ_HEADER_TIMEOUT: "10s"
+      ATTACKBOX_READ_TIMEOUT: "30s"
+      ATTACKBOX_IDLE_TIMEOUT: "60s"
+      ATTACKBOX_SHUTDOWN_TIMEOUT: "15s"
+    # Healthcheck using built-in -healthcheck flag
+    healthcheck:
+      test: ["CMD", "/attackbox", "-healthcheck", "http://127.0.0.1:8080/v1/models"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    
+    # Private internal network (no external egress)
+    networks:
+      - internal
+    
+    # Restart policy
+    restart: unless-stopped
+
+    # Logging configuration (bounded local driver)
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # DNS configuration (no external resolution needed)
+    dns:
+      - 127.0.0.1
+    dns_search: []
+    
+    # No privileged operations
+    privileged: false
+    
+    # No Docker socket access
+    # No /sys or /proc mounts beyond defaults
+
+  proxy:
+    # Chainguard nginx with verified multi-arch digest
+    # Verification: docker pull cgr.dev/chainguard/nginx:latest
+    # Command: docker inspect cgr.dev/chainguard/nginx:latest | jq -r '.[0].RepoDigests[0]'
+    # Digest: cgr.dev/chainguard/nginx@sha256:c1642395cc75f39c931d66d939f7e78cbdf671d6cfd821616632b0639c3c6d63
+    # Multi-arch: linux/amd64, linux/arm64 verified 2026-11-22
+    image: cgr.dev/chainguard/nginx@sha256:c1642395cc75f39c931d66d939f7e78cbdf671d6cfd821616632b0639c3c6d63
+    pull_policy: never
+    container_name: attackbox-proxy
+
+    # Chainguard nonroot user (UID 65532)
+    user: "65532:65532"
+
+    # Read-only root filesystem
+    read_only: true
+
+    # Drop all capabilities
+    cap_drop:
+      - ALL
+
+    # Security hardening
+    security_opt:
+      - no-new-privileges:true
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 256M
+          pids: 50
+        reservations:
+          cpus: '0.25'
+          memory: 64M
+
+    # Writable paths for Chainguard nginx
+    tmpfs:
+      - /var/cache/nginx:rw,noexec,nosuid,nodev,size=16m,mode=0770,uid=65532,gid=65532
+      - /var/run:rw,noexec,nosuid,nodev,size=4m,mode=0770,uid=65532,gid=65532
+      - /var/log/nginx:rw,noexec,nosuid,nodev,size=16m,mode=0770,uid=65532,gid=65532
+
+    # Configuration and TLS secrets
+    volumes:
+      - type: bind
+        source: ./docker/nginx/nginx.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+
+    secrets:
+      - source: proxy_tls_cert
+        target: /etc/nginx/ssl/server.crt
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+      - source: proxy_tls_key
+        target: /etc/nginx/ssl/server.key
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+
+    # Publish on loopback only: map unprivileged internal ports to host
+    ports:
+      - "127.0.0.1:8443:8443"
+      - "127.0.0.1:8080:8080"
+
+    # Healthcheck (shell-free, using nginx binary)
+    healthcheck:
+      test: ["CMD", "/usr/sbin/nginx", "-t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+    # Both internal and external networks
+    networks:
+      - internal
+      - external
+
+    # Restart policy
+    restart: unless-stopped
+
+    # Logging configuration (bounded local driver)
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Depends on bait
+    depends_on:
+      bait:
+        condition: service_healthy
+    
+    # No privileged operations
+    privileged: false
+
+networks:
+  # Internal network: bait <-> proxy only, no external egress
+  internal:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  
+  # External network: proxy internet access only
+  external:
+    driver: bridge
+
+secrets:
+  # Redaction secret for bait (32+ bytes)
+  attackbox_secret:
+    file: ./secrets/redaction.key
+  
+  # TLS certificate for proxy
+  proxy_tls_cert:
+    file: ./secrets/server.crt
+
+  # TLS private key for proxy
+  proxy_tls_key:
+    file: ./secrets/server.key
+
+# Deployment requirements:
+# 1. No Watchtower or automatic image pulls
+# 2. Verified digests only (Chainguard go/static/nginx)
+# 3. No forced net-raw capability
+# 4. No Docker socket or management ports exposed
+# 5. No metrics ports exposed (Prometheus/etc.)
+# 6. Bait has no New Relic key (uses SPOOL_SOCKET)
+# 7. Only intended /run/attackbox mount (read-only)
+# 8. Published ports default to loopback (127.0.0.1)
+# 9. gVisor (runsc) runtime is a hard requirement for production deployment
+#    (apply it with: docker compose -f compose.yaml -f compose.gvisor.yaml up -d)
+# 10. Local log driver for bounded disk usage

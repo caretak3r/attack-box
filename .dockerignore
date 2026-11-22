@@ -1,0 +1,26 @@
+# Strict Docker build context: only Go source and module files
+
+# Deny everything by default
+*
+
+# Allow only required files
+!go.mod
+!go.sum
+!cmd/
+!internal/
+
+# Explicitly block sensitive paths even if they match above
+.git/
+.gnhf/
+secrets/
+*.key
+*.crt
+*.pem
+context-log*.md
+local://*
+*.log
+research/
+scripts/
+*.md
+!cmd/**/*.go
+!internal/**/*.go
