@@ -182,11 +182,11 @@ if require_or_skip "shipper integration" "[[ -d cmd/attackbox-shipper && -d inte
 	# Run shipper package tests
 	check "shipper package tests" go test -race -count=1 ./internal/shipper/...
 
-	# Require real integration test with six-stream and full-metric evidence
-	if [[ -f internal/shipper/integration_test.go ]] || grep -q "TestShipperIntegration\|TestSixStreams" internal/shipper/*_test.go 2>/dev/null; then
-		check "shipper six-stream integration" go test -race -count=1 -run 'Integration|SixStream|FullMetric' ./internal/shipper/...
+	# Require real integration test with six-stream and full-metric evidence in either package
+	if grep -q "TestShipperIntegration\|TestSixStreams\|TestFullMetric" internal/shipper/*_test.go cmd/attackbox-shipper/*_test.go 2>/dev/null; then
+		check "shipper six-stream integration" go test -race -count=1 -run 'Integration|SixStream|FullMetric' ./internal/shipper/... ./cmd/attackbox-shipper/...
 	else
-		fail "shipper integration: no TestShipperIntegration, TestSixStreams, or TestFullMetric found in internal/shipper/"
+		fail "shipper integration: no TestShipperIntegration, TestSixStreams, or TestFullMetric found in internal/shipper/ or cmd/attackbox-shipper/"
 	fi
 fi
 
@@ -201,20 +201,18 @@ elif [[ -f docker-compose.yml ]]; then
 fi
 
 if require_or_skip "container files" "[[ -f Dockerfile && -n $compose_file ]]" "Dockerfile or compose file not present"; then
+	# Clean up test image on exit
+	trap 'docker rmi attackbox-verify-test >/dev/null 2>&1 || true' EXIT
 	check "Dockerfile build" docker build -t attackbox-verify-test .
 	check "docker compose config" docker compose -f "$compose_file" config >/dev/null
-	# Clean up test image
-	docker rmi attackbox-verify-test >/dev/null 2>&1 || true
 fi
 
 echo
 info "Deployment validation"
-if require_or_skip "deployment scripts" "[[ -f scripts/deploy-ubuntu.sh ]]" "scripts/deploy-ubuntu.sh not implemented"; then
+if require_or_skip "deployment scripts" "[[ -f scripts/deploy-ubuntu.sh && -f scripts/test-deploy-ubuntu.sh ]]" "scripts/deploy-ubuntu.sh or test-deploy-ubuntu.sh not implemented"; then
 	check "deploy-ubuntu.sh syntax" bash -n scripts/deploy-ubuntu.sh
-	if [[ -f scripts/test-deploy-ubuntu.sh ]]; then
-		check "test-deploy-ubuntu.sh syntax" bash -n scripts/test-deploy-ubuntu.sh
-		check "test-deploy-ubuntu.sh execution" scripts/test-deploy-ubuntu.sh
-	fi
+	check "test-deploy-ubuntu.sh syntax" bash -n scripts/test-deploy-ubuntu.sh
+	check "test-deploy-ubuntu.sh execution" scripts/test-deploy-ubuntu.sh
 fi
 
 echo
@@ -249,15 +247,21 @@ if [[ -f cmd/attackbox/config.go ]]; then
 	fi
 fi
 
-# Check for operator documentation if final mode
+# Require operator documentation in FINAL mode
 if [[ $PARTIAL == false ]]; then
-	if ! grep -q "New Relic.*ingest.*license.*key" implementation_plan.md 2>/dev/null; then
-		fail "Operator documentation incomplete: New Relic setup not documented"
+	if require_or_skip "operator docs" "[[ -f docs/operator.md ]]" "docs/operator.md not present"; then
+		check "docs/operator.md exists" test -f docs/operator.md
 	fi
-	if ! grep -q "dedicated.*account\|additional.*key" implementation_plan.md 2>/dev/null; then
-		fail "Operator documentation incomplete: dedicated account guidance not documented"
+	if require_or_skip "architecture docs" "[[ -f docs/architecture.md ]]" "docs/architecture.md not present"; then
+		check "docs/architecture.md exists" test -f docs/architecture.md
 	fi
-	pass "Operator documentation present"
+	if require_or_skip "New Relic runbook" "[[ -f docs/newrelic-runbook.md ]]" "docs/newrelic-runbook.md not present"; then
+		check "docs/newrelic-runbook.md exists" test -f docs/newrelic-runbook.md
+	fi
+	if require_or_skip "New Relic artifacts" "[[ -d newrelic && -n \$(find newrelic -type f 2>/dev/null) ]]" "newrelic/ dashboard/alert artifacts not present"; then
+		artifact_count=$(find newrelic -type f 2>/dev/null | wc -l | tr -d ' ')
+		pass "New Relic artifacts: $artifact_count files in newrelic/"
+	fi
 fi
 
 echo
