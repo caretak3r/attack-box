@@ -19,6 +19,13 @@ func (s *Server) usageFor(prompt int, text string) *usage {
 	return &usage{PromptTokens: prompt, CompletionTokens: n, TotalTokens: prompt + n}
 }
 
+// usageNull reports whether stream chunks other than the final usage chunk
+// carry "usage":null. OpenAI does this when include_usage is set; vLLM and
+// Ollama leave the key out.
+func (s *Server) usageNull(requested bool) bool {
+	return requested && s.persona == PersonaOpenAI
+}
+
 // --- chat completions ---
 
 type chatFormat struct {
@@ -77,7 +84,7 @@ type chatChunk struct {
 	Model             string        `json:"model"`
 	SystemFingerprint string        `json:"system_fingerprint,omitempty"`
 	Choices           []chunkChoice `json:"choices"`
-	Usage             *usage        `json:"usage,omitempty"`
+	Usage             any           `json:"usage,omitempty"`
 }
 
 func (f *chatFormat) contentType() string { return sseContentType }
@@ -88,10 +95,14 @@ func (f *chatFormat) chunk(d chatDelta, finish *string) chatChunk {
 	if f.s.persona != PersonaVLLM {
 		fp = f.s.fingerprint(f.model)
 	}
-	return chatChunk{
+	c := chatChunk{
 		ID: f.id, Object: "chat.completion.chunk", Created: f.created, Model: f.model, SystemFingerprint: fp,
 		Choices: []chunkChoice{{Delta: d, Logprobs: jsonNull, FinishReason: finish}},
 	}
+	if f.s.usageNull(f.usage) {
+		c.Usage = jsonNull
+	}
+	return c
 }
 
 func (f *chatFormat) start() [][]byte {
@@ -146,6 +157,7 @@ type completionFormat struct {
 	created int64
 	prompt  int
 	usage   bool
+	choices int // one choice per prompt
 }
 
 type completionChoice struct {
@@ -163,34 +175,65 @@ type completionBody struct {
 	Model             string             `json:"model"`
 	Choices           []completionChoice `json:"choices"`
 	SystemFingerprint string             `json:"system_fingerprint,omitempty"`
-	Usage             *usage             `json:"usage,omitempty"`
+	Usage             any                `json:"usage,omitempty"`
 }
 
 func (f *completionFormat) contentType() string { return sseContentType }
 func (f *completionFormat) idle() []byte        { return sseKeepAlive }
 func (f *completionFormat) start() [][]byte     { return nil }
 
-func (f *completionFormat) body(text string, finish *string) completionBody {
-	choice := completionChoice{Text: text, Logprobs: jsonNull, FinishReason: finish}
+// body builds one envelope. index < 0 puts every choice in it (the
+// non-streaming body); otherwise it carries only that choice, as a stream
+// chunk does.
+func (f *completionFormat) body(text string, finish *string, index int) completionBody {
 	b := completionBody{ID: f.id, Object: "text_completion", Created: f.created, Model: f.model}
-	if f.s.persona == PersonaVLLM {
-		choice.StopReason = jsonNull
-	} else {
+	if f.s.persona != PersonaVLLM {
 		b.SystemFingerprint = f.s.fingerprint(f.model)
 	}
-	b.Choices = []completionChoice{choice}
+	if f.s.usageNull(f.usage) {
+		b.Usage = jsonNull
+	}
+	lo, hi := index, index+1
+	if index < 0 {
+		lo, hi = 0, max(1, f.choices)
+	}
+	b.Choices = make([]completionChoice, 0, hi-lo)
+	for i := lo; i < hi; i++ {
+		choice := completionChoice{Text: text, Index: i, Logprobs: jsonNull, FinishReason: finish}
+		if f.s.persona == PersonaVLLM {
+			choice.StopReason = jsonNull
+		}
+		b.Choices = append(b.Choices, choice)
+	}
 	return b
 }
 
-func (f *completionFormat) delta(text string) []byte { return sseData(f.body(text, nil)) }
+// perChoice frames one SSE chunk per choice index.
+func (f *completionFormat) perChoice(text string, finish *string) []byte {
+	var out []byte
+	for i := range max(1, f.choices) {
+		out = append(out, sseData(f.body(text, finish, i))...)
+	}
+	return out
+}
+
+// usage counts every choice's completion tokens.
+func (f *completionFormat) usageOf(text string) *usage {
+	u := f.s.usageFor(f.prompt, text)
+	u.CompletionTokens *= max(1, f.choices)
+	u.TotalTokens = u.PromptTokens + u.CompletionTokens
+	return u
+}
+
+func (f *completionFormat) delta(text string) []byte { return f.perChoice(text, nil) }
 
 func (f *completionFormat) finish(text string) [][]byte {
 	stop := "stop"
-	out := [][]byte{sseData(f.body("", &stop))}
+	out := [][]byte{f.perChoice("", &stop)}
 	if f.usage {
-		u := f.body("", nil)
+		u := f.body("", nil, 0)
 		u.Choices = []completionChoice{}
-		u.Usage = f.s.usageFor(f.prompt, text)
+		u.Usage = f.usageOf(text)
 		out = append(out, sseData(u))
 	}
 	return append(out, sseDone)
@@ -198,8 +241,8 @@ func (f *completionFormat) finish(text string) [][]byte {
 
 func (f *completionFormat) full(text string) any {
 	stop := "stop"
-	b := f.body(text, &stop)
-	b.Usage = f.s.usageFor(f.prompt, text)
+	b := f.body(text, &stop, -1)
+	b.Usage = f.usageOf(text)
 	return b
 }
 
@@ -213,13 +256,19 @@ type responsesFormat struct {
 	created int64
 	prompt  int
 	seq     int
-	status  string // status of full(); "completed" unless cancelled
+	status  string         // status of full(); "completed" unless cancelled
+	meta    map[string]any // request metadata, echoed back
 }
 
 type outputText struct {
 	Type        string `json:"type"`
 	Text        string `json:"text"`
 	Annotations []any  `json:"annotations"`
+	Logprobs    []any  `json:"logprobs"`
+}
+
+func newOutputText(text string) outputText {
+	return outputText{Type: "output_text", Text: text, Annotations: []any{}, Logprobs: []any{}}
 }
 
 type outputItem struct {
@@ -239,24 +288,44 @@ type respUsage struct {
 }
 
 type responseObject struct {
-	ID                 string       `json:"id"`
-	Object             string       `json:"object"`
-	CreatedAt          int64        `json:"created_at"`
-	Status             string       `json:"status"`
-	Error              any          `json:"error"`
-	IncompleteDetails  any          `json:"incomplete_details"`
-	Instructions       any          `json:"instructions"`
-	MaxOutputTokens    any          `json:"max_output_tokens"`
-	Model              string       `json:"model"`
-	Output             []outputItem `json:"output"`
-	ParallelToolCalls  bool         `json:"parallel_tool_calls"`
-	PreviousResponseID any          `json:"previous_response_id"`
-	Store              bool         `json:"store"`
-	Temperature        float64      `json:"temperature"`
-	ToolChoice         string       `json:"tool_choice"`
-	Tools              []any        `json:"tools"`
-	TopP               float64      `json:"top_p"`
-	Usage              *respUsage   `json:"usage"`
+	ID                 string         `json:"id"`
+	Object             string         `json:"object"`
+	CreatedAt          int64          `json:"created_at"`
+	Status             string         `json:"status"`
+	AccessPrograms     any            `json:"access_programs"`
+	Error              any            `json:"error"`
+	IncompleteDetails  any            `json:"incomplete_details"`
+	Instructions       any            `json:"instructions"`
+	MaxOutputTokens    any            `json:"max_output_tokens"`
+	Metadata           map[string]any `json:"metadata"`
+	Model              string         `json:"model"`
+	Output             []outputItem   `json:"output"`
+	ParallelToolCalls  bool           `json:"parallel_tool_calls"`
+	PreviousResponseID any            `json:"previous_response_id"`
+	Store              bool           `json:"store"`
+	Temperature        float64        `json:"temperature"`
+	ToolChoice         string         `json:"tool_choice"`
+	Tools              []any          `json:"tools"`
+	TopP               float64        `json:"top_p"`
+	Usage              *respUsage     `json:"usage"`
+}
+
+// responseMetadata returns the metadata a Response echoes: the request's
+// string pairs when they fit the documented limits (16 pairs, 64-character
+// keys, 512-character values), otherwise an empty object.
+func responseMetadata(md map[string]any) map[string]any {
+	out := map[string]any{}
+	if len(md) > 16 {
+		return out
+	}
+	for k, v := range md {
+		sv, ok := v.(string)
+		if !ok || len(k) > 64 || len(sv) > 512 {
+			return map[string]any{}
+		}
+		out[k] = sv
+	}
+	return out
 }
 
 func (f *responsesFormat) contentType() string { return sseContentType }
@@ -265,7 +334,7 @@ func (f *responsesFormat) idle() []byte        { return sseKeepAlive }
 func (f *responsesFormat) item(status, text string) outputItem {
 	content := []outputText{}
 	if text != "" || status == "completed" {
-		content = append(content, outputText{Type: "output_text", Text: text, Annotations: []any{}})
+		content = append(content, newOutputText(text))
 	}
 	return outputItem{ID: f.msgID, Type: "message", Status: status, Role: "assistant", Content: content}
 }
@@ -273,14 +342,14 @@ func (f *responsesFormat) item(status, text string) outputItem {
 func (f *responsesFormat) object(status, text string, withOutput bool) responseObject {
 	o := responseObject{
 		ID: f.id, Object: "response", CreatedAt: f.created, Status: status, Model: f.model,
-		Output: []outputItem{}, ParallelToolCalls: true, Store: true, Temperature: 1, ToolChoice: "auto",
-		Tools: []any{}, TopP: 1,
+		Metadata: responseMetadata(f.meta), Output: []outputItem{}, ParallelToolCalls: true, Store: true,
+		Temperature: 1, ToolChoice: "auto", Tools: []any{}, TopP: 1,
 	}
 	if withOutput {
 		o.Output = []outputItem{f.item("completed", text)}
 		n := wordCount(text)
 		o.Usage = &respUsage{
-			InputTokens: f.prompt, InputTokensDetails: map[string]int{"cached_tokens": 0},
+			InputTokens: f.prompt, InputTokensDetails: map[string]int{"cached_tokens": 0, "cache_write_tokens": 0},
 			OutputTokens: n, OutputTokensDetails: map[string]int{"reasoning_tokens": 0},
 			TotalTokens: f.prompt + n,
 		}
@@ -323,25 +392,25 @@ func (f *responsesFormat) start() [][]byte {
 		f.event("response.output_item.added", map[string]any{"output_index": 0, "item": f.item("in_progress", "")}),
 		f.event("response.content_part.added", map[string]any{
 			"item_id": f.msgID, "output_index": 0, "content_index": 0,
-			"part": outputText{Type: "output_text", Annotations: []any{}},
+			"part": newOutputText(""),
 		}),
 	}
 }
 
 func (f *responsesFormat) delta(text string) []byte {
 	return f.event("response.output_text.delta", map[string]any{
-		"item_id": f.msgID, "output_index": 0, "content_index": 0, "delta": text,
+		"item_id": f.msgID, "output_index": 0, "content_index": 0, "delta": text, "logprobs": []any{},
 	})
 }
 
 func (f *responsesFormat) finish(text string) [][]byte {
 	return [][]byte{
 		f.event("response.output_text.done", map[string]any{
-			"item_id": f.msgID, "output_index": 0, "content_index": 0, "text": text,
+			"item_id": f.msgID, "output_index": 0, "content_index": 0, "text": text, "logprobs": []any{},
 		}),
 		f.event("response.content_part.done", map[string]any{
 			"item_id": f.msgID, "output_index": 0, "content_index": 0,
-			"part": outputText{Type: "output_text", Text: text, Annotations: []any{}},
+			"part": newOutputText(text),
 		}),
 		f.event("response.output_item.done", map[string]any{"output_index": 0, "item": f.item("completed", text)}),
 		f.event("response.completed", map[string]any{"response": f.object("completed", text, true)}),
@@ -355,7 +424,9 @@ func (f *responsesFormat) full(text string) any {
 	}
 	o := f.object(status, text, true)
 	if status != "completed" {
-		o.Output = []outputItem{f.item(status, text)}
+		// A cancelled Response is "cancelled"; its interrupted message is
+		// "incomplete", the only terminal non-completed item status.
+		o.Output = []outputItem{f.item("incomplete", text)}
 	}
 	return o
 }
@@ -367,9 +438,9 @@ func (s *Server) newFormat(c *call, p *inferReq, model string) format {
 	created := s.cfg.Now().Unix()
 	switch p.kind {
 	case kindCompletion:
-		return &completionFormat{s: s, model: model, id: s.newID("cmpl-"), created: created, prompt: p.promptWords, usage: p.includeUsage}
+		return &completionFormat{s: s, model: model, id: s.newID("cmpl-"), created: created, prompt: p.promptWords, usage: p.includeUsage, choices: p.prompts}
 	case kindResponses:
-		return &responsesFormat{s: s, model: model, id: s.newID("resp_"), msgID: s.newID("msg_"), created: created, prompt: p.promptWords}
+		return &responsesFormat{s: s, model: model, id: s.newID("resp_"), msgID: s.newID("msg_"), created: created, prompt: p.promptWords, meta: p.req.Metadata}
 	case kindOllamaChat, kindOllamaGenerate:
 		return &ollamaFormat{s: s, kind: p.kind, model: model, prompt: p.promptWords}
 	}
@@ -462,7 +533,7 @@ func (s *Server) serveInference(c *call, k kind) {
 	f := s.newFormat(c, p, model)
 
 	if p.load {
-		s.serveLoad(c, f.(*ollamaFormat))
+		s.serveLoad(c, f.(*ollamaFormat), p.unload)
 		return
 	}
 	d := s.cfg.Responder.Decide(c.key, p.req)

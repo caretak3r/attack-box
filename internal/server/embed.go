@@ -73,7 +73,7 @@ func appendVector(dst []byte, v []float32, b64 bool) []byte {
 // embedRequest is a parsed embeddings call.
 type embedRequest struct {
 	model  string
-	inputs []string
+	inputs []embedInput
 	dims   int
 	b64    bool
 	words  int
@@ -104,11 +104,15 @@ func (c *call) parseEmbed(field string) (*embedRequest, bool) {
 	}
 	req := &embedRequest{model: model, inputs: inputs, dims: embedDimsFor(model)}
 	for _, in := range inputs {
-		if in == "" && c.style != styleOllama {
+		if in.tokens > 0 {
+			req.words += in.tokens
+			continue
+		}
+		if in.text == "" && c.style != styleOllama {
 			c.fail(http.StatusBadRequest, "Invalid 'input': empty string. Expected a string with minimum length 1, but got an empty string instead.", "input", "")
 			return nil, false
 		}
-		req.words += max(1, wordCount(in))
+		req.words += max(1, wordCount(in.text))
 	}
 	if d, ok := intOf(raw["dimensions"]); ok {
 		if d < 1 || d > maxEmbedDims {
@@ -148,7 +152,7 @@ func (s *Server) embeddings(c *call) {
 		buf = append(buf, `{"object":"embedding","index":`...)
 		buf = strconv.AppendInt(buf, int64(i), 10)
 		buf = append(buf, `,"embedding":`...)
-		buf = appendVector(buf, s.vector(req.model, in, req.dims), req.b64)
+		buf = appendVector(buf, s.vector(req.model, in.text, req.dims), req.b64)
 		buf = append(buf, '}')
 		if _, err := w.Write(buf); err != nil {
 			return
@@ -186,7 +190,7 @@ func (s *Server) ollamaEmbed(c *call) {
 		if i > 0 {
 			buf = append(buf, ',')
 		}
-		buf = appendVector(buf, s.vector(req.model, in, req.dims), false)
+		buf = appendVector(buf, s.vector(req.model, in.text, req.dims), false)
 		if _, err := w.Write(buf); err != nil {
 			return
 		}
@@ -205,7 +209,7 @@ func (s *Server) ollamaEmbeddings(c *call) {
 		return
 	}
 	buf := append([]byte(nil), `{"embedding":`...)
-	buf = appendVector(buf, s.vector(req.model, req.inputs[0], req.dims), false)
+	buf = appendVector(buf, s.vector(req.model, req.inputs[0].text, req.dims), false)
 	buf = append(buf, "}\n"...)
 	c.w.Header().Set("Content-Type", c.contentType())
 	c.w.WriteHeader(http.StatusOK)

@@ -123,9 +123,12 @@ func (f *ollamaFormat) full(text string) any {
 }
 
 // serveLoad answers a request that only asks to load the model.
-func (s *Server) serveLoad(c *call, f *ollamaFormat) {
+func (s *Server) serveLoad(c *call, f *ollamaFormat, unload bool) {
 	fr := f.frame("", true)
 	fr.DoneReason = "load"
+	if unload {
+		fr.DoneReason = "unload"
+	}
 	c.json(fr)
 }
 
@@ -270,6 +273,10 @@ func (s *Server) ollamaCreate(c *call) {
 		c.fail(http.StatusBadRequest, "model is required", "", "")
 		return
 	}
+	if stream, ok := boolOf(b["stream"]); ok && !stream {
+		c.json(map[string]string{"status": "success"})
+		return
+	}
 	c.w.Header().Set("Content-Type", ollamaContentType)
 	c.w.WriteHeader(http.StatusOK)
 	_, _ = c.w.Write(ndjson(map[string]string{"status": "success"}))
@@ -289,7 +296,7 @@ func (s *Server) ollamaCopy(c *call) {
 		c.modelMissing(src)
 		return
 	}
-	c.empty(http.StatusOK)
+	c.json(map[string]string{"status": "success"})
 }
 
 func (s *Server) ollamaDelete(c *call) {

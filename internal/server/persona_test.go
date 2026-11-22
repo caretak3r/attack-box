@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -247,15 +248,17 @@ func TestEmbedInputs(t *testing.T) {
 	s := newRig(t, PersonaOpenAI).srv
 	cases := []struct {
 		in   string
-		want []string
+		want []embedInput
 	}{
-		{`"a"`, []string{"a"}}, {`""`, []string{""}}, {`["a","","b"]`, []string{"a", "", "b"}},
-		{`[[1,2],[3]]`, []string{"[1,2]", "[3]"}}, {`[1,2,3]`, []string{"1", "2", "3"}}, {`7`, []string{"7"}},
+		{`"a"`, []embedInput{{text: "a"}}}, {`""`, []embedInput{{}}},
+		{`["a","","b"]`, []embedInput{{text: "a"}, {}, {text: "b"}}},
+		{`[[1,2],[3]]`, []embedInput{{"[1,2]", 2}, {"[3]", 1}}},
+		{`[1,2,3]`, []embedInput{{"[1,2,3]", 3}}}, {`7`, []embedInput{{text: "7"}}},
 	}
 	for _, tc := range cases {
 		got, err := s.embedInputs(raw(tc.in))
-		if err != nil || strings.Join(got, "|") != strings.Join(tc.want, "|") {
-			t.Errorf("%s = %q, %v", tc.in, got, err)
+		if err != nil || !slices.Equal(got, tc.want) {
+			t.Errorf("%s = %+v, %v", tc.in, got, err)
 		}
 	}
 	if got, _ := s.embedInputs(nil); got != nil {

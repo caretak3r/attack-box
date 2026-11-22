@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 
 	"attackbox/internal/responder"
 )
@@ -44,7 +45,9 @@ type inferReq struct {
 	parallel     *bool
 	req          responder.Request
 	promptWords  int
+	prompts      int  // legacy completion prompts; one choice each
 	load         bool // Ollama model-load request: no prompt at all
+	unload       bool // a load request with keep_alive 0 unloads instead
 }
 
 // The decoders below are lenient: a field of the wrong type reads as absent.
@@ -173,9 +176,11 @@ func (s *Server) parseInference(c *call, k kind) (*inferReq, error) {
 		}
 	case kindCompletion:
 		prompts, ok := arrayOf(raw["prompt"])
-		if !ok {
+		if !ok || (len(prompts) > 0 && isNumber(prompts[0])) {
+			// A string, or one prompt given as a token array.
 			prompts = []json.RawMessage{raw["prompt"]}
 		}
+		p.prompts = len(prompts)
 		if len(prompts) > s.cfg.MaxMessages {
 			return nil, &limitError{"prompt", s.cfg.MaxMessages, len(prompts)}
 		}
@@ -215,10 +220,32 @@ func (s *Server) parseInference(c *call, k kind) (*inferReq, error) {
 			}
 		}
 	}
+	p.unload = p.load && keepAliveZero(raw["keep_alive"])
 	p.req.Text = strings.Join(text, "\n")
 	p.req.Untrusted = strings.Join(untrusted, "\n")
 	p.promptWords = wordCount(p.req.Text) + wordCount(p.req.Untrusted)
 	return p, nil
+}
+
+// isNumber reports a JSON number token.
+func isNumber(raw json.RawMessage) bool {
+	b := bytes.TrimSpace(raw)
+	return len(b) > 0 && (b[0] == '-' || (b[0] >= '0' && b[0] <= '9'))
+}
+
+// keepAliveZero reports an Ollama keep_alive of zero: the number 0 (seconds)
+// or a zero duration string such as "0" or "0s".
+func keepAliveZero(raw json.RawMessage) bool {
+	var n float64
+	if json.Unmarshal(raw, &n) == nil {
+		return n == 0
+	}
+	sv := str(raw)
+	if sv == "0" {
+		return true
+	}
+	d, err := time.ParseDuration(sv)
+	return err == nil && d == 0
 }
 
 // toolForced reports a tool_choice that requires a call or names a function.
@@ -254,28 +281,44 @@ func jsonRequested(k kind, raw map[string]json.RawMessage) bool {
 	return false
 }
 
-// embedInputs reads an embeddings input: a string, an array of strings or an
-// array of token arrays. Non-string items are hashed as their JSON text.
-func (s *Server) embedInputs(raw json.RawMessage) ([]string, error) {
+// embedInput is one embeddings input. tokens is the token count of an input
+// given as token IDs; text inputs leave it 0 and are counted by words.
+type embedInput struct {
+	text   string
+	tokens int
+}
+
+// embedInputs reads an embeddings input: a string, an array of strings, one
+// token array, or an array of token arrays. Token arrays are hashed as their
+// JSON text.
+func (s *Server) embedInputs(raw json.RawMessage) ([]embedInput, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
-	if sv := str(raw); sv != "" || bytes.Equal(bytes.TrimSpace(raw), []byte(`""`)) {
-		return []string{sv}, nil
+	isEmpty := func(r json.RawMessage) bool { return bytes.Equal(bytes.TrimSpace(r), []byte(`""`)) }
+	if sv := str(raw); sv != "" || isEmpty(raw) {
+		return []embedInput{{text: sv}}, nil
 	}
 	items, ok := arrayOf(raw)
 	if !ok {
-		return []string{string(raw)}, nil
+		return []embedInput{{text: string(raw)}}, nil
+	}
+	if len(items) > 0 && isNumber(items[0]) {
+		return []embedInput{{text: string(raw), tokens: len(items)}}, nil
 	}
 	if len(items) > maxEmbedInputs {
 		return nil, &limitError{"input", maxEmbedInputs, len(items)}
 	}
-	out := make([]string, len(items))
+	out := make([]embedInput, len(items))
 	for i, it := range items {
-		if sv := str(it); sv != "" || bytes.Equal(bytes.TrimSpace(it), []byte(`""`)) {
-			out[i] = sv
-		} else {
-			out[i] = string(it)
+		switch inner, isArr := arrayOf(it); {
+		case isArr:
+			out[i] = embedInput{text: string(it), tokens: max(1, len(inner))}
+		default:
+			out[i] = embedInput{text: str(it)}
+			if out[i].text == "" && !isEmpty(it) {
+				out[i].text = string(it)
+			}
 		}
 	}
 	return out, nil

@@ -17,7 +17,7 @@ Read `research/responder-review.md` and `research/telemetry-security.md` before 
 5. DONE: Medium: make heartbeat scheduling/delivery independent of slow POST retries and attacker-filled queues.
 6. DONE: Medium: reject/account for metric intake after Close; make the Sink contract and local JSON writer behavior agree so request processing cannot stall silently.
 7. DONE: Review Low findings: strong random redactor keys, count transient failed POST attempts, and reject/scrub raw or escaped credentials in endpoint URLs.
-8. Triage `research/secret-review.md`: fix marker-prefix and malformed-canary allowlist bypasses, camelCase/encoded credential names, non-string JSON credential handling, cookie/canary idempotence and unsafe fingerprint output. Preserve valid JSON and behavioral telemetry byte-for-byte; document the remaining free-text detection boundary rather than claiming perfection.
+8. DEPLOY BLOCKER: the scrubber re-review confirmed all 11 findings in `research/secret-review.md` remain in the latest code. Fix marker-prefix and malformed-canary allowlist bypasses, camelCase/encoded credential names, non-string JSON credential handling, cookie/canary idempotence and unsafe fingerprint output. Preserve valid JSON and behavioral telemetry byte-for-byte; document the remaining free-text detection boundary rather than claiming perfection.
 9. `research/new-relic-hardening-review.md`: keep blocking JSONLog writers off the request path (or use bounded async/drop behavior), reject nested-escaped and arbitrary credential query parameters, scrub escaped keys in errors, expose recovered failed attempts in shipped metrics, cap custom backoff correctly, and count retries only when a subsequent POST actually runs.
 
 ## HTTP server snapshot
@@ -34,7 +34,7 @@ Remaining action: add streaming frame-loop cancellation, XFF malformed-input and
 
 ## Protocol fidelity
 
-Read `research/protocol-review.md` and fix all ten client-visible mismatches with contract tests: streamed `usage:null`, multi-prompt completion choices, Responses required fields/logprobs/usage details, cancelled nested item status, token-array embedding cardinality/counts, Ollama unload reason, `/api/create` non-streaming JSON and `/api/copy` success body. If a deliberately emulated older release differs, gate that behavior explicitly by persona version and document it; do not silently ignore the current contract.
+DONE: all ten mismatches are fixed and covered by `internal/server/protocol_test.go` (each test fails against the previous code). The OpenAI `usage:null` chunk behavior is gated to the `openai` persona, because vLLM and Ollama omit the key; this is documented in `implementation_plan.md`. Original item: read `research/protocol-review.md` and fix all ten client-visible mismatches with contract tests: streamed `usage:null`, multi-prompt completion choices, Responses required fields/logprobs/usage details, cancelled nested item status, token-array embedding cardinality/counts, Ollama unload reason, `/api/create` non-streaming JSON and `/api/copy` success body. If a deliberately emulated older release differs, gate that behavior explicitly by persona version and document it; do not silently ignore the current contract.
 
 ## Runtime defaults
 

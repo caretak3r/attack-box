@@ -216,9 +216,15 @@ Verification: `gofmt -l .` (no output), `go vet ./...`, `go test -race -count=1 
 - Source address: the peer address. `X-Forwarded-For` counts only when the peer is in `TrustedProxies`; then the right-most untrusted entry wins. Session key: HMAC-SHA256(`SessionKey`, source, User-Agent, credential fingerprint).
 - Logging: every request (also 404, 405, 413, 429) gives one `edge` event (redacted headers, credential fingerprints, redacted query, model, stream, tool count, `parallel_tool_calls`, task, declarations, observations, latency, redacted body). Inference requests also give a `transcript` event with the probe text, probe ID and task labels. Counters: `attackbox.requests` {persona, endpoint route pattern, status_class} and `attackbox.probes` {persona, probe_id, task}.
 - Unknown model on inference: persona 404 (`model_not_found`, vLLM `NotFoundError`, Ollama `model "x" not found, try pulling it first`); the echoed name is capped at 128 characters and stripped of control characters.
-- Ollama management endpoints change no state: `pull` of a listed model streams success, other names fail with a missing-manifest error; `push` fails with a namespace authorization error; `create` reports success and stores nothing; `copy` and `delete` act on listed names only.
+- Ollama management endpoints change no state: `pull` of a listed model streams success, other names fail with a missing-manifest error; `push` fails with a namespace authorization error; `create` reports success and stores nothing (NDJSON by default, one `application/json` `{"status":"success"}` with `"stream":false`); `copy` returns `{"status":"success"}` and, like `delete`, acts on listed names only.
+- Protocol contract (tests in `internal/server/protocol_test.go`):
+  - With `stream_options.include_usage`, the `openai` persona puts `"usage":null` in every chat and completion chunk except the last one before `[DONE]`. That last chunk has the usage object and `"choices":[]`. `vllm` and the Ollama `/v1` subset leave the key out of the other chunks, as those servers do.
+  - Legacy completions return one choice per prompt (indexes `0..n-1`). A flat token array such as `[1,2,3]` is one prompt. An array of token arrays is one prompt per inner array. Each stream chunk carries one choice index. `completion_tokens` counts every choice.
+  - A Response object always has `access_programs: null` and `metadata`. `metadata` echoes the request's string pairs when they are within the documented limits (16 pairs, 64-character keys, 512-character values), otherwise `{}`. `output_text` parts and the `response.output_text.delta`/`.done` events carry `"logprobs":[]`. `usage.input_tokens_details` has `cached_tokens` and `cache_write_tokens`. A cancelled Response has outer status `cancelled` and message item status `incomplete`.
+  - Embeddings: a flat number array is one input; an array of token arrays gives one embedding per inner array. Token inputs count their tokens in `prompt_tokens`/`total_tokens`.
+  - Ollama `/api/generate` with no prompt, or `/api/chat` with no messages, returns `done_reason` `unload` when `keep_alive` is zero (`0`, `"0"`, `"0s"`, any zero duration), otherwise `load`.
 
-Verification: `gofmt -l .` (no output), `go vet ./...`, `go test -race -count=1 -cover ./...` (`internal/server` 95.2%).
+Verification: `gofmt -l .` (no output), `go vet ./...`, `go test -race -count=1 -cover ./...` (`internal/server` 95.7%).
 
 ### Process entry point (`cmd/attackbox`)
 
