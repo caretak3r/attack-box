@@ -1,6 +1,9 @@
 package responder
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+)
 
 // Task labels. Responses use these safe labels instead of reflecting the
 // attacker's prompt.
@@ -125,7 +128,16 @@ func containsAny(s string, terms []string) bool {
 	return false
 }
 
-// normalize lowercases, drops invisible format characters and collapses
+// invisible reports characters that render as nothing: every Unicode format
+// character (Cf: zero-width, bidi marks and embeddings U+200E/F and
+// U+202A-U+202E, isolates, U+2061-U+2064, soft hyphen, BOM, U+180E), the
+// combining grapheme joiner and variation selectors.
+func invisible(r rune) bool {
+	return unicode.Is(unicode.Cf, r) || r == '\u034f' ||
+		(r >= '\ufe00' && r <= '\ufe0f') || (r >= 0xe0100 && r <= 0xe01ef)
+}
+
+// normalize lowercases, drops invisible characters and collapses
 // whitespace so trivial obfuscation does not hide a task.
 func normalize(s string) string {
 	if len(s) > maxScan {
@@ -136,7 +148,7 @@ func normalize(s string) string {
 	space := false
 	for _, r := range strings.ToLower(s) {
 		switch {
-		case r == '\u200b' || r == '\u200c' || r == '\u200d' || r == '\u2060' || r == '\ufeff' || r == '\u00ad':
+		case invisible(r):
 			continue
 		case r == '\n' || r == '\t' || r == '\r' || r == ' ':
 			if !space {

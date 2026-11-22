@@ -148,9 +148,10 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 		a.sink = telemetry.Multi{a.local, nr}
 	}
 
-	resp := responder.New(responder.Config{}, responder.NewStore(responder.StoreConfig{MaxSessions: cfg.maxSessions}))
-	sessionKey, embedSeed := cfg.derive("session"), cfg.derive("embed")
 	redactor := telemetry.NewRedactor(cfg.derive("redact"))
+	resp := responder.New(responder.Config{Fingerprint: redactor.Fingerprint},
+		responder.NewStore(responder.StoreConfig{MaxSessions: cfg.maxSessions}))
+	sessionKey, embedSeed := cfg.derive("session"), cfg.derive("embed")
 	for _, l := range cfg.listeners {
 		s, err := server.New(server.Config{
 			Persona:           l.persona,

@@ -4,14 +4,14 @@ Read `research/responder-review.md` and `research/telemetry-security.md` before 
 
 ## Responder
 
-1. H1: normalize U+200E/U+200F and U+202A–U+202E in the classifier, with regression tests.
-2. H3: bound declarations per field (reviewer suggests eight each), not only by a shared total.
-3. Sanitize declaration values, including nested `metadata.client`, before they enter session state or telemetry.
+1. DONE: H1: normalize U+200E/U+200F and U+202A–U+202E in the classifier, with regression tests.
+2. DONE: H3: bound declarations per field (reviewer suggests eight each), not only by a shared total.
+3. DONE: Sanitize declaration values, including nested `metadata.client`, before they enter session state or telemetry.
 
 ## Telemetry
 
-1. High: redact JSON credential fields, Basic/Bearer forms, API-key aliases and cookie-shaped fields in request/response bodies; add adversarial regression tests.
-2. Medium: redact credential-bearing header aliases and Referer userinfo/query secrets.
+1. DONE: High: redact JSON credential fields, Basic/Bearer forms, API-key aliases and cookie-shaped fields in request/response bodies; add adversarial regression tests.
+2. DONE: Medium: redact credential-bearing header aliases and Referer userinfo/query secrets.
 3. Medium: reject known non-ingest New Relic key formats and require the documented ingest-key shape at configuration time.
 4. Medium: honor bounded `Retry-After` seconds and HTTP-date values on 429.
 5. Medium: make heartbeat scheduling/delivery independent of slow POST retries and attacker-filled queues.
@@ -36,4 +36,23 @@ Read `research/protocol-review.md` and fix all ten client-visible mismatches wit
 
 ## Runtime defaults
 
-`cmd/attackbox/config.go` currently defaults `ATTACKBOX_OPENAI_ADDR` to `:8080`, which binds every interface and contradicts the private-application-listener design. Change the development default to `127.0.0.1:8080`; deployment must explicitly set the intended public or container address. Add a test proving the zero-configuration listener is loopback-only.
+`cmd/attackbox/config.go` currently defaults `ATTACKBOX_OPENAI_ADDR` to `:8080`, which binds every interface and contradicts the private-application-listener design. DONE: the development default is now `127.0.0.1:8080`, a test proves it is loopback-only, and a wildcard and a specific address on the same port are rejected as a conflict; deployment must explicitly set the intended public or container address. Add a test proving the zero-configuration listener is loopback-only.
+
+Also address the validated findings in `research/main-review.md`:
+
+1. On partial-listener startup failure, join/report `nr.Close` errors rather than discarding them; prove cleanup with a failing listener and fake NR intake.
+2. Put safe upper bounds on `MAX_SESSIONS`, `MAX_IN_FLIGHT`, `MAX_PER_SOURCE` and `MAX_BODY_BYTES` to reject operator configurations that trivially exhaust memory.
+3. Require secret files to be private to the service account (reject group/other-readable files) and test permissive modes.
+4. Emit the final runtime stop event before closing NR with a reliable local record, and handle empty `LastError` without malformed error text.
+5. Reject userinfo in healthcheck URLs and validate/document the relationship between shutdown and stream timeouts.
+
+## Deployment acceptance
+
+When writing the Ubuntu deployment, treat `research/ubuntu-hardening.md` as leads and enforce these boundaries:
+
+1. Default is preflight/dry-run. Require explicit `--apply`; require both `--disable-ssh` and `--console-confirmed` before masking SSH or changing cloud-init. Preserve a rollback copy of firewall configuration.
+2. Block metadata before Docker starts and prove container egress cannot bypass host policy through Docker's FORWARD/DOCKER-USER path. Test DNS/NTP/New Relic allowances and denied destinations from inside gVisor, not only from the host.
+3. Do not add Watchtower, automatic `docker compose pull`, unverified image tags or automatic reboots by default. Pin verified image versions/digests at deployment and make upgrades an explicit rebuild.
+4. Use pinned DNS resolvers; do not force DNS-over-TLS unless the script actually configures and verifies it. Keep the initial package-bootstrap path working before locking egress.
+5. Falco must not give the bait container Docker socket access. If host Falco needs privileged access, isolate it from the bait and document that residual host-monitoring privilege and kernel/eBPF support checks.
+6. Keep writable state bounded and explicit; read-only root filesystem plus approved tmpfs/log paths only. Never mount host SSH, cloud, kube, AWS or Docker credentials.

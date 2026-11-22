@@ -125,9 +125,9 @@ func loadConfig(getenv func(string) string) (config, error) {
 		errs = append(errs, errors.New("ATTACKBOX_HOLD_SILENT must not exceed ATTACKBOX_MAX_STREAM"))
 	}
 
-	addrs := map[string]string{}
+	var used []boundAddr
 	for _, l := range []struct{ persona, name, def string }{
-		{"openai", "OPENAI_ADDR", ":8080"},
+		{"openai", "OPENAI_ADDR", "127.0.0.1:8080"},
 		{"vllm", "VLLM_ADDR", "off"},
 		{"ollama", "OLLAMA_ADDR", "off"},
 	} {
@@ -135,16 +135,16 @@ func loadConfig(getenv func(string) string) (config, error) {
 		if strings.EqualFold(a, "off") {
 			continue
 		}
-		_, port, err := splitAddr(a)
+		host, port, err := splitAddr(a)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("ATTACKBOX_%s: %v", l.name, err))
 			continue
 		}
-		if other, dup := addrs[a]; dup && port != 0 {
+		if other := conflict(used, host, port); other != "" {
 			errs = append(errs, fmt.Errorf("ATTACKBOX_%s: address %s is already used by %s", l.name, a, other))
 			continue
 		}
-		addrs[a] = l.persona
+		used = append(used, boundAddr{host, port, l.persona})
 		c.listeners = append(c.listeners, listener{l.persona, a})
 	}
 	if len(c.listeners) == 0 {
@@ -216,6 +216,31 @@ func splitList(v string) []string {
 		}
 	}
 	return out
+}
+
+// wildcard reports hosts that bind every interface.
+func wildcard(host string) bool {
+	return host == "" || host == "0.0.0.0" || host == "::"
+}
+
+type boundAddr struct {
+	host    string
+	port    int
+	persona string
+}
+
+// conflict returns the persona already bound to port on an overlapping host.
+// Port 0 picks a free port, so it never conflicts.
+func conflict(used []boundAddr, host string, port int) string {
+	if port == 0 {
+		return ""
+	}
+	for _, u := range used {
+		if u.port == port && (u.host == host || wildcard(u.host) || wildcard(host)) {
+			return u.persona
+		}
+	}
+	return ""
 }
 
 func splitAddr(a string) (host string, port int, err error) {

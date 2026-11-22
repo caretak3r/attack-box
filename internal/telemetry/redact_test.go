@@ -114,3 +114,42 @@ func TestText(t *testing.T) {
 		t.Errorf("short key altered: %s", out)
 	}
 }
+
+func TestHeadersCredentialAliasesAndReferer(t *testing.T) {
+	r := NewRedactor([]byte("k"))
+	h := http.Header{}
+	for _, n := range []string{"X-Authorization", "Authentication", "X-Auth", "X-Credential", "X-Client-Secret"} {
+		h.Set(n, "alias-secret-"+n)
+	}
+	h.Set("Referer", "https://u:refpass@example.test/cb?access_token=reftok&page=2")
+	h.Set("X-Note", `{"password":"notepass"}`)
+	safe, fps := r.Headers(h)
+	out, _ := json.Marshal(safe)
+	for _, leak := range []string{"alias-secret", "refpass", "reftok", "notepass"} {
+		if strings.Contains(string(out), leak) {
+			t.Errorf("%q leaked: %s", leak, out)
+		}
+	}
+	for _, n := range []string{"X-Authorization", "Authentication", "X-Auth", "X-Credential", "X-Client-Secret"} {
+		if safe[n] != "[redacted]" || fps[n] == "" {
+			t.Errorf("%s: safe=%q fp=%q", n, safe[n], fps[n])
+		}
+	}
+	if !strings.Contains(safe["Referer"], "example.test/cb?access_token=[redacted:") || !strings.Contains(safe["Referer"], "page=2") {
+		t.Errorf("Referer = %q", safe["Referer"])
+	}
+}
+
+func TestTextStructuredCredentials(t *testing.T) {
+	r := NewRedactor([]byte("k"))
+	in := `{"messages":[{"role":"user","content":"login {\"password\":\"hunter2\"}"}],"api_key":"abc","x":"Basic dXNlcjpwYXNz"}`
+	out := r.Text(in)
+	for _, leak := range []string{"hunter2", `"abc"`, "dXNlcjpwYXNz"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("%q leaked: %s", leak, out)
+		}
+	}
+	if !strings.Contains(out, `"api_key":"[redacted:`+r.Fingerprint("abc")+`]"`) {
+		t.Errorf("api_key fingerprint missing: %s", out)
+	}
+}

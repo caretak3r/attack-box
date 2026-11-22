@@ -6,12 +6,19 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"attackbox/internal/secret"
 )
 
 // Config tunes the responder.
 type Config struct {
 	MaxQuestions    int // questions before the fake payout; default 3
-	MaxDeclarations int // declarations kept per session; default 32
+	MaxDeclarations int // declarations kept per session; default 40
+	MaxPerField     int // declarations kept per field per session; default 8
+	// Fingerprint turns a credential found in a declaration into a keyed
+	// fingerprint. nil stores a plain "[redacted]" marker.
+	Fingerprint secret.Fingerprinter
 }
 
 // Responder selects counter-probes from local templates. It never calls a
@@ -27,7 +34,10 @@ func New(cfg Config, store *Store) *Responder {
 		cfg.MaxQuestions = 3
 	}
 	if cfg.MaxDeclarations <= 0 {
-		cfg.MaxDeclarations = 32
+		cfg.MaxDeclarations = 40
+	}
+	if cfg.MaxPerField <= 0 {
+		cfg.MaxPerField = 8
 	}
 	return &Responder{cfg: cfg, store: store}
 }
@@ -130,14 +140,24 @@ func (r *Responder) next(sess *Session, task string, decls []Declaration) Probe 
 	return CompletionProbe(sess)
 }
 
-var emailLike = regexp.MustCompile(`[^\s@"]+@[^\s@"]+\.[A-Za-z]{2,}`)
+// emailLike matches anything shaped like local@host. Operator identity is an
+// alias only, so even "user@host" or "user@10.0.0.1" is never kept.
+var emailLike = regexp.MustCompile(`[^\s@"'<>(){}\[\],;:]+@[^\s@"'<>(){}\[\],;:]+`)
 
-func redact(v string) string {
-	v = emailLike.ReplaceAllString(v, "[email-redacted]")
-	if len(v) > 256 {
-		v = v[:256]
+const maxDeclValue = 256
+
+// sanitize removes credentials and email addresses, then bounds the value to
+// 256 bytes on a UTF-8 boundary.
+func (r *Responder) sanitize(v string) string {
+	v = emailLike.ReplaceAllString(secret.Scrub(v, r.cfg.Fingerprint), "[email-redacted]")
+	if len(v) <= maxDeclValue {
+		return v
 	}
-	return v
+	cut := maxDeclValue
+	for cut > 0 && !utf8.RuneStart(v[cut]) {
+		cut--
+	}
+	return v[:cut]
 }
 
 // declare extracts identification fields. Credential values are compared
@@ -149,7 +169,7 @@ func (r *Responder) declare(sess *Session, req Request, now time.Time) []Declara
 		if value == "" {
 			return
 		}
-		out = append(out, Declaration{Field: field, Value: redact(value), Valid: valid, At: now})
+		out = append(out, Declaration{Field: field, Value: r.sanitize(value), Valid: valid, At: now})
 	}
 	md := req.Metadata
 	if v, ok := md["client_model"]; ok {
@@ -169,13 +189,16 @@ func (r *Responder) declare(sess *Session, req Request, now time.Time) []Declara
 		}
 	}
 	add("user", req.User, true)
-	room := r.cfg.MaxDeclarations - len(sess.Declarations)
-	if room > 0 {
-		kept := out
-		if len(kept) > room {
-			kept = kept[:room]
+	perField := map[string]int{}
+	for _, d := range sess.Declarations {
+		perField[d.Field]++
+	}
+	for _, d := range out {
+		if len(sess.Declarations) >= r.cfg.MaxDeclarations || perField[d.Field] >= r.cfg.MaxPerField {
+			continue
 		}
-		sess.Declarations = append(sess.Declarations, kept...)
+		perField[d.Field]++
+		sess.Declarations = append(sess.Declarations, d)
 	}
 	return out
 }

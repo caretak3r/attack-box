@@ -29,8 +29,11 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(c.listeners) != 1 || c.listeners[0] != (listener{"openai", ":8080"}) {
+	if len(c.listeners) != 1 || c.listeners[0] != (listener{"openai", "127.0.0.1:8080"}) {
 		t.Fatalf("listeners = %+v", c.listeners)
+	}
+	if host, _, err := net.SplitHostPort(c.listeners[0].addr); err != nil || !net.ParseIP(host).IsLoopback() {
+		t.Fatalf("zero-config listener %q must be loopback-only", c.listeners[0].addr)
 	}
 	if c.holdSilent != 150*time.Second || c.idleInterval != 45*time.Second || c.maxStream != 180*time.Second {
 		t.Fatalf("hold defaults = %v %v %v", c.holdSilent, c.idleInterval, c.maxStream)
@@ -99,7 +102,8 @@ func TestLoadConfigErrors(t *testing.T) {
 		"no listeners":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_OPENAI_ADDR": "off"}, "no listener enabled"},
 		"bad addr":          {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_OPENAI_ADDR": "example.com:80"}, "host must be an IP"},
 		"bad port":          {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_VLLM_ADDR": ":99999"}, "invalid port"},
-		"dup addr":          {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_VLLM_ADDR": ":8080"}, "already used"},
+		"dup addr":          {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_VLLM_ADDR": "127.0.0.1:8080"}, "already used"},
+		"wildcard overlap":  {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_VLLM_ADDR": ":8080"}, "already used"},
 		"bad proxy":         {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_TRUSTED_PROXIES": "proxy.local"}, "not an IP or CIDR"},
 		"bad model":         {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MODELS": "a\x01b"}, "invalid model"},
 		"bad instance":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_INSTANCE": "has space"}, "ATTACKBOX_INSTANCE"},
