@@ -1,6 +1,7 @@
 package telemetry
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"math"
@@ -90,22 +91,26 @@ func validEndpoint(v string) bool {
 
 // JSONLog writes one JSON object per line. Events are chunked; metrics are
 // written as stream "metric" lines. Writes are synchronous: point it at a
-// local file or stdout, never a network writer. Failed writes are counted in
-// Errors and passed to OnError.
+// local file or stdout, never a network writer. A record that cannot be encoded
+// is replaced by a "log_encode_error" line. Encode and write failures are
+// counted in Errors and passed to OnError.
 type JSONLog struct {
 	mu     sync.Mutex
+	w      io.Writer
+	buf    bytes.Buffer
 	enc    *json.Encoder
 	now    func() time.Time
 	errors atomic.Int64
 
-	// OnError, if set, is called with write failures.
+	// OnError, if set, is called with encode and write failures.
 	OnError func(error)
 }
 
 func NewJSONLog(w io.Writer) *JSONLog {
-	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
-	return &JSONLog{enc: enc, now: time.Now}
+	l := &JSONLog{w: w, now: time.Now}
+	l.enc = json.NewEncoder(&l.buf)
+	l.enc.SetEscapeHTML(false)
+	return l
 }
 
 func (l *JSONLog) Emit(e Event) {
@@ -143,9 +148,24 @@ func (l *JSONLog) metric(kind, name string, value float64, attrs map[string]stri
 
 func (l *JSONLog) write(v map[string]any) {
 	l.mu.Lock()
-	err := l.enc.Encode(v)
+	var errs []error
+	l.buf.Reset()
+	if err := l.enc.Encode(v); err != nil {
+		errs = append(errs, err)
+		stream, _ := v["stream"].(string)
+		l.buf.Reset()
+		l.enc.Encode(map[string]any{
+			"timestamp": l.now().UTC().Format(time.RFC3339Nano),
+			"stream":    stream,
+			"event":     "log_encode_error",
+			"error":     err.Error(),
+		})
+	}
+	if _, err := l.w.Write(l.buf.Bytes()); err != nil {
+		errs = append(errs, err)
+	}
 	l.mu.Unlock()
-	if err != nil {
+	for _, err := range errs {
 		l.errors.Add(1)
 		if l.OnError != nil {
 			l.OnError(err)
@@ -153,5 +173,5 @@ func (l *JSONLog) write(v map[string]any) {
 	}
 }
 
-// Errors returns the number of lines that failed to write.
+// Errors returns the number of lines that failed to encode or write.
 func (l *JSONLog) Errors() int64 { return l.errors.Load() }

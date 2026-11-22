@@ -127,6 +127,30 @@ func TestJSONLogWriteError(t *testing.T) {
 	}
 }
 
+func TestJSONLogEncodeFailureWritesMarker(t *testing.T) {
+	var buf bytes.Buffer
+	l := NewJSONLog(&buf)
+	var seen int
+	l.OnError = func(error) { seen++ }
+	l.Emit(Event{Stream: StreamEdge, Action: "x", Attrs: map[string]any{"bad": make(chan int)}})
+	l.Emit(Event{Stream: StreamEdge, Action: "after"})
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("lines = %d: %s", len(lines), buf.String())
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &m); err != nil {
+		t.Fatalf("marker line invalid: %v: %s", err, lines[0])
+	}
+	if m["event"] != "log_encode_error" || m["stream"] != StreamEdge || m["error"] == nil || m["timestamp"] == nil {
+		t.Errorf("marker = %v", m)
+	}
+	if l.Errors() != 1 || seen != 1 {
+		t.Errorf("errors=%d seen=%d", l.Errors(), seen)
+	}
+}
+
 func TestJSONLogCountsWriteErrors(t *testing.T) {
 	l := NewJSONLog(failWriter{})
 	var seen int

@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +29,16 @@ const (
 	defaultMetricURL = "https://metric-api.newrelic.com/metric/v1"
 	maxSeries        = 2000
 	licenseKeyLen    = 40
+
+	defaultPayloadBytes = 900_000
+	maxPayloadBytes     = 950_000 // New Relic rejects bodies over 1MB
+	closeGrace          = time.Second
+
+	// New Relic drops a record with more than 254 attributes, names over 255
+	// characters or string values over 4094 characters.
+	maxAttrKey    = 255
+	maxAttrValue  = 4000
+	maxExtraAttrs = 230 // leaves room for the fixed fields and the marker
 )
 
 // ValidLicenseKey accepts only the documented New Relic license-key shape: 40
@@ -67,7 +79,7 @@ type NRConfig struct {
 	BatchSize         int           // log events per batch; default 200
 	FlushInterval     time.Duration // default 5s
 	QueueSize         int           // default 10000
-	MaxPayloadBytes   int           // uncompressed bytes per POST; default 900_000
+	MaxPayloadBytes   int           // uncompressed bytes per POST; default 900_000, max 950_000
 	Client            *http.Client  // default timeout 10s
 	Now               func() time.Time
 	Common            map[string]any
@@ -78,17 +90,21 @@ type NRConfig struct {
 }
 
 // Stats is a snapshot of shipper counters. Sent counts log events and metrics
-// New Relic accepted; Dropped counts items refused by a full queue or series
-// cap or arriving after Close; Lost counts items abandoned after failed
-// delivery; Errors counts POSTs that finally failed; Retries counts transient
-// failed attempts that were retried.
+// New Relic accepted; DroppedLogs counts events refused by a full queue or
+// arriving after Close; DroppedMetrics counts metrics refused by the series cap
+// or arriving after Close; Dropped is their sum; Lost counts items abandoned
+// after failed delivery, including events still queued when Close timed out;
+// Errors counts POSTs that finally failed; Retries counts transient failed
+// attempts that were retried.
 type Stats struct {
-	Sent      int64
-	Dropped   int64
-	Lost      int64
-	Errors    int64
-	Retries   int64
-	LastError string
+	Sent           int64
+	Dropped        int64
+	DroppedLogs    int64
+	DroppedMetrics int64
+	Lost           int64
+	Errors         int64
+	Retries        int64
+	LastError      string
 }
 
 type series struct {
@@ -97,6 +113,10 @@ type series struct {
 	value  float64
 	labels map[string]string
 	at     time.Time
+
+	// internal series are the shipper's own health metrics. They are rebuilt
+	// on every flush, so a failed POST does not requeue them.
+	internal bool
 }
 
 // NewRelic ships events to the Log API and metrics to the Metric API. Emit,
@@ -117,10 +137,11 @@ type NewRelic struct {
 	series    map[string]*series
 	lastFlush time.Time
 
-	sent, dropped, lost, errs, retries atomic.Int64
-	errMu                              sync.Mutex
-	lastErr                            string
-	keyRe                              *regexp.Regexp
+	sent, lost, errs, retries   atomic.Int64
+	droppedLogs, droppedMetrics atomic.Int64
+	errMu                       sync.Mutex
+	lastErr                     string
+	keyRe                       *regexp.Regexp
 }
 
 func NewNewRelic(cfg NRConfig) (*NewRelic, error) {
@@ -151,8 +172,9 @@ func NewNewRelic(cfg NRConfig) (*NewRelic, error) {
 		cfg.QueueSize = 10000
 	}
 	if cfg.MaxPayloadBytes <= 0 {
-		cfg.MaxPayloadBytes = 900_000
+		cfg.MaxPayloadBytes = defaultPayloadBytes
 	}
+	cfg.MaxPayloadBytes = min(cfg.MaxPayloadBytes, maxPayloadBytes)
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -164,6 +186,12 @@ func NewNewRelic(cfg NRConfig) (*NewRelic, error) {
 	}
 	if cfg.MaxRetryAfter <= 0 {
 		cfg.MaxRetryAfter = 30 * time.Second
+	}
+	// The shipper marshals Common from several goroutines and New Relic
+	// rejects "attributes":null, so keep a private non-nil copy.
+	cfg.Common = maps.Clone(cfg.Common)
+	if cfg.Common == nil {
+		cfg.Common = map[string]any{}
 	}
 	client := &http.Client{Timeout: 10 * time.Second}
 	if cfg.Client != nil {
@@ -291,22 +319,25 @@ func keyPattern(key string) *regexp.Regexp {
 }
 
 // Emit chunks the event and queues each chunk, dropping when the queue is full.
+// Attrs and TaskLabels are copied, so the caller may reuse them afterwards.
 func (n *NewRelic) Emit(e Event) {
 	if e.Timestamp.IsZero() {
 		e.Timestamp = n.cfg.Now()
 	}
+	e.Attrs = maps.Clone(e.Attrs)
+	e.TaskLabels = slices.Clone(e.TaskLabels)
 	chunks := Chunk(e, MaxChunk)
 	n.closeMu.RLock()
 	defer n.closeMu.RUnlock()
 	for _, c := range chunks {
 		if n.closed {
-			n.dropped.Add(1)
+			n.droppedLogs.Add(1)
 			continue
 		}
 		select {
 		case n.queue <- c:
 		default:
-			n.dropped.Add(1)
+			n.droppedLogs.Add(1)
 		}
 	}
 }
@@ -328,7 +359,7 @@ func (n *NewRelic) record(name string, count bool, value float64, attrs map[stri
 	n.closeMu.RLock()
 	defer n.closeMu.RUnlock()
 	if n.closed {
-		n.dropped.Add(1)
+		n.droppedMetrics.Add(1)
 		return
 	}
 	labels := SafeLabels(attrs)
@@ -339,7 +370,7 @@ func (n *NewRelic) record(name string, count bool, value float64, attrs map[stri
 	s, ok := n.series[key]
 	if !ok {
 		if len(n.series) >= maxSeries {
-			n.dropped.Add(1)
+			n.droppedMetrics.Add(1)
 			return
 		}
 		s = &series{name: name, count: count, labels: labels}
@@ -377,15 +408,17 @@ func (n *NewRelic) Stats() Stats {
 	n.errMu.Lock()
 	last := n.lastErr
 	n.errMu.Unlock()
+	dl, dm := n.droppedLogs.Load(), n.droppedMetrics.Load()
 	return Stats{
-		Sent: n.sent.Load(), Dropped: n.dropped.Load(), Lost: n.lost.Load(),
-		Errors: n.errs.Load(), Retries: n.retries.Load(), LastError: last,
+		Sent: n.sent.Load(), Dropped: dl + dm, DroppedLogs: dl, DroppedMetrics: dm,
+		Lost: n.lost.Load(), Errors: n.errs.Load(), Retries: n.retries.Load(), LastError: last,
 	}
 }
 
 // Close stops intake, drains the queue and flushes logs and metrics. If ctx
-// ends first, in-flight delivery is aborted and ctx.Err() returned. It is safe
-// to call more than once.
+// ends first, in-flight delivery is aborted, the events not yet delivered are
+// counted in Lost, and ctx.Err() is returned. It is safe to call more than
+// once.
 func (n *NewRelic) Close(ctx context.Context) error {
 	n.closeMu.Lock()
 	if !n.closed {
@@ -398,6 +431,10 @@ func (n *NewRelic) Close(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		n.cancel()
+		select { // the worker counts what it abandons
+		case <-n.done:
+		case <-time.After(closeGrace):
+		}
 		return ctx.Err()
 	}
 }
@@ -432,7 +469,7 @@ func (n *NewRelic) heartbeatLoop() {
 		now := n.cfg.Now()
 		e := Event{Stream: StreamHeartbeat, Action: "heartbeat", Timestamp: now, Attrs: map[string]any{
 			"queue_len":     len(n.queue),
-			"dropped_total": n.dropped.Load(),
+			"dropped_total": n.droppedLogs.Load() + n.droppedMetrics.Load(),
 			"lost_total":    n.lost.Load(),
 			"errors_total":  n.errs.Load(),
 		}}
@@ -459,14 +496,51 @@ func envelope(common []byte, field string, items ...[]byte) []byte {
 }
 
 func logItem(e Event) ([]byte, error) {
-	attrs := e.Attributes()
-	delete(attrs, "timestamp")
-	delete(attrs, "message")
 	return json.Marshal(map[string]any{
 		"timestamp":  e.Timestamp.UnixMilli(),
 		"message":    e.Message(),
-		"attributes": attrs,
+		"attributes": limitAttrs(e),
 	})
+}
+
+// limitAttrs flattens e within New Relic's attribute limits, which otherwise
+// make it drop the whole record. Extra Attrs past maxExtraAttrs are dropped in
+// key order, and long keys and values are cut; any cut sets attrs_truncated.
+func limitAttrs(e Event) map[string]any {
+	cut := len(e.Attrs) > maxExtraAttrs
+	if cut {
+		kept := make(map[string]any, maxExtraAttrs)
+		for _, k := range slices.Sorted(maps.Keys(e.Attrs))[:maxExtraAttrs] {
+			kept[k] = e.Attrs[k]
+		}
+		e.Attrs = kept
+	}
+	attrs := e.Attributes()
+	delete(attrs, "timestamp")
+	delete(attrs, "message")
+	out := make(map[string]any, len(attrs)+1)
+	clip := func(s string, limit int) string {
+		t := truncate(s, limit)
+		cut = cut || len(t) != len(s)
+		return t
+	}
+	for k, v := range attrs {
+		switch x := v.(type) {
+		case string:
+			v = clip(x, maxAttrValue)
+		case []string:
+			c := make([]string, len(x))
+			for i, s := range x {
+				c[i] = clip(s, maxAttrValue)
+			}
+			v = c
+		}
+		out[clip(k, maxAttrKey)] = v
+	}
+	if cut {
+		out["attrs_truncated"] = true
+	}
+	return out
 }
 
 func (n *NewRelic) ship() {
@@ -486,7 +560,7 @@ func (n *NewRelic) ship() {
 			}
 		case <-flush.C:
 			send()
-			n.flushMetrics()
+			n.flushMetrics(false)
 		case <-n.quit:
 			for {
 				select {
@@ -501,7 +575,7 @@ func (n *NewRelic) ship() {
 				break
 			}
 			send()
-			n.flushMetrics()
+			n.flushMetrics(true)
 			return
 		}
 	}
@@ -509,6 +583,10 @@ func (n *NewRelic) ship() {
 
 func (n *NewRelic) flushLogs(events []Event) {
 	if len(events) == 0 {
+		return
+	}
+	if n.ctx.Err() != nil {
+		n.lost.Add(int64(len(events)))
 		return
 	}
 	items := make([][]byte, 0, len(events))
@@ -525,18 +603,23 @@ func (n *NewRelic) flushLogs(events []Event) {
 		n.fail(fmt.Errorf("newrelic: marshal common: %w", err), len(items))
 		return
 	}
-	n.postAll(n.cfg.LogURL, common, "logs", items)
+	failed := n.postAll(n.cfg.LogURL, common, "logs", items)
+	n.lost.Add(int64(len(failed)))
 }
 
-func (n *NewRelic) flushMetrics() {
+// flushMetrics ships the pending series. Series from a failed POST are merged
+// back for the next flush, or counted lost when final is set.
+func (n *NewRelic) flushMetrics(final bool) {
 	now := n.cfg.Now()
 	n.mu.Lock()
 	for name, v := range map[string]int64{
-		"attackbox.telemetry.dropped_total":        n.dropped.Load(),
-		"attackbox.telemetry.ingest_errors_total":  n.errs.Load(),
-		"attackbox.telemetry.ingest_retries_total": n.retries.Load(),
+		"attackbox.telemetry.dropped_total":         n.droppedLogs.Load() + n.droppedMetrics.Load(),
+		"attackbox.telemetry.dropped_logs_total":    n.droppedLogs.Load(),
+		"attackbox.telemetry.dropped_metrics_total": n.droppedMetrics.Load(),
+		"attackbox.telemetry.ingest_errors_total":   n.errs.Load(),
+		"attackbox.telemetry.ingest_retries_total":  n.retries.Load(),
 	} {
-		n.series[seriesKey(name, false, nil)] = &series{name: name, value: float64(v), at: now}
+		n.series[seriesKey(name, false, nil)] = &series{name: name, value: float64(v), at: now, internal: true}
 	}
 	pending := n.series
 	n.series = map[string]*series{}
@@ -554,6 +637,7 @@ func (n *NewRelic) flushMetrics() {
 	}
 	sort.Strings(keys)
 	items := make([][]byte, 0, len(keys))
+	itemKeys := make([]string, 0, len(keys))
 	for _, k := range keys {
 		s := pending[k]
 		m := map[string]any{"name": s.name, "value": s.value}
@@ -573,6 +657,7 @@ func (n *NewRelic) flushMetrics() {
 			continue
 		}
 		items = append(items, b)
+		itemKeys = append(itemKeys, k)
 	}
 	common, err := json.Marshal(map[string]any{
 		"timestamp":   start.UnixMilli(),
@@ -583,46 +668,106 @@ func (n *NewRelic) flushMetrics() {
 		n.fail(fmt.Errorf("newrelic: marshal common: %w", err), len(items))
 		return
 	}
-	n.postAll(n.cfg.MetricURL, common, "metrics", items)
+	failed := n.postAll(n.cfg.MetricURL, common, "metrics", items)
+	if final {
+		n.lost.Add(int64(len(failed)))
+		return
+	}
+	retry := make(map[string]*series, len(failed))
+	for _, i := range failed {
+		retry[itemKeys[i]] = pending[itemKeys[i]]
+	}
+	n.requeue(retry)
 }
 
-// postAll packs items into POSTs of at most MaxPayloadBytes uncompressed. An
-// item too large for any POST is dropped and counted.
-func (n *NewRelic) postAll(endpoint string, common []byte, field string, items [][]byte) {
-	head := append(append([]byte(`[{"common":`), common...), []byte(`,"`+field+`":[`)...)
-	const tail = `]}]`
-	limit := n.cfg.MaxPayloadBytes - len(head) - len(tail)
-
-	var buf []byte
-	count := 0
-	flush := func() {
-		if count == 0 {
-			return
+// requeue folds series from a failed POST back into the live set: counts add
+// up, gauges keep the newest value. It stays within maxSeries; what does not
+// fit is counted in DroppedMetrics.
+func (n *NewRelic) requeue(failed map[string]*series) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for k, s := range failed {
+		if s.internal {
+			continue
 		}
-		payload := append(append(append([]byte(nil), head...), buf...), tail...)
-		n.post(endpoint, payload, count)
-		buf, count = buf[:0], 0
+		cur, ok := n.series[k]
+		switch {
+		case !ok && len(n.series) >= maxSeries:
+			n.droppedMetrics.Add(1)
+		case !ok:
+			n.series[k] = s
+		case s.count:
+			cur.value += s.value
+		case s.at.After(cur.at):
+			cur.value, cur.at = s.value, s.at
+		}
 	}
-	for _, it := range items {
+}
+
+const payloadTail = `]}]`
+
+// postAll packs items into POSTs of at most MaxPayloadBytes uncompressed and
+// returns the indexes of items whose POST failed. An item too large for any
+// POST is counted lost and not returned.
+func (n *NewRelic) postAll(endpoint string, common []byte, field string, items [][]byte) (failed []int) {
+	head := append(append([]byte(`[{"common":`), common...), []byte(`,"`+field+`":[`)...)
+	limit := n.cfg.MaxPayloadBytes - len(head) - len(payloadTail)
+
+	var group []int
+	size := 0
+	flush := func() {
+		if len(group) > 0 {
+			failed = append(failed, n.postGroup(endpoint, head, items, group)...)
+		}
+		group, size = nil, 0
+	}
+	for i, it := range items {
 		if len(it) > limit {
 			n.fail(errors.New("newrelic: item exceeds max payload size"), 1)
 			continue
 		}
 		extra := len(it)
-		if count > 0 {
+		if len(group) > 0 {
 			extra++
 		}
-		if len(buf)+extra > limit {
+		if size+extra > limit {
 			flush()
 			extra = len(it)
 		}
-		if count > 0 {
-			buf = append(buf, ',')
-		}
-		buf = append(buf, it...)
-		count++
+		group = append(group, i)
+		size += extra
 	}
 	flush()
+	return failed
+}
+
+// postGroup sends items[group] in one POST. On 413 a multi-item group is split
+// in half and each half sent on its own. It returns the indexes that failed.
+func (n *NewRelic) postGroup(endpoint string, head []byte, items [][]byte, group []int) []int {
+	if n.ctx.Err() != nil {
+		return group
+	}
+	payload := append([]byte(nil), head...)
+	for i, idx := range group {
+		if i > 0 {
+			payload = append(payload, ',')
+		}
+		payload = append(payload, items[idx]...)
+	}
+	payload = append(payload, payloadTail...)
+
+	err := n.post(endpoint, payload)
+	if err == nil {
+		n.sent.Add(int64(len(group)))
+		return nil
+	}
+	var se *statusError
+	if errors.As(err, &se) && se.status == http.StatusRequestEntityTooLarge && len(group) > 1 {
+		mid := len(group) / 2
+		return append(n.postGroup(endpoint, head, items, group[:mid]), n.postGroup(endpoint, head, items, group[mid:])...)
+	}
+	n.recordErr(err)
+	return group
 }
 
 func gzipBody(payload []byte) ([]byte, error) {
@@ -647,35 +792,42 @@ func (n *NewRelic) postOnce(endpoint string, payload []byte, items int) {
 	n.fail(err, items)
 }
 
-func (n *NewRelic) post(endpoint string, payload []byte, items int) {
+// post gzips and sends payload, retrying transient failures. The caller
+// counts the outcome.
+func (n *NewRelic) post(endpoint string, payload []byte) error {
 	body, err := gzipBody(payload)
 	if err != nil {
-		n.fail(err, items)
-		return
+		return err
 	}
 	for attempt := 0; ; attempt++ {
 		var retry bool
 		var after time.Duration
 		retry, after, err = n.try(endpoint, body)
 		if err == nil {
-			n.sent.Add(int64(items))
-			return
+			return nil
 		}
 		if !retry || attempt >= len(n.cfg.Backoff) {
-			break
+			return err
 		}
 		// The larger of the backoff step and Retry-After, always capped.
 		wait := min(max(n.cfg.Backoff[attempt], after), n.cfg.MaxRetryAfter)
 		select {
 		case <-time.After(wait):
 		case <-n.ctx.Done():
-			n.fail(err, items)
-			return
+			return err
 		}
 		// Counted only once the next POST is certain to run.
 		n.retries.Add(1)
 	}
-	n.fail(err, items)
+}
+
+type statusError struct {
+	path   string
+	status int
+}
+
+func (e *statusError) Error() string {
+	return fmt.Sprintf("newrelic: %s returned status %d", e.path, e.status)
 }
 
 // try makes one POST. retry reports whether the failure is worth another go;
@@ -700,8 +852,9 @@ func (n *NewRelic) try(endpoint string, body []byte) (retry bool, after time.Dur
 	if resp.StatusCode == http.StatusTooManyRequests {
 		after = retryAfter(resp.Header.Get("Retry-After"), time.Now())
 	}
-	return resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500, after,
-		fmt.Errorf("newrelic: %s returned status %d", req.URL.Path, resp.StatusCode)
+	retry = resp.StatusCode == http.StatusTooManyRequests ||
+		resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode >= 500
+	return retry, after, &statusError{path: req.URL.Path, status: resp.StatusCode}
 }
 
 // retryAfter parses delay-seconds or an HTTP-date. Invalid or past values give
@@ -726,11 +879,16 @@ func retryAfter(v string, now time.Time) time.Duration {
 	return 0
 }
 
-// fail records a failed delivery. The license key is scrubbed from the message.
+// fail records a failed delivery of items.
 func (n *NewRelic) fail(err error, items int) {
+	n.lost.Add(int64(items))
+	n.recordErr(err)
+}
+
+// recordErr counts a failed POST. The license key is scrubbed from the message.
+func (n *NewRelic) recordErr(err error) {
 	err = errors.New(n.keyRe.ReplaceAllString(err.Error(), "[redacted]"))
 	n.errs.Add(1)
-	n.lost.Add(int64(items))
 	n.errMu.Lock()
 	n.lastErr = err.Error()
 	n.errMu.Unlock()

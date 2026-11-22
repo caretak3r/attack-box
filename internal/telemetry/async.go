@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"slices"
 	"sync"
 	"sync/atomic"
 )
@@ -59,6 +60,7 @@ func (a *Async) run() {
 // owns shallow copies.
 func (a *Async) Emit(e Event) {
 	e.Attrs = maps.Clone(e.Attrs)
+	e.TaskLabels = slices.Clone(e.TaskLabels)
 	a.put(asyncItem{event: e})
 }
 

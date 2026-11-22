@@ -89,6 +89,20 @@ func TestAsyncStalledLocalDoesNotBlockFanOut(t *testing.T) {
 	}
 }
 
+func TestAsyncOwnsTaskLabels(t *testing.T) {
+	var buf bytes.Buffer
+	local := NewAsync(NewJSONLog(&buf), 0)
+	labels := []string{"first"}
+	local.Emit(Event{Action: "a", TaskLabels: labels})
+	labels[0] = "mutated"
+	if err := local.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if out := buf.String(); !strings.Contains(out, `"first"`) || strings.Contains(out, "mutated") {
+		t.Errorf("caller slice mutation reached the log:\n%s", out)
+	}
+}
+
 func TestAsyncDeliversInOrderAndOwnsMaps(t *testing.T) {
 	var buf bytes.Buffer
 	local := NewAsync(NewJSONLog(&buf), 0)
