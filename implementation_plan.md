@@ -262,9 +262,15 @@ Verification: `gofmt -l .` (no output), `go vet ./...`, `go test -race -count=1 
 
 Verification: `go test -race ./cmd/...` (88.9%) runs all three listeners on loopback against a fake New Relic intake (checks `Api-Key`, gzip payloads, `instance`, no raw bearer token, flush on shutdown), a 403 intake (run returns a lost-events error and logs `newrelic_error`), port conflicts, a partial bind with a hanging intake (the joined `new relic close` error returns within the timeout), spool mode against a fake shipper socket (`TestSpoolMode`: edge, probe and metric records and `start`/`stop`/`stopped` on the socket, `stopped` last, no raw bearer token, no New Relic client, local `stopped` counts every written record), a missing shipper socket at startup and a partial bind that closes the spool, shutdown with a stalled connection, config caps and secret-file modes. `scripts/smoke.sh` builds the release binary, starts all three personas on loopback with New Relic disabled and checks JSON, SSE, Responses events, NDJSON, unknown-model errors, vLLM `/metrics` and `/openapi.json`, Ollama no-op delete, SIGTERM exit 0 and token redaction in the log. It contacts only `127.0.0.1`.
 
-### Not yet implemented
+### Repository deliverables implemented
 
-Dockerfile/Compose, deployment script, operator documentation with Mermaid diagrams, benchmarks, and the items in `SECURITY_FIXES.md` that are not marked DONE.
+- `cmd/attackbox-shipper` and `internal/shipper`: authenticated roles, bounded ingestion, durable queue, synchronous per-record New Relic receipts, contiguous-prefix checkpoints, replay-gap handling, six streams, and runtime/egress stdin adapters.
+- `Dockerfile`, `compose.yaml`, and `compose.gvisor.yaml`: pinned Chainguard images, static bait/shipper builds, hardened non-root read-only runtime, bounded resources/logs, TLS proxy, and required gVisor/host-UDS deployment overlay.
+- `scripts/deploy-ubuntu.sh` and `deploy/`: non-destructive preflight, explicit apply, rollback-safe bootstrap/final firewalls, service installation/startup, Falco/egress adapters, and verification before optional SSH disablement.
+- `docs/operator.md`, `docs/architecture.md`, `docs/newrelic-runbook.md`, and `newrelic/`: operator guidance, Mermaid diagrams, dashboards, alerts, and NRQL runbook.
+- `scripts/run-benchmarks.sh`, `scripts/analyze-perf.sh`, and `reports/perf/`: golden-test-gated benchmarks and measured CPU/memory profiles. `scripts/verify.sh` and `scripts/client_matrix.py` provide the final gate and official-client matrix.
+
+`REMAINING_WORK.md` records actual verification evidence. Live Ubuntu, gVisor host compatibility, New Relic account-side NRQL/alert behavior, provider firewalls, and production secrets remain deployment-only checks; no live deployment is claimed here.
 
 ## Decoy VPS layers
 
