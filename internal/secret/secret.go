@@ -3,10 +3,27 @@
 // catches JSON fields (any value type, escaped names, one level of JSON
 // nested in a string), form/query/env/YAML pairs (bare or quoted),
 // Authorization lines, Bearer/Basic values, sk- keys, cookies, URL userinfo
-// passwords and PEM private-key blocks. Exact decoy canary shapes stay
-// visible so their reuse is detectable. Free-text secrets with no name, scheme
-// or known shape are not detected; the dedicated New Relic account is the
-// remaining blast-radius control.
+// passwords (also network-path //user:pass@), PEM private-key blocks,
+// folded header lines, Digest auth-params and quoted cookies. Exact decoy
+// canary shapes stay visible so their reuse is detectable.
+//
+// Known limits, by design:
+//   - Free-text secrets with no name, scheme or known shape are not detected.
+//   - Names are matched as ASCII after JSON \u and percent decoding; raw
+//     non-ASCII names and confusables (Cyrillic or fullwidth letters) are not
+//     recognized.
+//   - A credential-named object is exempt only if it is a complete JSON Schema
+//     made of structural keywords; its description/title strings are prose
+//     and are kept.
+//   - Unquoted form/YAML true, false, null, none, nil and ~ are kept, as JSON
+//     literals are.
+//   - "Bearer" and "BEARER" always mark a credential; lowercase "bearer"
+//     needs a token-like value so prose survives.
+//   - Fingerprints cover the JSON-unescaped value without its auth scheme;
+//     there is no percent-decoding, so encoded and raw forms of one secret
+//     get different fingerprints.
+//
+// The dedicated New Relic account is the remaining blast-radius control.
 package secret
 
 import (
@@ -46,6 +63,7 @@ var credWords = map[string]bool{
 	"secret": true, "token": true, "apikey": true, "auth": true, "authorization": true,
 	"authentication": true, "cookie": true, "credential": true, "credentials": true,
 	"sessionid": true, "bearer": true, "jwt": true, "signature": true, "sig": true,
+	"cookies": true,
 }
 
 // credPairs are two-segment suffixes such as api_key or session_id.
@@ -143,28 +161,47 @@ func IsCanary(v string) bool {
 
 func keep(v string) bool { return v == "" || IsCanary(v) || IsMarker(v) }
 
-// nameClass is a field name: plain characters, percent escapes, or JSON \u
-// escapes at up to three nesting levels.
-const nameClass = `(?:[A-Za-z0-9_.+-]|%[0-9A-Fa-f]{2}|\\{1,3}u[0-9A-Fa-f]{4}){1,64}`
+// nameClass is a field name: plain characters, percent escapes, JSON \u
+// escapes at up to three nesting levels, or bracket segments as in
+// user[password].
+const nameElem = `[A-Za-z0-9_.+\[\]-]|%[0-9A-Fa-f]{2}|\\{1,3}u[0-9A-Fa-f]{4}`
+const nameClass = `(?:` + nameElem + `){1,64}`
+
+// jsonNameClass also allows spaces, as in {"api key": ...}; JSON quotes
+// delimit the name, so a space cannot merge two words of prose.
+const jsonNameClass = `(?:` + nameElem + `| ){1,64}`
+
+// kvValue is a quoted (plain or JSON-escaped) or bare form/env/YAML value.
+const kvValue = `("(?:[^"\\\n]|\\.)*"|\\"(?:[^"\\]|\\[^"])*\\"|'[^'\n]*'|` + bareValue + `)`
+
+// fold is header whitespace, including obsolete line folding (a line break
+// followed by a space or tab), raw or JSON-escaped.
+const fold = `(?:[ \t]|\r?\n[ \t]|(?:\\r)?\\n[ \t])`
+
+// authParams is an auth-param list such as Digest username="u", response="r".
+const authParam = `[A-Za-z0-9_-]+=(?:"[^"\r\n]*"|\\"(?:[^"\\]|\\[^"])*?\\"|[^\s,"'\\]+)`
+const authParams = authParam + `(?:[ \t]*,` + fold + `*` + authParam + `)*`
 
 // bareValue stops at whitespace, quotes and JSON string escapes such as \n,
 // so a value inside a JSON string never swallows the closing quote.
 const bareValue = `(?:[^\s"'\\&,;<>?#]|\\[^"nrt])+`
 
 var (
-	jsonKeyRe = regexp.MustCompile(`"(` + nameClass + `)"\s*:\s*`)
+	jsonKeyRe = regexp.MustCompile(`"(` + jsonNameClass + `)"\s*:\s*`)
 	schemaRe  = regexp.MustCompile(`"type"\s*:\s*"(?:string|number|integer|boolean|object|array|null)"`)
 	// \"name\": \"value\" or a number, one JSON level down inside a string.
 	escapedFieldRe = regexp.MustCompile(`\\"(` + nameClass + `)\\"(\s*:\s*)(?:\\"((?:\\\\(?:\\.|[^\\"])|\\[^\\"]|[^\\"])*)\\"|(-?[0-9][0-9.eE+-]*))`)
 	// name=value or name: value in forms, queries, env files and YAML.
-	kvRe       = regexp.MustCompile(`(^|\\[nrt]|[^A-Za-z0-9_.+%\\-])(` + nameClass + `)([ \t]*[=:][ \t]*)("(?:[^"\\\n]|\\.)*"|\\"(?:[^"\\]|\\[^"])*\\"|'[^'\n]*'|` + bareValue + `)`)
+	kvRe = regexp.MustCompile(`(^|\\[nrt]|[^A-Za-z0-9_.+%\\-])(` + nameClass + `)([ \t]*[=:][ \t]*)` + kvValue)
+	// Two-word names such as "api key: v" or "session id = v".
+	spacedKVRe = regexp.MustCompile(`(?i)(^|\\[nrt]|[^A-Za-z0-9_.+%\\-])((?:api|access|private|secret|session|license|ingest|client|auth|id)[ \t]+(?:key|id|secret|token))([ \t]*[=:][ \t]*)` + kvValue)
 	pemRe      = regexp.MustCompile(`-----BEGIN ([A-Z0-9 ]{0,40}PRIVATE KEY)-----((?:[^"\\]|\\[^"])*?)(-----END [A-Z0-9 ]{0,40}PRIVATE KEY-----|\\"|"|$)`)
 	bearerRe   = regexp.MustCompile(`(?i)\b(bearer)[ \t]+([A-Za-z0-9._~+/=-]+)`)
 	basicRe    = regexp.MustCompile(`(?i)\b(basic)[ \t]+([A-Za-z0-9+/]{4,}={0,2})`)
 	skRe       = regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{8,}`)
-	authLineRe = regexp.MustCompile(`(?i)\b((?:proxy-)?authori[sz]ation)[ \t]*:[ \t]*(?:(bearer|basic|digest|token|negotiate|ntlm)[ \t]+)?(` + `(?:[^\s"'\\]|\\[^"nrt])+)`)
-	cookieRe   = regexp.MustCompile(`(?i)\b((?:set-)?cookie)[ \t]*:[ \t]*((?:[^\r\n"\\]|\\[^"nrt])+)`)
-	userinfoRe = regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]{0,31}://)([^/\s:@"'<>\\]*):((?:[^/\s@"'<>\\]|\\[^"nrt])+)@`)
+	authLineRe = regexp.MustCompile(`(?i)\b((?:proxy-)?authori[sz]ation)[ \t]*:` + fold + `*(?:(bearer|basic|digest|token|negotiate|ntlm|hoba|mutual|vapid|scram-sha-1|scram-sha-256|aws4-hmac-sha256)` + fold + `+)?(` + authParams + `|(?:[^\s"'\\]|\\[^"nrt])+)`)
+	cookieRe   = regexp.MustCompile(`(?i)\b((?:set-)?cookie)[ \t]*:[ \t]*((?:="[^"\r\n\\;]*"|=\\"[^"\\\r\n;]*\\"|[^\r\n"\\]|\\[^"nrt]|\r?\n[ \t]|\\r\\n[ \t]|\\n[ \t])+)`)
+	userinfoRe = regexp.MustCompile(`(?i)((?:\b[a-z][a-z0-9+.-]*:)?//)([^/\s:@"'<>\\]*):((?:[^/\s@"'<>\\]|\\[^"nrt])+)@`)
 )
 
 // isBasicCredential reports whether v decodes to "user:password" (the user
@@ -247,7 +284,7 @@ func Scrub(s string, fp Fingerprinter) string {
 		}
 		return m[:len(m)-len(sub[3])] + mark(sub[3])
 	})
-	s = replaceSub(kvRe, s, func(sub []string) string {
+	kv := func(sub []string) string {
 		m := sub[0]
 		v, open, close := sub[4], "", ""
 		switch {
@@ -257,18 +294,26 @@ func Scrub(s string, fp Fingerprinter) string {
 			open, close = v[:1], v[:1]
 		}
 		inner := v[len(open) : len(v)-len(close)]
-		if !IsCredentialName(sub[2]) || ownPass[strings.ToLower(sub[2])] || keep(inner) || authSchemes[strings.ToLower(inner)] {
+		if !IsCredentialName(sub[2]) || ownPass[strings.ToLower(sub[2])] || keep(inner) || authSchemes[strings.ToLower(inner)] ||
+			open == "" && literals[inner] {
 			return m
 		}
 		return sub[1] + sub[2] + sub[3] + open + mark(inner) + close
-	})
+	}
+	s = replaceSub(kvRe, s, kv)
+	s = replaceSub(spacedKVRe, s, kv)
 	s = replaceSub(cookieRe, s, func(sub []string) string {
 		m := sub[0]
-		return m[:len(m)-len(sub[2])] + scrubCookie(sub[2], mark)
+		return m[:len(m)-len(sub[2])] + scrubCookie(sub[2], strings.EqualFold(sub[1], "set-cookie"), mark)
 	})
 	s = replaceSub(bearerRe, s, func(sub []string) string {
 		m := sub[0]
-		if proseWords[strings.ToLower(sub[2])] || keep(sub[2]) || !tokenLike(sub[2]) {
+		if keep(sub[2]) {
+			return m
+		}
+		// "Bearer"/"BEARER" is the HTTP scheme spelling; lowercase "bearer"
+		// is usually prose ("bearer bonds") and needs a token-like value.
+		if sub[1] != "Bearer" && sub[1] != "BEARER" && (proseWords[strings.ToLower(sub[2])] || !tokenLike(sub[2])) {
 			return m
 		}
 		return sub[1] + " " + mark(sub[2])
@@ -295,9 +340,23 @@ func Scrub(s string, fp Fingerprinter) string {
 	})
 }
 
-// scrubCookie redacts every cookie value but keeps names, separators, exact
-// canaries and existing markers.
-func scrubCookie(v string, mark func(string) string) string {
+// literals are unquoted form/YAML values that carry no secret, matching the
+// JSON true/false/null preservation.
+var literals = map[string]bool{
+	"true": true, "false": true, "null": true, "True": true, "False": true, "TRUE": true, "FALSE": true,
+	"Null": true, "NULL": true, "none": true, "None": true, "nil": true, "~": true,
+}
+
+// cookieAttrs are Set-Cookie attributes; they are not secret.
+var cookieAttrs = map[string]bool{
+	"path": true, "domain": true, "expires": true, "max-age": true, "samesite": true,
+	"secure": true, "httponly": true, "partitioned": true, "priority": true,
+}
+
+// scrubCookie redacts every cookie value but keeps names, separators,
+// DQUOTE wrappers, exact canaries and existing markers. For Set-Cookie only
+// the first pair is a cookie; the rest are attributes and stay visible.
+func scrubCookie(v string, set bool, mark func(string) string) string {
 	parts := strings.Split(v, ";")
 	for i, p := range parts {
 		body := strings.TrimSpace(p)
@@ -306,11 +365,25 @@ func scrubCookie(v string, mark func(string) string) string {
 		}
 		lead := strings.Index(p, body)
 		eq := strings.IndexByte(body, '=')
+		name := body
+		if eq >= 0 {
+			name = body[:eq]
+		}
 		switch {
+		case set && i > 0 && cookieAttrs[strings.ToLower(strings.TrimSpace(name))]:
 		case eq < 0 && !keep(body):
 			body = mark(body)
-		case eq >= 0 && !keep(body[eq+1:]):
-			body = body[:eq+1] + mark(body[eq+1:])
+		case eq >= 0:
+			val, q := body[eq+1:], ""
+			switch {
+			case len(val) >= 4 && strings.HasPrefix(val, `\"`) && strings.HasSuffix(val, `\"`):
+				q = `\"`
+			case len(val) >= 2 && val[0] == '"' && val[len(val)-1] == '"':
+				q = `"`
+			}
+			if inner := val[len(q) : len(val)-len(q)]; !keep(inner) {
+				body = body[:eq+1] + q + mark(inner) + q
+			}
 		}
 		parts[i] = p[:lead] + body + p[lead+len(strings.TrimSpace(p)):]
 	}
@@ -387,13 +460,95 @@ func scrubJSON(s string, mark func(string) string) string {
 			}
 		case cred:
 			end := skipBalanced(s, v)
-			if c == '[' || !schemaRe.MatchString(s[v:end]) {
-				edits = leafEdits(s, v, end, mark, edits)
+			if c == '{' && isSchemaSpan(s[v:end]) {
+				// A validated schema holds only names, types and prose, so
+				// nothing inside it needs scanning.
 				pos = end
+				break
 			}
+			edits = leafEdits(s, v, end, mark, edits)
+			pos = end
 		}
 	}
 	return applyEdits(s, edits)
+}
+
+// isSchemaSpan reports whether span is a complete JSON Schema object built
+// only from structural keywords. Value-carrying keywords (default, const,
+// enum, examples) or any other key, such as "value", disqualify it, so
+// {"password":{"type":"string","value":"x"}} is redacted.
+func isSchemaSpan(span string) bool {
+	if !schemaRe.MatchString(span) {
+		return false
+	}
+	var v any
+	if json.Unmarshal([]byte(span), &v) != nil {
+		return false
+	}
+	return isSchema(v)
+}
+
+func isSchema(v any) bool {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return false
+	}
+	for k, x := range m {
+		var good bool
+		switch k {
+		case "type":
+			good = isString(x) || allOf(x, isString)
+		case "description", "title", "format", "pattern", "$ref", "$id", "$schema", "$comment",
+			"contentMediaType", "contentEncoding":
+			good = isString(x)
+		case "minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems", "multipleOf",
+			"minProperties", "maxProperties":
+			_, good = x.(float64)
+		case "exclusiveMinimum", "exclusiveMaximum":
+			_, num := x.(float64)
+			_, b := x.(bool)
+			good = num || b
+		case "nullable", "readOnly", "writeOnly", "deprecated", "uniqueItems":
+			_, good = x.(bool)
+		case "required":
+			good = allOf(x, isString)
+		case "properties", "patternProperties", "$defs", "definitions":
+			if mm, ok := x.(map[string]any); ok {
+				good = true
+				for _, s := range mm {
+					good = good && isSchema(s)
+				}
+			}
+		case "items":
+			good = isSchema(x) || allOf(x, isSchema)
+		case "additionalProperties", "additionalItems":
+			_, b := x.(bool)
+			good = b || isSchema(x)
+		case "anyOf", "oneOf", "allOf":
+			good = allOf(x, isSchema)
+		case "not":
+			good = isSchema(x)
+		}
+		if !good {
+			return false
+		}
+	}
+	return true
+}
+
+func isString(v any) bool { _, ok := v.(string); return ok }
+
+func allOf(v any, f func(any) bool) bool {
+	a, ok := v.([]any)
+	if !ok {
+		return false
+	}
+	for _, x := range a {
+		if !f(x) {
+			return false
+		}
+	}
+	return true
 }
 
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
@@ -460,6 +615,16 @@ func stringEdit(s string, i, end int, closed bool, mark func(string) string) (ed
 	v := unquote(raw)
 	if keep(v) || keep(raw) {
 		return edit{}, false
+	}
+	// "Bearer abc" keeps its scheme and fingerprints only the credential,
+	// as the header-line pass does.
+	if sp := strings.IndexByte(v, ' '); sp > 0 && authSchemes[strings.ToLower(v[:sp])] {
+		if rest := strings.TrimLeft(v[sp:], " "); rest != "" {
+			if keep(rest) {
+				return edit{}, false
+			}
+			return edit{i, end, `"` + v[:len(v)-len(rest)] + mark(rest) + tail}, true
+		}
 	}
 	return edit{i, end, `"` + mark(v) + tail}, true
 }

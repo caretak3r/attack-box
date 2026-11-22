@@ -26,6 +26,16 @@ func TestScrubAdversarialLinear(t *testing.T) {
 		"markers":     func(n int) string { return `"password":` + strings.Repeat("[redacted]", n/10) },
 		"escaped":     func(n int) string { return strings.Repeat(`\"token\":\"`, n/11) },
 		"unicodename": func(n int) string { return `"` + strings.Repeat(`a`, n/6) },
+		"schemanest": func(n int) string {
+			return strings.Repeat(`{"token":{"type":"object","properties":{"p":`, n/44) + strings.Repeat("}}}", n/44)
+		},
+		"schemaflat":  func(n int) string { return strings.Repeat(`"token":{"type":"string"},`, n/26) },
+		"fold":        func(n int) string { return "Authorization:" + strings.Repeat("\r\n ", n/5) },
+		"digest":      func(n int) string { return "Authorization: Digest " + strings.Repeat(`a="b", `, n/7) },
+		"cookiequote": func(n int) string { return "Cookie: " + strings.Repeat(`a="b";`, n/6) },
+		"spacedkv":    func(n int) string { return strings.Repeat("api key api key: ", n/16) },
+		"netpath":     func(n int) string { return strings.Repeat("//a:", n/4) },
+		"brackets kv": func(n int) string { return strings.Repeat("a[", n/2) },
 	}
 	// The race detector slows the regex engine ~20x; smaller inputs keep
 	// the default gate fast while still exposing a quadratic path.
