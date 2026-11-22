@@ -43,6 +43,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if c.maxBody != 1<<20 || c.maxLogBody != 128<<10 {
 		t.Fatalf("body defaults = %d %d", c.maxBody, c.maxLogBody)
 	}
+	if !c.timing {
+		t.Fatal("response pacing must be on by default")
+	}
 	if len(c.secret) != minSecret {
 		t.Fatalf("random secret len = %d", len(c.secret))
 	}
@@ -85,12 +88,15 @@ func TestLoadConfigFull(t *testing.T) {
 	if len(c.trustedProxies) != 2 || c.trustedProxies[1].String() != "10.0.0.5/32" {
 		t.Fatalf("proxies = %v", c.trustedProxies)
 	}
-	c2, err := loadConfig(envOf(map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SECRET_FILE": secret}))
+	c2, err := loadConfig(envOf(map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SECRET_FILE": secret, "ATTACKBOX_TIMING": "false"}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(c.derive("session"), c2.derive("session")) {
 		t.Fatal("same secret file must give the same session key across restarts")
+	}
+	if c2.timing {
+		t.Fatal("ATTACKBOX_TIMING=false must turn response pacing off")
 	}
 }
 
@@ -114,6 +120,7 @@ func TestLoadConfigErrors(t *testing.T) {
 		"nr key shape":      {map[string]string{"ATTACKBOX_NR_LICENSE_KEY": "abc123"}, "must be 40 characters"},
 		"nr conflict":       {map[string]string{"ATTACKBOX_NR_DISABLED": "true", "ATTACKBOX_NR_LICENSE_KEY": testNRKey}, "conflicts"},
 		"bad bool":          {map[string]string{"ATTACKBOX_NR_DISABLED": "maybe"}, "want true or false"},
+		"bad timing":        {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_TIMING": "fast"}, "ATTACKBOX_TIMING"},
 		"bad duration":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_HOLD_SILENT": "soon"}, "ATTACKBOX_HOLD_SILENT"},
 		"negative duration": {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_IDLE_INTERVAL": "-1s"}, "ATTACKBOX_IDLE_INTERVAL"},
 		"hold over stream":  {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_HOLD_SILENT": "10s", "ATTACKBOX_MAX_STREAM": "5s"}, "must not exceed"},

@@ -62,6 +62,7 @@ type config struct {
 	holdSilent   time.Duration
 	idleInterval time.Duration
 	maxStream    time.Duration
+	timing       bool // realistic response pacing; ATTACKBOX_TIMING, default true
 
 	readHeaderTimeout time.Duration
 	readTimeout       time.Duration
@@ -103,21 +104,21 @@ func loadConfig(getenv func(string) string) (config, error) {
 		}
 		return n
 	}
-	flag := func(name string) bool {
-		switch strings.ToLower(env(name, "false")) {
+	flag := func(name string, def bool) bool {
+		switch strings.ToLower(env(name, strconv.FormatBool(def))) {
 		case "1", "true", "yes":
 			return true
 		case "0", "false", "no":
 			return false
 		}
 		errs = append(errs, fmt.Errorf("ATTACKBOX_%s: want true or false", name))
-		return false
+		return def
 	}
 
 	c := config{
 		instance:          env("INSTANCE", "attackbox"),
 		secretFile:        env("SECRET_FILE", ""),
-		nrDisabled:        flag("NR_DISABLED"),
+		nrDisabled:        flag("NR_DISABLED", false),
 		nrKey:             strings.TrimSpace(getenv("ATTACKBOX_NR_LICENSE_KEY")),
 		nrLogURL:          env("NR_LOG_URL", ""),
 		nrMetricURL:       env("NR_METRIC_URL", ""),
@@ -129,6 +130,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 		holdSilent:        dur("HOLD_SILENT", 150*time.Second),
 		idleInterval:      dur("IDLE_INTERVAL", 45*time.Second),
 		maxStream:         dur("MAX_STREAM", 180*time.Second),
+		timing:            flag("TIMING", true),
 		readHeaderTimeout: dur("READ_HEADER_TIMEOUT", 10*time.Second),
 		readTimeout:       dur("READ_TIMEOUT", 30*time.Second),
 		idleTimeout:       dur("IDLE_TIMEOUT", 60*time.Second),

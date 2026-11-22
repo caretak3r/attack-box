@@ -19,12 +19,18 @@ type format interface {
 	full(text string) any // non-streaming body
 }
 
-// stream writes text as stream frames. The probe text goes out first, then
+// stream writes text as stream frames, paced by Config.Timing. The probe
+// text goes out first, then
 // the hold (if any) runs, then the stream ends normally. Every frame write
 // checks the request context first, so a client that leaves or a server
 // shutdown stops emission at the next frame; the cut is logged as
 // stream_result.
 func (c *call) stream(f format, text, hold string) {
+	// Headers go out with the first token, as from a server still decoding.
+	p := c.newPacer()
+	if !c.pause(p.first()) {
+		return
+	}
 	w := c.w
 	rc := c.rc // the write deadline was set in serve
 	h := w.Header()
@@ -56,8 +62,12 @@ func (c *call) stream(f format, text, hold string) {
 	if !emit(f.start()...) {
 		return
 	}
-	for _, chunk := range wordChunks(text, wordsPerChunk) {
+	chunks := wordChunks(text, wordsPerChunk)
+	for i, chunk := range chunks {
 		if !emit(f.delta(chunk)) {
+			return
+		}
+		if i+1 < len(chunks) && !c.pause(p.after(chunk)) {
 			return
 		}
 	}

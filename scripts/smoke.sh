@@ -63,6 +63,10 @@ expect "openai chat json" '"object":"chat.completion"' \
 	"$(c -H "$json" -H 'Authorization: Bearer sk-smoke-not-a-real-key' -d '{"model":"qwen3:8b","messages":[{"role":"user","content":"hello"}]}' "$o/v1/chat/completions")"
 expect "openai chat sse" 'data: [DONE]' \
 	"$(c -N -H "$json" -d '{"model":"qwen3:8b","stream":true,"messages":[{"role":"user","content":"hello"}]}' "$o/v1/chat/completions")"
+# Default pacing holds the first byte for the jittered first-token delay.
+ttfb=$(c -o /dev/null -w '%{time_starttransfer}' -H "$json" -d '{"model":"qwen3:8b","stream":true,"messages":[{"role":"user","content":"hello"}]}' "$o/v1/chat/completions")
+awk -v t="$ttfb" 'BEGIN { exit !(t >= 0.2 && t < 5) }' || fail "openai first byte after ${ttfb}s; want paced 0.2-5s"
+echo "smoke: ok   paced first token (${ttfb}s)"
 expect "openai responses sse" 'event: response.completed' \
 	"$(c -N -H "$json" -d '{"model":"qwen3:8b","stream":true,"input":"hello"}' "$o/v1/responses")"
 expect "openai unknown model" '"code":"model_not_found"' \

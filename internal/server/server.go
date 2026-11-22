@@ -55,8 +55,12 @@ type Config struct {
 	// TrustedProxies lists peers whose X-Forwarded-For is believed.
 	TrustedProxies []netip.Prefix
 
+	// Timing paces inference replies; the zero value sends at once.
+	Timing Timing
+
 	Now   func() time.Time                     // default time.Now
 	After func(time.Duration) <-chan time.Time // default time.After
+	Rand  func() float64                       // timing jitter in [0,1); default math/rand/v2
 }
 
 // Server is one persona's HTTP handler.
@@ -139,6 +143,13 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.After == nil {
 		cfg.After = time.After
+	}
+	if cfg.Rand == nil {
+		cfg.Rand = defaultRand
+	}
+	var err error
+	if cfg.Timing, err = cfg.Timing.normalize(); err != nil {
+		return nil, err
 	}
 	s := &Server{
 		cfg:     cfg,
@@ -236,10 +247,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// extendWriteDeadline gives the response the longest hold plus slack. Without
-// it a client that stops reading pins the connection and its slot.
+// extendWriteDeadline gives the response the longest hold, the pacing budget
+// and slack. Without it a client that stops reading pins the connection and
+// its slot.
 func (c *call) extendWriteDeadline() {
-	_ = c.rc.SetWriteDeadline(time.Now().Add(c.s.cfg.MaxStreamDuration + 15*time.Second))
+	_ = c.rc.SetWriteDeadline(time.Now().Add(c.s.cfg.MaxStreamDuration + c.s.cfg.Timing.MaxTotal + 15*time.Second))
 }
 
 // recoverPanic turns a handler panic into the persona's 500. The request is

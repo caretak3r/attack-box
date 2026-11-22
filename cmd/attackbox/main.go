@@ -156,6 +156,10 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 	resp := responder.New(responder.Config{Fingerprint: redactor.Fingerprint},
 		responder.NewStore(responder.StoreConfig{MaxSessions: cfg.maxSessions}))
 	sessionKey, embedSeed := cfg.derive("session"), cfg.derive("embed")
+	var timing server.Timing
+	if cfg.timing {
+		timing = server.DefaultTiming()
+	}
 	for _, l := range cfg.listeners {
 		s, err := server.New(server.Config{
 			Persona:           l.persona,
@@ -173,6 +177,7 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 			HoldSilent:        cfg.holdSilent,
 			IdleInterval:      cfg.idleInterval,
 			TrustedProxies:    cfg.trustedProxies,
+			Timing:            timing,
 		})
 		if err == nil {
 			var ln net.Listener

@@ -698,6 +698,9 @@ func (s *Server) serveInference(c *call, k kind) {
 	if !c.holdFor(d.Probe.Hold, nil) {
 		return
 	}
+	if !c.pause(c.newPacer().total(wordChunks(text, wordsPerChunk))) {
+		return
+	}
 	c.json(f.full(text))
 }
 
