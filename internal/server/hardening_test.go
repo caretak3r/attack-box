@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -411,5 +412,67 @@ func TestPyRepr(t *testing.T) {
 		if got := jsonTypeName(json.RawMessage(raw)); got != want {
 			t.Errorf("jsonTypeName(%s) = %q, want %q", raw, got, want)
 		}
+	}
+}
+
+// cutWriter runs cut once, right after the Nth body write succeeds.
+type cutWriter struct {
+	*httptest.ResponseRecorder
+	after  int
+	writes int
+	cut    func()
+}
+
+func (w *cutWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseRecorder.Write(p)
+	w.writes++
+	if w.writes == w.after {
+		w.cut()
+	}
+	return n, err
+}
+
+// TestStreamStopsOnCancelDuringFrames cancels the request context while delta
+// frames are still being written. The writes keep succeeding (as they do while
+// the kernel buffer has room), so only the context check can stop the loop.
+func TestStreamStopsOnCancelDuringFrames(t *testing.T) {
+	body := strings.Replace(chatBody, `"model"`, `"stream":true,"model"`, 1)
+	for _, tc := range []struct {
+		name   string
+		cause  error
+		result string
+	}{
+		{"client", nil, "client_closed"},
+		{"shutdown", ErrShutdown, holdServerShutdown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			full := newRig(t, PersonaOpenAI)
+			full.warm()
+			whole := full.do("POST", "/v1/chat/completions", body).Body.String()
+			frames := strings.Count(whole, "data: ")
+			if frames < 4 || !strings.Contains(whole, "[DONE]") {
+				t.Fatalf("baseline stream too short to cut: %d frames", frames)
+			}
+
+			r := newRig(t, PersonaOpenAI)
+			r.warm()
+			ctx, cancel := context.WithCancelCause(context.Background())
+			w := &cutWriter{ResponseRecorder: httptest.NewRecorder(), after: 2, cut: func() { cancel(tc.cause) }}
+			r.h.ServeHTTP(w, request("POST", "/v1/chat/completions", body).WithContext(ctx))
+			got := w.Body.String()
+			if strings.Contains(got, "[DONE]") || strings.Count(got, "data: ") != 2 {
+				t.Fatalf("emission went on after cancel: %d of %d frames\n%s", strings.Count(got, "data: "), frames, got)
+			}
+			edge := r.sink.lastEdge(t)
+			if edge.Attrs["stream_result"] != tc.result {
+				t.Fatalf("stream_result = %v", edge.Attrs["stream_result"])
+			}
+			if tc.cause != nil && edge.Result != holdServerShutdown {
+				t.Fatalf("result = %q", edge.Result)
+			}
+			if _, ok := full.sink.lastEdge(t).Attrs["stream_result"]; ok {
+				t.Fatal("complete stream logged stream_result")
+			}
+		})
 	}
 }

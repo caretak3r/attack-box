@@ -189,6 +189,7 @@ type call struct {
 	obs        []responder.Observation
 	holdResult string
 	holdMS     int64
+	streamCut  string // why frame emission stopped early, if it did
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
@@ -355,7 +356,9 @@ func (s *Server) trusted(a netip.Addr) bool {
 }
 
 // sessionKey is HMAC-SHA256(SessionKey, src NUL user-agent NUL credential
-// fingerprint). The source address alone never identifies a session.
+// fingerprint). The source address alone never identifies a session. The
+// credential is Authorization; X-Api-Key counts only when Authorization is
+// absent or empty, so a client that sends both is keyed by Authorization alone.
 func (s *Server) sessionKey(src, ua string, h http.Header) string {
 	cred := h.Get("Authorization")
 	if cred == "" {

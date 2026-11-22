@@ -61,6 +61,9 @@ func (s *Server) finish(c *call) {
 		attrs["hold_result"] = c.holdResult
 		attrs["hold_ms"] = c.holdMS
 	}
+	if c.streamCut != "" {
+		attrs["stream_result"] = c.streamCut
+	}
 	obs := c.obs
 	var labels []string
 	task, probeID, sessionID := "", "", c.sessionID
@@ -84,7 +87,7 @@ func (s *Server) finish(c *call) {
 	resource := truncRunes(red.Text(c.r.URL.Path), maxResourceLen)
 	ua := truncRunes(red.Text(c.ua), maxUALen)
 	result := resultFor(status)
-	if c.holdResult == holdServerShutdown {
+	if c.holdResult == holdServerShutdown || c.streamCut == holdServerShutdown {
 		result = holdServerShutdown
 	}
 

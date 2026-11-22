@@ -242,6 +242,18 @@ func TestSessionKeyVariance(t *testing.T) {
 		}
 		seen[k] = name
 	}
+	// Authorization wins over X-Api-Key when both are present: the API key is
+	// ignored, whatever its value, and an empty Authorization falls back to it.
+	both := key(r.srv, "192.0.2.1", "ua/1", "Authorization", "Bearer abc", "X-Api-Key", "other")
+	if both != base {
+		t.Fatal("X-Api-Key changed the key while Authorization was present")
+	}
+	if both == key(r.srv, "192.0.2.1", "ua/1", "X-Api-Key", "other") {
+		t.Fatal("X-Api-Key took priority over Authorization")
+	}
+	if key(r.srv, "192.0.2.1", "ua/1", "Authorization", "", "X-Api-Key", "other") != key(r.srv, "192.0.2.1", "ua/1", "X-Api-Key", "other") {
+		t.Fatal("empty Authorization did not fall back to X-Api-Key")
+	}
 	// The fields are NUL-separated, so shifting a byte between them changes the key.
 	if key(r.srv, "a", "bc") == key(r.srv, "ab", "c") {
 		t.Fatal("fields are not delimited")

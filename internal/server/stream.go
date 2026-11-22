@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"net/http"
 )
@@ -19,7 +20,10 @@ type format interface {
 }
 
 // stream writes text as stream frames. The probe text goes out first, then
-// the hold (if any) runs, then the stream ends normally.
+// the hold (if any) runs, then the stream ends normally. Every frame write
+// checks the request context first, so a client that leaves or a server
+// shutdown stops emission at the next frame; the cut is logged as
+// stream_result.
 func (c *call) stream(f format, text, hold string) {
 	w := c.w
 	rc := c.rc // the write deadline was set in serve
@@ -28,7 +32,15 @@ func (c *call) stream(f format, text, hold string) {
 	h.Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 
+	ctx := c.r.Context()
 	emit := func(frames ...[]byte) bool {
+		if ctx.Err() != nil {
+			c.streamCut = "client_closed"
+			if errors.Is(context.Cause(ctx), ErrShutdown) {
+				c.streamCut = holdServerShutdown
+			}
+			return false
+		}
 		for _, fr := range frames {
 			if len(fr) == 0 {
 				continue
