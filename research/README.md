@@ -7,6 +7,9 @@ Three read-only research agents reviewed primary documentation and public GitHub
 - `ubuntu-hardening.md`: Ubuntu 24.04, T-Pot isolation patterns, gVisor, nftables, auditd, Falco, unattended upgrades and Chainguard images.
 - `honeypot-projects.md`: OpenAI/Ollama/vLLM impersonation, response timing, anti-fingerprinting, canaries and Shibboleth behavioral gates.
 - `new-relic.md`: ingest-only credentials, Logs/Metric APIs, batching, gzip, backpressure, key rotation and NRQL alerts.
+- `responder-review.md`: independent review of the first responder commit. Fix H1 Unicode bidirectional-mark normalization and H3 per-field declaration bounds before deployment; review the remaining findings.
+- `telemetry-security.md`: independent security review of the first telemetry commit. Fix the High raw-credential leakage finding and all Medium findings before deployment; review Low findings.
+- `server-review.md`: independent snapshot review, subsequently triaged by the host. Its slot-leak and missing-route claims were false; follow only the validated actions in `SECURITY_FIXES.md`.
 
 ## Required application in this repository
 

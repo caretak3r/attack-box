@@ -203,9 +203,25 @@ Verification: `go vet ./...`, `gofmt -l .`, `go test -race -count=1 -cover ./...
 
 Verification: `gofmt -l .` (no output), `go vet ./...`, `go test -race -count=1 -cover ./...` (`internal/telemetry` 95.5%). Tests use `httptest` servers only.
 
+### HTTP personas — `internal/server` (implemented, tested)
+
+- `server.New(Config)` returns one persona handler: `openai` (default), `vllm` or `ollama`. One `Server` per listener. Default versions: `1.0.0`, `0.11.0`, `0.12.6`. Default models: `qwen3:8b`, `gpt-oss:20b`, `llama3.1:8b`. Embedding widths: 1024, 768 and 2048 (other models 1024; client `dimensions` max 4096).
+- Routes. All personas: `GET /v1/models`, `GET /v1/models/{model}`, `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/responses`, `GET /v1/responses/{id}`, `POST /v1/embeddings`, `GET /v1/edge/{A-D}/status`. `openai` and `vllm` add `POST /v1/responses/{id}/cancel`, `GET /health`, `GET /version`. `vllm` adds `POST /invocations`, fake `GET /metrics`, `GET /docs`, `GET /openapi.json` (lists exactly the published paths). `ollama` adds `GET|HEAD /`, `/api/version`, `/api/tags`, `/api/ps`, `/api/show`, `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/pull`, `/api/push`, `/api/create`, `/api/copy`, `DELETE|POST /api/delete`. On `ollama`, `GET /v1/responses/{id}` returns 404 (stateless).
+- Error shapes: `openai` uses `{"error":{message,type,param,code}}`; `vllm` uses `{"object":"error",message,type,param,code}` and `{"detail":...}` for unknown paths; `ollama` native uses `{"error":"..."}` and Go/gin `404 page not found` for unknown paths and wrong methods. Responses never contain decoy software names.
+- Streaming: SSE `data:` frames plus `data: [DONE]` for chat and completions, typed `event:` frames for Responses, NDJSON for Ollama (`stream` defaults to true there). Text goes out in 4-word deltas.
+- Holds: the probe text is sent first, then `timeout-silent` sends nothing for `HoldSilent` (150 s) and `timeout-idle` sends `: keep-alive` (SSE) or an empty NDJSON frame every `IdleInterval` (45 s). Then the stream ends normally. Non-stream requests wait before the body. The edge log records `hold_result` (`completed` or `client_closed`) and `hold_ms`. A hold is capped by `MaxStreamDuration` (180 s).
+- Retry gate: HTTP 429, `Retry-After: 1`, persona rate-limit error.
+- Limits: body 1 MiB (413), 256 messages/prompts, 64 tools (400), 256 in-flight requests in total and 8 per source (429, `Retry-After: 1`), logged body 128 KiB.
+- Source address: the peer address. `X-Forwarded-For` counts only when the peer is in `TrustedProxies`; then the right-most untrusted entry wins. Session key: HMAC-SHA256(`SessionKey`, source, User-Agent, credential fingerprint).
+- Logging: every request (also 404, 405, 413, 429) gives one `edge` event (redacted headers, credential fingerprints, redacted query, model, stream, tool count, `parallel_tool_calls`, task, declarations, observations, latency, redacted body). Inference requests also give a `transcript` event with the probe text, probe ID and task labels. Counters: `attackbox.requests` {persona, endpoint route pattern, status_class} and `attackbox.probes` {persona, probe_id, task}.
+- Unknown model on inference: persona 404 (`model_not_found`, vLLM `NotFoundError`, Ollama `model "x" not found, try pulling it first`); the echoed name is capped at 128 characters and stripped of control characters.
+- Ollama management endpoints change no state: `pull` of a listed model streams success, other names fail with a missing-manifest error; `push` fails with a namespace authorization error; `create` reports success and stores nothing; `copy` and `delete` act on listed names only.
+
+Verification: `gofmt -l .` (no output), `go vet ./...`, `go test -race -count=1 -cover ./...` (`internal/server` 95.2%).
+
 ### Not yet implemented
 
-HTTP personas and endpoint handlers, request/response logging wiring, `cmd` entry point, Dockerfile/Compose, deployment script, operator documentation.
+`cmd` entry point (listeners with `ReadHeaderTimeout`/`ReadTimeout`, shared `SessionKey`/`EmbedSeed`, NR wiring, graceful shutdown), live-server smoke test, Dockerfile/Compose, deployment script, operator documentation, benchmarks.
 
 ## Decoy VPS layers
 
