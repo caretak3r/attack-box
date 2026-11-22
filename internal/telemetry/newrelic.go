@@ -88,7 +88,7 @@ type NRConfig struct {
 	Common            map[string]any
 	HeartbeatInterval time.Duration // 0 means 30s; negative disables
 	Backoff           []time.Duration
-	MaxRetryAfter     time.Duration // cap on a 429 Retry-After wait; default 30s
+	MaxRetryAfter     time.Duration         // cap on a 429 Retry-After wait; default 30s
 	HeartbeatAttrs    func() map[string]any // merged into each heartbeat, must not block
 	OnError           func(error)
 }
