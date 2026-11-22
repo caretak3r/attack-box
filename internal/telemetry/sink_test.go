@@ -126,3 +126,14 @@ func TestJSONLogWriteError(t *testing.T) {
 		t.Error("write error not reported")
 	}
 }
+
+func TestJSONLogCountsWriteErrors(t *testing.T) {
+	l := NewJSONLog(failWriter{})
+	var seen int
+	l.OnError = func(error) { seen++ }
+	l.Emit(Event{Action: "x"})
+	l.Count("attackbox.requests", 1, nil)
+	if l.Errors() != 2 || seen != 2 {
+		t.Errorf("errors=%d seen=%d", l.Errors(), seen)
+	}
+}

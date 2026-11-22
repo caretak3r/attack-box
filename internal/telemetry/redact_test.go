@@ -153,3 +153,14 @@ func TestTextStructuredCredentials(t *testing.T) {
 		t.Errorf("api_key fingerprint missing: %s", out)
 	}
 }
+
+func TestShortRedactorKeyReplaced(t *testing.T) {
+	a, b := NewRedactor([]byte("k")), NewRedactor([]byte("k"))
+	if a.Fingerprint("tok") == b.Fingerprint("tok") {
+		t.Error("short key used as given")
+	}
+	long := []byte(strings.Repeat("x", MinRedactorKey))
+	if NewRedactor(long).Fingerprint("tok") != NewRedactor(long).Fingerprint("tok") {
+		t.Error("full-length key not deterministic")
+	}
+}

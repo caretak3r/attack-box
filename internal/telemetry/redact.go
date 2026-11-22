@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
@@ -38,7 +39,18 @@ var infoHeaders = map[string]bool{
 // by keyed fingerprints so reuse stays correlatable without storing the value.
 type Redactor struct{ key []byte }
 
+// MinRedactorKey is the shortest key NewRedactor accepts as given.
+const MinRedactorKey = 32
+
+// NewRedactor uses key for fingerprints. A key shorter than MinRedactorKey
+// would make fingerprints of short credentials brute-forceable, so it is
+// replaced by a random key (fingerprints then correlate only within this
+// process).
 func NewRedactor(key []byte) *Redactor {
+	if len(key) < MinRedactorKey {
+		key = make([]byte, MinRedactorKey)
+		rand.Read(key) // never fails since Go 1.24
+	}
 	return &Redactor{key: append([]byte(nil), key...)}
 }
 

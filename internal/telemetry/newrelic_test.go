@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const testKey = "NRAK-example"
+const testKey = "0123456789abcdef0123456789abcdef0123NRAL"
 
 type fakeClock struct {
 	mu sync.Mutex
@@ -505,4 +505,214 @@ func TestSeriesCap(t *testing.T) {
 		t.Error("series cap not enforced")
 	}
 	closeNR(t, n)
+}
+
+func TestValidLicenseKey(t *testing.T) {
+	good := []string{
+		testKey,
+		"0123456789abcdef0123456789abcdef01234567", // original 40-hex key
+		"eu01xx0123456789abcdef0123456789abcdNRAL", // region-prefixed ingest key
+	}
+	for _, k := range good {
+		if err := ValidLicenseKey(k); err != nil {
+			t.Errorf("%q rejected: %v", k, err)
+		}
+	}
+	bad := map[string]string{
+		"user key":    "NRAK-example",
+		"insert key":  "NRII-example",
+		"query key":   "NRIQ-example",
+		"browser key": "NRJS-example",
+		"short":       "0123456789abcdef",
+		"long":        testKey + "0",
+		"mixed no sx": "0123456789ABCDEF0123456789abcdef01234567",
+		"symbols":     "0123456789abcdef0123456789abcdef012-NRAL",
+	}
+	for name, k := range bad {
+		err := ValidLicenseKey(k)
+		if err == nil {
+			t.Errorf("%s accepted", name)
+			continue
+		}
+		if len(k) > 5 && strings.Contains(err.Error(), k[5:]) {
+			t.Errorf("%s: error echoes key: %v", name, err)
+		}
+		if _, err := NewNewRelic(NRConfig{LicenseKey: k, Client: noNet}); err == nil {
+			t.Errorf("%s: NewNewRelic accepted", name)
+		}
+	}
+}
+
+func TestEncodedKeyInURLRejected(t *testing.T) {
+	enc := strings.ReplaceAll(testKey, "0", "%30")
+	for _, u := range []string{
+		"https://example.com/log?k=" + enc,
+		"https://example.com/" + strings.ToUpper(testKey) + "/log",
+		"https://example.com/log?k=" + strings.ReplaceAll(testKey, "a", "%61"),
+	} {
+		if n, err := NewNewRelic(NRConfig{LicenseKey: testKey, LogURL: u, Client: noNet}); err == nil {
+			closeNR(t, n)
+			t.Errorf("%s accepted", u)
+		}
+	}
+}
+
+func TestRetryAfterParse(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	cases := map[string]time.Duration{
+		"":                                 0,
+		"7":                                7 * time.Second,
+		" 2 ":                              2 * time.Second,
+		"0":                                0,
+		"-5":                               0,
+		"soon":                             0,
+		"99999999999":                      24 * time.Hour,
+		"Thu, 01 Jan 2026 00:00:30 GMT":    30 * time.Second,
+		"Wed, 31 Dec 2025 23:59:00 GMT":    0,
+		"Thursday, 01-Jan-26 00:01:00 GMT": time.Minute,
+	}
+	for in, want := range cases {
+		if got := retryAfter(in, now); got != want {
+			t.Errorf("retryAfter(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+// retryServer answers the first log POST with 429 and the given Retry-After,
+// then 202, recording when each attempt arrived.
+func retryServer(t *testing.T, header string) (*httptest.Server, func() []time.Time) {
+	t.Helper()
+	var mu sync.Mutex
+	var at []time.Time
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/log" {
+			w.WriteHeader(202)
+			return
+		}
+		mu.Lock()
+		at = append(at, time.Now())
+		first := len(at) == 1
+		mu.Unlock()
+		if first {
+			w.Header().Set("Retry-After", header)
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(202)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func() []time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]time.Time(nil), at...)
+	}
+}
+
+func TestRetryAfterHonoredAndBounded(t *testing.T) {
+	cases := []struct {
+		header  string
+		max     time.Duration
+		atLeast time.Duration
+		under   time.Duration
+	}{
+		{"1", 5 * time.Second, time.Second, 3 * time.Second},
+		{"3600", 80 * time.Millisecond, 80 * time.Millisecond, time.Second},
+	}
+	for _, c := range cases {
+		srv, attempts := retryServer(t, c.header)
+		n := start(t, NRConfig{
+			LicenseKey: testKey, LogURL: srv.URL + "/log", MetricURL: srv.URL + "/metric",
+			HeartbeatInterval: -1, Backoff: []time.Duration{time.Millisecond}, MaxRetryAfter: c.max,
+		})
+		n.Emit(Event{Action: "x"})
+		closeNR(t, n)
+		at := attempts()
+		if len(at) != 2 {
+			t.Fatalf("Retry-After %s: attempts = %d", c.header, len(at))
+		}
+		if gap := at[1].Sub(at[0]); gap < c.atLeast || gap > c.under {
+			t.Errorf("Retry-After %s: gap %v, want [%v, %v]", c.header, gap, c.atLeast, c.under)
+		}
+		if st := n.Stats(); st.Retries != 1 || st.Lost != 0 || st.Errors != 0 {
+			t.Errorf("Retry-After %s: stats %+v", c.header, st)
+		}
+	}
+}
+
+func TestHeartbeatIndependentOfStalledWorker(t *testing.T) {
+	var heartbeats atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		zr, err := gzip.NewReader(r.Body)
+		if err != nil {
+			w.WriteHeader(400)
+			return
+		}
+		b, _ := io.ReadAll(zr)
+		if strings.Contains(string(b), `"stream":"heartbeat"`) {
+			if !strings.Contains(string(b), `"queue_len"`) || !strings.Contains(string(b), `"dropped_total"`) {
+				t.Errorf("heartbeat lacks health attributes: %s", b)
+			}
+			heartbeats.Add(1)
+			w.WriteHeader(202)
+			return
+		}
+		if r.URL.Path == "/log" {
+			// Normal log batches are rate-limited for a long time.
+			w.Header().Set("Retry-After", "60")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(202)
+	}))
+	defer srv.Close()
+	n := start(t, NRConfig{
+		LicenseKey: testKey, LogURL: srv.URL + "/log", MetricURL: srv.URL + "/metric",
+		HeartbeatInterval: 10 * time.Millisecond, FlushInterval: time.Millisecond,
+		QueueSize: 4, BatchSize: 1, Backoff: []time.Duration{time.Millisecond}, MaxRetryAfter: time.Minute,
+	})
+	for i := 0; i < 20; i++ { // fill the queue while the worker sleeps
+		n.Emit(Event{Action: "flood"})
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for heartbeats.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if heartbeats.Load() < 3 {
+		t.Errorf("heartbeats = %d while worker stalled", heartbeats.Load())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_ = n.Close(ctx)
+	closeNR(t, n)
+	if st := n.Stats(); st.Dropped == 0 || st.Lost == 0 {
+		t.Errorf("stalled delivery not accounted: %+v", st)
+	}
+}
+
+func TestMetricsAfterCloseDropped(t *testing.T) {
+	srv := newServer(t, 202)
+	n := start(t, srv.cfg())
+	closeNR(t, n)
+	n.Count("attackbox.requests", 1, nil)
+	n.Gauge("attackbox.x", 1, nil)
+	if d := n.Stats().Dropped; d != 2 {
+		t.Errorf("post-close metrics dropped = %d, want 2", d)
+	}
+	for _, p := range srv.posts("/metric/v1") {
+		if strings.Contains(string(p.Payload), "attackbox.requests") {
+			t.Error("post-close count was shipped")
+		}
+	}
+}
+
+func TestTransientFailuresCounted(t *testing.T) {
+	srv := newServer(t, 500)
+	n := start(t, srv.cfg())
+	n.Emit(Event{Action: "x"})
+	closeNR(t, n)
+	st := n.Stats()
+	// two backoff steps: each failing payload (logs, metrics) retries twice.
+	if st.Retries != 4 || st.Errors != 2 {
+		t.Errorf("stats %+v", st)
+	}
 }

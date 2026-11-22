@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-const testNRKey = "0123456789abcdef0123456789abcdefNRAL"
+const testNRKey = "0123456789abcdef0123456789abcdef0123NRAL"
 
 func envOf(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
@@ -93,6 +93,8 @@ func TestLoadConfigErrors(t *testing.T) {
 		want string
 	}{
 		"nr key required":   {map[string]string{}, "ATTACKBOX_NR_LICENSE_KEY is required"},
+		"nr user key":       {map[string]string{"ATTACKBOX_NR_LICENSE_KEY": "NRAK-example"}, "not an ingest license key"},
+		"nr key shape":      {map[string]string{"ATTACKBOX_NR_LICENSE_KEY": "abc123"}, "must be 40 characters"},
 		"nr conflict":       {map[string]string{"ATTACKBOX_NR_DISABLED": "true", "ATTACKBOX_NR_LICENSE_KEY": testNRKey}, "conflicts"},
 		"bad bool":          {map[string]string{"ATTACKBOX_NR_DISABLED": "maybe"}, "want true or false"},
 		"bad duration":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_HOLD_SILENT": "soon"}, "ATTACKBOX_HOLD_SILENT"},

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,7 +23,38 @@ const (
 	defaultLogURL    = "https://log-api.newrelic.com/log/v1"
 	defaultMetricURL = "https://metric-api.newrelic.com/metric/v1"
 	maxSeries        = 2000
+	licenseKeyLen    = 40
 )
+
+// ValidLicenseKey accepts only the documented New Relic license-key shape: 40
+// alphanumeric characters, either lowercase hex (original account keys) or
+// ending in "NRAL" (Ingest - License keys, including region-prefixed ones).
+// User, Insert, Query, browser and admin keys are rejected by prefix because
+// they grant more than write-only ingest.
+func ValidLicenseKey(k string) error {
+	for _, p := range []string{"NRAK-", "NRAA-", "NRII-", "NRIQ-", "NRJS-", "NRBR-"} {
+		if strings.HasPrefix(k, p) {
+			return fmt.Errorf("newrelic: %s... is not an ingest license key; create an Ingest - License key", p)
+		}
+	}
+	if len(k) != licenseKeyLen {
+		return fmt.Errorf("newrelic: license key must be %d characters, got %d", licenseKeyLen, len(k))
+	}
+	hex := true
+	for _, c := range k {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+		case c >= 'A' && c <= 'Z', c >= 'g' && c <= 'z':
+			hex = false
+		default:
+			return errors.New("newrelic: license key must be alphanumeric")
+		}
+	}
+	if !hex && !strings.HasSuffix(k, "NRAL") {
+		return errors.New("newrelic: license key must be 40 hex characters or end in NRAL")
+	}
+	return nil
+}
 
 // NRConfig configures the New Relic shipper. Zero values take defaults.
 type NRConfig struct {
@@ -38,18 +70,21 @@ type NRConfig struct {
 	Common            map[string]any
 	HeartbeatInterval time.Duration // 0 means 30s; negative disables
 	Backoff           []time.Duration
+	MaxRetryAfter     time.Duration // cap on a 429 Retry-After wait; default 30s
 	OnError           func(error)
 }
 
 // Stats is a snapshot of shipper counters. Sent counts log events and metrics
 // New Relic accepted; Dropped counts items refused by a full queue or series
-// cap; Lost counts items abandoned after failed delivery; Errors counts failed
-// POSTs.
+// cap or arriving after Close; Lost counts items abandoned after failed
+// delivery; Errors counts POSTs that finally failed; Retries counts transient
+// failed attempts that were retried.
 type Stats struct {
 	Sent      int64
 	Dropped   int64
 	Lost      int64
 	Errors    int64
+	Retries   int64
 	LastError string
 }
 
@@ -79,14 +114,17 @@ type NewRelic struct {
 	series    map[string]*series
 	lastFlush time.Time
 
-	sent, dropped, lost, errs atomic.Int64
-	errMu                     sync.Mutex
-	lastErr                   string
+	sent, dropped, lost, errs, retries atomic.Int64
+	errMu                              sync.Mutex
+	lastErr                            string
 }
 
 func NewNewRelic(cfg NRConfig) (*NewRelic, error) {
 	if cfg.LicenseKey == "" {
 		return nil, errors.New("newrelic: license key required")
+	}
+	if err := ValidLicenseKey(cfg.LicenseKey); err != nil {
+		return nil, err
 	}
 	if cfg.LogURL == "" {
 		cfg.LogURL = defaultLogURL
@@ -120,6 +158,9 @@ func NewNewRelic(cfg NRConfig) (*NewRelic, error) {
 	if cfg.Backoff == nil {
 		cfg.Backoff = []time.Duration{time.Second, 2 * time.Second}
 	}
+	if cfg.MaxRetryAfter <= 0 {
+		cfg.MaxRetryAfter = 30 * time.Second
+	}
 	client := &http.Client{Timeout: 10 * time.Second}
 	if cfg.Client != nil {
 		c := *cfg.Client
@@ -147,7 +188,7 @@ func validateURL(raw, key string) error {
 	if err != nil || u.Host == "" {
 		return errors.New("newrelic: invalid endpoint URL")
 	}
-	if u.User != nil || strings.Contains(raw, key) {
+	if u.User != nil || containsKey(raw, key) {
 		return errors.New("newrelic: credentials must not be in the endpoint URL")
 	}
 	switch u.Scheme {
@@ -162,6 +203,24 @@ func validateURL(raw, key string) error {
 		return errors.New("newrelic: endpoint must be https")
 	}
 	return nil
+}
+
+// containsKey also catches percent-encoded and case-folded copies of the key.
+func containsKey(raw, key string) bool {
+	key = strings.ToLower(key)
+	forms := []string{raw}
+	if p, err := url.PathUnescape(raw); err == nil {
+		forms = append(forms, p)
+	}
+	if q, err := url.QueryUnescape(raw); err == nil {
+		forms = append(forms, q)
+	}
+	for _, f := range forms {
+		if strings.Contains(strings.ToLower(f), key) {
+			return true
+		}
+	}
+	return false
 }
 
 // Emit chunks the event and queues each chunk, dropping when the queue is full.
@@ -197,6 +256,12 @@ func (n *NewRelic) Gauge(name string, value float64, attrs map[string]string) {
 
 func (n *NewRelic) record(name string, count bool, value float64, attrs map[string]string) {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return
+	}
+	n.closeMu.RLock()
+	defer n.closeMu.RUnlock()
+	if n.closed {
+		n.dropped.Add(1)
 		return
 	}
 	labels := SafeLabels(attrs)
@@ -247,7 +312,7 @@ func (n *NewRelic) Stats() Stats {
 	n.errMu.Unlock()
 	return Stats{
 		Sent: n.sent.Load(), Dropped: n.dropped.Load(), Lost: n.lost.Load(),
-		Errors: n.errs.Load(), LastError: last,
+		Errors: n.errs.Load(), Retries: n.retries.Load(), LastError: last,
 	}
 }
 
@@ -271,16 +336,75 @@ func (n *NewRelic) Close(ctx context.Context) error {
 }
 
 func (n *NewRelic) run() {
-	defer close(n.done)
-	defer n.cancel()
+	var wg sync.WaitGroup
+	if n.cfg.HeartbeatInterval > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			n.heartbeatLoop()
+		}()
+	}
+	n.ship()
+	wg.Wait()
+	n.cancel()
+	close(n.done)
+}
+
+// heartbeatLoop posts heartbeats directly, one attempt each, so a full queue
+// or a worker sleeping through retries cannot hide a live host. A failed
+// heartbeat is counted as lost; the next tick is the retry.
+func (n *NewRelic) heartbeatLoop() {
+	t := time.NewTicker(n.cfg.HeartbeatInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-n.quit:
+			return
+		case <-t.C:
+		}
+		now := n.cfg.Now()
+		e := Event{Stream: StreamHeartbeat, Action: "heartbeat", Timestamp: now, Attrs: map[string]any{
+			"queue_len":     len(n.queue),
+			"dropped_total": n.dropped.Load(),
+			"lost_total":    n.lost.Load(),
+			"errors_total":  n.errs.Load(),
+		}}
+		if item, err := logItem(e); err == nil {
+			common, _ := json.Marshal(map[string]any{"attributes": n.cfg.Common})
+			n.postOnce(n.cfg.LogURL, envelope(common, "logs", item), 1)
+		}
+		metric, _ := json.Marshal(map[string]any{"name": "attackbox.heartbeat", "type": "gauge", "value": 1, "timestamp": now.UnixMilli()})
+		common, _ := json.Marshal(map[string]any{"attributes": n.cfg.Common})
+		n.postOnce(n.cfg.MetricURL, envelope(common, "metrics", metric), 1)
+	}
+}
+
+func envelope(common []byte, field string, items ...[]byte) []byte {
+	b := append([]byte(`[{"common":`), common...)
+	b = append(b, `,"`+field+`":[`...)
+	for i, it := range items {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, it...)
+	}
+	return append(b, `]}]`...)
+}
+
+func logItem(e Event) ([]byte, error) {
+	attrs := e.Attributes()
+	delete(attrs, "timestamp")
+	delete(attrs, "message")
+	return json.Marshal(map[string]any{
+		"timestamp":  e.Timestamp.UnixMilli(),
+		"message":    e.Message(),
+		"attributes": attrs,
+	})
+}
+
+func (n *NewRelic) ship() {
 	flush := time.NewTicker(n.cfg.FlushInterval)
 	defer flush.Stop()
-	var hb <-chan time.Time
-	if n.cfg.HeartbeatInterval > 0 {
-		t := time.NewTicker(n.cfg.HeartbeatInterval)
-		defer t.Stop()
-		hb = t.C
-	}
 	batch := make([]Event, 0, n.cfg.BatchSize)
 	send := func() {
 		n.flushLogs(batch)
@@ -296,9 +420,6 @@ func (n *NewRelic) run() {
 		case <-flush.C:
 			send()
 			n.flushMetrics()
-		case <-hb:
-			n.Emit(Event{Stream: StreamHeartbeat, Action: "heartbeat"})
-			n.Gauge("attackbox.heartbeat", 1, nil)
 		case <-n.quit:
 			for {
 				select {
@@ -325,14 +446,7 @@ func (n *NewRelic) flushLogs(events []Event) {
 	}
 	items := make([][]byte, 0, len(events))
 	for _, e := range events {
-		attrs := e.Attributes()
-		delete(attrs, "timestamp")
-		delete(attrs, "message")
-		b, err := json.Marshal(map[string]any{
-			"timestamp":  e.Timestamp.UnixMilli(),
-			"message":    e.Message(),
-			"attributes": attrs,
-		})
+		b, err := logItem(e)
 		if err != nil {
 			n.fail(fmt.Errorf("newrelic: marshal event: %w", err), 1)
 			continue
@@ -348,11 +462,14 @@ func (n *NewRelic) flushLogs(events []Event) {
 }
 
 func (n *NewRelic) flushMetrics() {
-	n.Gauge("attackbox.telemetry.dropped_total", float64(n.dropped.Load()), nil)
-	n.Gauge("attackbox.telemetry.ingest_errors_total", float64(n.errs.Load()), nil)
-
 	now := n.cfg.Now()
 	n.mu.Lock()
+	for name, v := range map[string]int64{
+		"attackbox.telemetry.dropped_total":       n.dropped.Load(),
+		"attackbox.telemetry.ingest_errors_total": n.errs.Load(),
+	} {
+		n.series[seriesKey(name, false, nil)] = &series{name: name, value: float64(v), at: now}
+	}
 	pending := n.series
 	n.series = map[string]*series{}
 	start := n.lastFlush
@@ -440,20 +557,38 @@ func (n *NewRelic) postAll(endpoint string, common []byte, field string, items [
 	flush()
 }
 
-func (n *NewRelic) post(endpoint string, payload []byte, items int) {
+func gzipBody(payload []byte) ([]byte, error) {
 	var zbuf bytes.Buffer
 	zw := gzip.NewWriter(&zbuf)
 	zw.Write(payload)
 	if err := zw.Close(); err != nil {
-		n.fail(fmt.Errorf("newrelic: gzip: %w", err), items)
+		return nil, fmt.Errorf("newrelic: gzip: %w", err)
+	}
+	return zbuf.Bytes(), nil
+}
+
+// postOnce makes a single delivery attempt with no retry.
+func (n *NewRelic) postOnce(endpoint string, payload []byte, items int) {
+	body, err := gzipBody(payload)
+	if err == nil {
+		if _, _, err = n.try(endpoint, body); err == nil {
+			n.sent.Add(int64(items))
+			return
+		}
+	}
+	n.fail(err, items)
+}
+
+func (n *NewRelic) post(endpoint string, payload []byte, items int) {
+	body, err := gzipBody(payload)
+	if err != nil {
+		n.fail(err, items)
 		return
 	}
-	body := zbuf.Bytes()
-
-	var err error
 	for attempt := 0; ; attempt++ {
 		var retry bool
-		retry, err = n.try(endpoint, body)
+		var after time.Duration
+		retry, after, err = n.try(endpoint, body)
 		if err == nil {
 			n.sent.Add(int64(items))
 			return
@@ -461,8 +596,13 @@ func (n *NewRelic) post(endpoint string, payload []byte, items int) {
 		if !retry || attempt >= len(n.cfg.Backoff) {
 			break
 		}
+		n.retries.Add(1)
+		wait := n.cfg.Backoff[attempt]
+		if after > wait {
+			wait = min(after, n.cfg.MaxRetryAfter)
+		}
 		select {
-		case <-time.After(n.cfg.Backoff[attempt]):
+		case <-time.After(wait):
 		case <-n.ctx.Done():
 			n.fail(err, items)
 			return
@@ -471,26 +611,52 @@ func (n *NewRelic) post(endpoint string, payload []byte, items int) {
 	n.fail(err, items)
 }
 
-// try makes one POST. retry reports whether the failure is worth another go.
-func (n *NewRelic) try(endpoint string, body []byte) (retry bool, err error) {
+// try makes one POST. retry reports whether the failure is worth another go;
+// after is the server's Retry-After on a 429, or zero.
+func (n *NewRelic) try(endpoint string, body []byte) (retry bool, after time.Duration, err error) {
 	req, err := http.NewRequestWithContext(n.ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return false, errors.New("newrelic: build request failed")
+		return false, 0, errors.New("newrelic: build request failed")
 	}
 	req.Header.Set("Api-Key", n.cfg.LicenseKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Content-Encoding", "gzip")
 	resp, err := n.client.Do(req)
 	if err != nil {
-		return n.ctx.Err() == nil, fmt.Errorf("newrelic: transport error: %w", err)
+		return n.ctx.Err() == nil, 0, fmt.Errorf("newrelic: transport error: %w", err)
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return false, nil
+		return false, 0, nil
 	}
-	return resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500,
+	if resp.StatusCode == http.StatusTooManyRequests {
+		after = retryAfter(resp.Header.Get("Retry-After"), time.Now())
+	}
+	return resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500, after,
 		fmt.Errorf("newrelic: %s returned status %d", req.URL.Path, resp.StatusCode)
+}
+
+// retryAfter parses delay-seconds or an HTTP-date. Invalid or past values give
+// zero; the caller applies the upper bound.
+func retryAfter(v string, now time.Time) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		if secs > int64(24*time.Hour/time.Second) {
+			secs = int64(24 * time.Hour / time.Second)
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil && t.After(now) {
+		return t.Sub(now)
+	}
+	return 0
 }
 
 // fail records a failed delivery. The license key is scrubbed from the message.

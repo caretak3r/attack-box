@@ -12,11 +12,12 @@ Read `research/responder-review.md` and `research/telemetry-security.md` before 
 
 1. DONE: High: redact JSON credential fields, Basic/Bearer forms, API-key aliases and cookie-shaped fields in request/response bodies; add adversarial regression tests.
 2. DONE: Medium: redact credential-bearing header aliases and Referer userinfo/query secrets.
-3. Medium: reject known non-ingest New Relic key formats and require the documented ingest-key shape at configuration time.
-4. Medium: honor bounded `Retry-After` seconds and HTTP-date values on 429.
-5. Medium: make heartbeat scheduling/delivery independent of slow POST retries and attacker-filled queues.
-6. Medium: reject/account for metric intake after Close; make the Sink contract and local JSON writer behavior agree so request processing cannot stall silently.
-7. Review Low findings: strong random redactor keys, count transient failed POST attempts, and reject/scrub raw or escaped credentials in endpoint URLs.
+3. DONE: Medium: reject known non-ingest New Relic key formats and require the documented ingest-key shape at configuration time.
+4. DONE: Medium: honor bounded `Retry-After` seconds and HTTP-date values on 429.
+5. DONE: Medium: make heartbeat scheduling/delivery independent of slow POST retries and attacker-filled queues.
+6. DONE: Medium: reject/account for metric intake after Close; make the Sink contract and local JSON writer behavior agree so request processing cannot stall silently.
+7. DONE: Review Low findings: strong random redactor keys, count transient failed POST attempts, and reject/scrub raw or escaped credentials in endpoint URLs.
+8. Triage `research/secret-review.md`: fix marker-prefix and malformed-canary allowlist bypasses, camelCase/encoded credential names, non-string JSON credential handling, cookie/canary idempotence and unsafe fingerprint output. Preserve valid JSON and behavioral telemetry byte-for-byte; document the remaining free-text detection boundary rather than claiming perfection.
 
 ## HTTP server snapshot
 

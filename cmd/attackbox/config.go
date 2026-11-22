@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"attackbox/internal/telemetry"
 )
 
 // minSecret is the shortest accepted secret file, in bytes.
@@ -176,6 +178,11 @@ func loadConfig(getenv func(string) string) (config, error) {
 		errs = append(errs, errors.New("ATTACKBOX_NR_DISABLED=true conflicts with ATTACKBOX_NR_LICENSE_KEY; unset one"))
 	case !c.nrDisabled && c.nrKey == "":
 		errs = append(errs, errors.New("ATTACKBOX_NR_LICENSE_KEY is required; set ATTACKBOX_NR_DISABLED=true to log locally only"))
+	}
+	if !c.nrDisabled && c.nrKey != "" {
+		if err := telemetry.ValidLicenseKey(c.nrKey); err != nil {
+			errs = append(errs, fmt.Errorf("ATTACKBOX_NR_LICENSE_KEY: %v", err))
+		}
 	}
 
 	if c.secretFile != "" {

@@ -7,11 +7,15 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// Sink receives log events and metrics. Implementations must not block the
-// request path.
+// Sink receives log events and metrics. Calls happen on the request path, so
+// an implementation must either never block (NewRelic queues and drops) or
+// write only to a local destination whose stalls the operator accepts
+// (JSONLog writes synchronously to a file or the container log stream).
+// Neither may fail silently: drops and write errors are counted.
 type Sink interface {
 	Emit(Event)
 	Count(name string, value float64, attrs map[string]string)
@@ -85,11 +89,14 @@ func validEndpoint(v string) bool {
 }
 
 // JSONLog writes one JSON object per line. Events are chunked; metrics are
-// written as stream "metric" lines.
+// written as stream "metric" lines. Writes are synchronous: point it at a
+// local file or stdout, never a network writer. Failed writes are counted in
+// Errors and passed to OnError.
 type JSONLog struct {
-	mu  sync.Mutex
-	enc *json.Encoder
-	now func() time.Time
+	mu     sync.Mutex
+	enc    *json.Encoder
+	now    func() time.Time
+	errors atomic.Int64
 
 	// OnError, if set, is called with write failures.
 	OnError func(error)
@@ -138,7 +145,13 @@ func (l *JSONLog) write(v map[string]any) {
 	l.mu.Lock()
 	err := l.enc.Encode(v)
 	l.mu.Unlock()
-	if err != nil && l.OnError != nil {
-		l.OnError(err)
+	if err != nil {
+		l.errors.Add(1)
+		if l.OnError != nil {
+			l.OnError(err)
+		}
 	}
 }
+
+// Errors returns the number of lines that failed to write.
+func (l *JSONLog) Errors() int64 { return l.errors.Load() }
