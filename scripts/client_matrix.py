@@ -14,6 +14,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -74,11 +76,12 @@ class ServerFixture:
         self.ollama_port = ollama_port
         self.process = None
         self.binary = None
+        self.log_file = None
 
     def start(self, timeout: int = 10) -> bool:
         """Build and start test server."""
         info("Building attackbox test server...")
-        
+
         # Build binary
         try:
             subprocess.run(
@@ -92,13 +95,17 @@ class ServerFixture:
             fail(f"Build failed: {e.stderr.decode()}")
             return False
 
+        # Create log file
+        self.log_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='-attackbox.log')
+
         # Start server
         env = os.environ.copy()
         env.update({
             "ATTACKBOX_NR_DISABLED": "true",
             "ATTACKBOX_OPENAI_ADDR": f"127.0.0.1:{self.openai_port}",
+            "ATTACKBOX_VLLM_ADDR": "off",
             "ATTACKBOX_OLLAMA_ADDR": f"127.0.0.1:{self.ollama_port}",
-            "ATTACKBOX_TIMING": "false",  # Instant responses for tests
+            "ATTACKBOX_TIMING": "false",
             "ATTACKBOX_MAX_STREAM": "10s",
         })
 
@@ -106,29 +113,32 @@ class ServerFixture:
             self.process = subprocess.Popen(
                 [self.binary],
                 env=env,
-                stdout=subprocess.PIPE,
+                stdout=self.log_file,
                 stderr=subprocess.STDOUT,
             )
         except Exception as e:
             fail(f"Failed to start server: {e}")
             return False
 
-        # Wait for ready
-        for _ in range(timeout * 10):
+        # Wait for ready by polling /v1/models
+        health_url = f"http://127.0.0.1:{self.openai_port}/v1/models"
+        for attempt in range(timeout * 10):
             try:
-                result = subprocess.run(
-                    [self.binary, "-healthcheck", f"http://127.0.0.1:{self.openai_port}/health"],
-                    capture_output=True,
-                    timeout=1,
-                )
-                if result.returncode == 0:
-                    success("Test server started")
-                    return True
-            except (subprocess.TimeoutExpired, FileNotFoundError):
+                with urllib.request.urlopen(health_url, timeout=1) as response:
+                    if response.status == 200:
+                        success("Test server started")
+                        return True
+            except (urllib.error.URLError, OSError):
                 pass
             time.sleep(0.1)
 
+        # Failed to start - capture logs
         fail("Test server failed to become ready")
+        self.log_file.seek(0)
+        logs = self.log_file.read()
+        if logs:
+            fail("Server logs:")
+            print(logs, file=sys.stderr)
         return False
 
     def stop(self) -> None:
@@ -140,6 +150,10 @@ class ServerFixture:
             except subprocess.TimeoutExpired:
                 self.process.kill()
             self.process = None
+        if self.log_file:
+            self.log_file.close()
+            Path(self.log_file.name).unlink(missing_ok=True)
+            self.log_file = None
         if self.binary and Path(self.binary).exists():
             Path(self.binary).unlink()
 
@@ -197,7 +211,7 @@ class VenvRunner:
             )
             if result.returncode != 0:
                 return {"error": result.stderr or result.stdout}
-            
+
             # Parse JSON output
             return json.loads(result.stdout)
         except subprocess.TimeoutExpired:
