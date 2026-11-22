@@ -377,6 +377,19 @@ EOF
     fi
 }
 
+# Start Docker after bootstrap firewall
+start_docker() {
+    log "Starting Docker..."
+
+    if [[ "$MODE" != "apply" ]]; then
+        warn "Would start Docker"
+        return 0
+    fi
+
+    systemctl start docker
+    ok "Started Docker (under bootstrap firewall)"
+}
+
 # gVisor setup
 setup_gvisor() {
     log "Checking gVisor (runsc)..."
@@ -484,6 +497,78 @@ resolve_nr_endpoints() {
 }
 
 # nftables firewall (enforced before Docker starts)
+# Bootstrap firewall (metadata blocking + root registry access)
+bootstrap_firewall() {
+    log "Loading bootstrap firewall (metadata blocking)..."
+
+    if [[ "$MODE" != "apply" ]]; then
+        warn "Would load bootstrap firewall"
+        return 0
+    fi
+
+    # Create minimal bootstrap table
+    nft -f - <<'EOF'
+add table inet attackbox_bootstrap
+flush table inet attackbox_bootstrap
+
+table inet attackbox_bootstrap {
+    chain forward_early {
+        type filter hook forward priority -150; policy accept;
+
+        # Block metadata from containers
+        ip daddr { 169.254.169.254, 100.100.100.200 } counter log prefix "METADATA-BLOCK: " drop
+        ip6 daddr fe80:ec2::254/128 counter log prefix "METADATA-BLOCK: " drop
+
+        # Allow established/related
+        ct state established,related accept
+
+        # Drop NEW container-originated forwarding
+        iifname "docker0" ct state new counter log prefix "CONTAINER-EGRESS-BLOCK: " drop
+        iifname "br-*" ct state new counter log prefix "CONTAINER-EGRESS-BLOCK: " drop
+    }
+
+    chain output_policy {
+        type filter hook output priority 0; policy drop;
+
+        # Loopback
+        oif lo accept
+
+        # Established/related
+        ct state established,related accept
+
+        # Block metadata
+        ip daddr { 169.254.169.254, 100.100.100.200 } counter log prefix "METADATA-BLOCK-OUT: " reject
+        ip6 daddr fe80:ec2::254/128 counter log prefix "METADATA-BLOCK-OUT: " reject
+
+        # DNS (Cloudflare)
+        ip daddr { 1.1.1.1, 1.0.0.1 } udp dport 53 accept
+        ip6 daddr { 2606:4700:4700::1111, 2606:4700:4700::1001 } udp dport 53 accept
+        ip daddr { 1.1.1.1, 1.0.0.1 } tcp dport 53 accept
+        ip6 daddr { 2606:4700:4700::1111, 2606:4700:4700::1001 } tcp dport 53 accept
+
+        # NTP (Cloudflare)
+        ip daddr { 162.159.200.123, 162.159.200.1 } udp dport 123 accept
+
+        # DHCP client
+        udp sport 68 udp dport 67 accept
+
+        # Bootstrap: root-only registry access (Docker Hub, Chainguard)
+        skuid 0 tcp dport { 80, 443 } accept
+
+        # ICMP errors
+        ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem } limit rate 5/second accept
+        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, destination-unreachable, packet-too-big, time-exceeded } accept
+
+        # Log and drop everything else
+        counter log prefix "OUTPUT-DROP: " drop
+    }
+}
+EOF
+
+    systemctl enable nftables
+    ok "Loaded bootstrap firewall (metadata blocking + root registry)"
+}
+
 setup_firewall() {
     log "Checking nftables firewall..."
 
@@ -513,6 +598,9 @@ setup_firewall() {
             return 1
         fi
 
+
+        # Delete bootstrap table if present
+        nft delete table inet attackbox_bootstrap 2>/dev/null || true
         nft -f "$nft_rules"
 
         # Populate Ubuntu mirrors after table load
@@ -659,6 +747,7 @@ setup_systemd_units() {
         "attackbox-shipper.service"
         "attackbox-falco-adapter.service"
         "attackbox-egress-adapter.service"
+        "attackbox.service"
     )
 
     for unit in "${units[@]}"; do
@@ -825,27 +914,27 @@ disable_ssh() {
 # Resolve Ubuntu mirrors
 resolve_ubuntu_mirrors() {
     log "Resolving Ubuntu mirror endpoints..."
-    
+
     local ubuntu_ips_v4=()
     local ubuntu_ips_v6=()
-    
+
     for host in archive.ubuntu.com security.ubuntu.com; do
         while IFS= read -r ip; do
             [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && ubuntu_ips_v4+=("$ip")
         done < <(dig +short "$host" A | grep -v '\.$')
-        
+
         while IFS= read -r ip; do
             [[ "$ip" =~ : ]] && ubuntu_ips_v6+=("$ip")
         done < <(dig +short "$host" AAAA | grep -v '\.$')
     done
-    
+
     if [[ ${#ubuntu_ips_v4[@]} -gt 0 ]]; then
         ok "Resolved ${#ubuntu_ips_v4[@]} Ubuntu mirror IPv4 addresses"
         for ip in "${ubuntu_ips_v4[@]}"; do
             nft add element inet attackbox ubuntu_ipv4 { "$ip" }
         done
     fi
-    
+
     if [[ ${#ubuntu_ips_v6[@]} -gt 0 ]]; then
         ok "Resolved ${#ubuntu_ips_v6[@]} Ubuntu mirror IPv6 addresses"
         for ip in "${ubuntu_ips_v6[@]}"; do
@@ -857,12 +946,12 @@ resolve_ubuntu_mirrors() {
 # Build and pre-pull bait before firewall
 prepare_bait() {
     log "Preparing bait containers..."
-    
+
     if [[ "$MODE" != "apply" ]]; then
         warn "Would build bait, install shipper, create secrets, and pre-pull images"
         return 0
     fi
-    
+
     # Install Compose project to /opt/attackbox
     local repo_root="${SCRIPT_DIR}/.."
     mkdir -p /opt/attackbox
@@ -870,17 +959,17 @@ prepare_bait() {
     cp "$repo_root/compose.gvisor.yaml" /opt/attackbox/
     cp "$repo_root/Dockerfile" /opt/attackbox/
     cp -r "$repo_root/docker" /opt/attackbox/
-    
+
     # Create secrets directory with safe permissions
     mkdir -p /opt/attackbox/secrets
     chmod 700 /opt/attackbox/secrets
-    
+
     # Create secrets if they don't exist (don't overwrite existing)
     if [[ ! -f /opt/attackbox/secrets/redaction.key ]]; then
         (umask 077; head -c 32 /dev/urandom | base64 > /opt/attackbox/secrets/redaction.key)
         ok "Generated redaction.key"
     fi
-    
+
     if [[ ! -f /opt/attackbox/secrets/server.crt ]] || [[ ! -f /opt/attackbox/secrets/server.key ]]; then
         (umask 077; openssl req -x509 -newkey rsa:2048 -nodes \
             -keyout /opt/attackbox/secrets/server.key \
@@ -888,7 +977,7 @@ prepare_bait() {
             -days 365 -subj "/CN=attackbox-proxy" 2>/dev/null)
         ok "Generated TLS certificate"
     fi
-    
+
     # Build bait image (dev tag for compose.yaml)
     if [[ -f "$repo_root/Dockerfile" ]]; then
         docker build -t attackbox-bait:dev "$repo_root"
@@ -897,19 +986,20 @@ prepare_bait() {
         err "Dockerfile not found in repository root"
         return 1
     fi
-    
+
     # Extract and install shipper binary from shipper-export target
     log "Installing shipper binary..."
-    docker build --target shipper-export --output type=local,dest=/tmp/shipper-build "$repo_root"
-    install -m 0755 -o root -g root /tmp/shipper-build/attackbox-shipper /usr/local/bin/attackbox-shipper
-    rm -f /tmp/shipper-build/attackbox-shipper
-    rmdir /tmp/shipper-build 2>/dev/null || true
+    local shipper_build
+    shipper_build=$(mktemp -d)
+    docker build --target shipper-export --output type=local,dest="$shipper_build" "$repo_root"
+    install -m 0755 -o root -g root "$shipper_build/attackbox-shipper" /usr/local/bin/attackbox-shipper
+    rm -rf "$shipper_build"
     ok "Installed attackbox-shipper binary"
-    
+
     # Pre-pull Chainguard nginx proxy with verified multi-arch digest
     docker pull cgr.dev/chainguard/nginx@sha256:c1642395cc75f39c931d66d939f7e78cbdf671d6cfd821616632b0639c3c6d63
     ok "Pre-pulled Chainguard nginx proxy"
-    
+
     # Pre-pull busybox verification image
     docker pull busybox@sha256:650fd573e056b679a5110a70aabeb01e26b76e545ec4b9c70a9523f2dfaf18c6
     ok "Pre-pulled busybox verification image"
@@ -918,12 +1008,12 @@ prepare_bait() {
 # Start bait service
 start_bait() {
     log "Starting bait service..."
-    
+
     if [[ "$MODE" != "apply" ]]; then
         warn "Would start bait service"
         return 0
     fi
-    
+
     systemctl enable attackbox
     systemctl start attackbox
     ok "Bait service started (Compose --wait ensures readiness)"
@@ -932,24 +1022,24 @@ start_bait() {
 # Enhanced verification
 run_verification_enhanced() {
     log "Running enhanced validation checks..."
-    
+
     if [[ "$(uname -s)" != "Linux" ]]; then
         err "Verification requires Linux"
         return 1
     fi
-    
+
     if ! command -v docker >/dev/null; then
         err "Verification requires Docker"
         return 1
     fi
-    
+
     # Use verified multi-arch busybox digest for tests
     # Verification: docker pull busybox:1.36.1
     # Command: docker inspect busybox:1.36.1 | jq -r '.[0].RepoDigests[] | select(contains("docker.io"))'
     # Digest: busybox@sha256:650fd573e056b679a5110a70aabeb01e26b76e545ec4b9c70a9523f2dfaf18c6
     # Multi-arch: linux/amd64, linux/arm64 verified 2024-03-xx
     local test_img="busybox@sha256:650fd573e056b679a5110a70aabeb01e26b76e545ec4b9c70a9523f2dfaf18c6"
-    
+
     # Derive actual Compose network name (attackbox_internal)
     local network
     network=$(docker network ls --format '{{.Name}}' | grep -E '^(attackbox_internal|opt-attackbox_internal)$' | head -1)
@@ -957,7 +1047,7 @@ run_verification_enhanced() {
         err "Compose internal network not found"
         return 1
     fi
-    
+
     # Test metadata blocking
     log "Testing metadata blocking from container..."
     if docker run --rm --runtime=runsc --network "$network" "$test_img" timeout 2 wget -O- http://169.254.169.254/ 2>&1 | grep -q "timed out\|Connection refused"; then
@@ -966,7 +1056,7 @@ run_verification_enhanced() {
         err "Metadata NOT blocked - required check failed"
         return 1
     fi
-    
+
     # Test internal Docker DNS (external DNS/NTP must be blocked from bait network)
     log "Testing internal Docker name resolution..."
     if docker run --rm --runtime=runsc --network "$network" "$test_img" nslookup attackbox-proxy >/dev/null 2>&1; then
@@ -975,7 +1065,7 @@ run_verification_enhanced() {
         err "Internal Docker DNS does NOT work - required check failed"
         return 1
     fi
-    
+
     # Verify external DNS is blocked
     log "Verifying external DNS blocked from bait network..."
     if ! docker run --rm --runtime=runsc --network "$network" "$test_img" timeout 2 nslookup google.com 1.1.1.1 >/dev/null 2>&1; then
@@ -984,7 +1074,7 @@ run_verification_enhanced() {
         err "External DNS NOT blocked - required check failed"
         return 1
     fi
-    
+
     # Test Internet blocked
     log "Testing Internet blocking from container..."
     if ! docker run --rm --runtime=runsc --network "$network" "$test_img" timeout 2 wget -O- https://example.com >/dev/null 2>&1; then
@@ -993,26 +1083,32 @@ run_verification_enhanced() {
         err "Internet NOT blocked - required check failed"
         return 1
     fi
-    
+
     # Test exact NR HTTPS endpoints as shipper UID with curl
     log "Testing New Relic HTTPS endpoints as shipper UID..."
     local nr_ok=0
-    
-    for host in "$NR_LOG_HOST" "$NR_METRIC_HOST"; do
-        local url="https://${host}"
-        if sudo -u "$SHIP_USER" timeout 5 curl -sf -o /dev/null "$url" 2>/dev/null || sudo -u "$SHIP_USER" timeout 5 curl -s -o /dev/null -w "%{http_code}" "$url" 2>/dev/null | grep -qE '^[0-9]{3}$'; then
-            ok "NR endpoint $host reachable"
-            nr_ok=$((nr_ok + 1))
-        fi
-    done
-    
+
+    # Test log-api.newrelic.com/log/v1
+    local log_url="https://${NR_LOG_HOST}/log/v1"
+    if sudo -u "$SHIP_USER" timeout 5 curl -s -o /dev/null -w "%{http_code}" "$log_url" 2>/dev/null | grep -qE '^[0-9]{3}$'; then
+        ok "NR log endpoint reachable"
+        nr_ok=$((nr_ok + 1))
+    fi
+
+    # Test metric-api.newrelic.com/metric/v1
+    local metric_url="https://${NR_METRIC_HOST}/metric/v1"
+    if sudo -u "$SHIP_USER" timeout 5 curl -s -o /dev/null -w "%{http_code}" "$metric_url" 2>/dev/null | grep -qE '^[0-9]{3}$'; then
+        ok "NR metric endpoint reachable"
+        nr_ok=$((nr_ok + 1))
+    fi
+
     if [[ $nr_ok -eq 2 ]]; then
         ok "Both NR endpoints reachable"
     else
         err "Not all NR endpoints reachable - required check failed"
         return 1
     fi
-    
+
     ok "All verification checks passed"
 }
 # Main execution
@@ -1035,6 +1131,8 @@ main() {
     setup_docker
     setup_gvisor
     setup_falco
+    bootstrap_firewall
+    start_docker
     prepare_bait
     setup_firewall
     setup_sysctl

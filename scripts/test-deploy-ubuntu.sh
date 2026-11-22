@@ -47,10 +47,16 @@ test_verification_derives_network() { grep -q "docker network ls.*grep.*attackbo
 test_verification_runsc() { grep -q "docker run.*--runtime=runsc.*--network" "$DEPLOY_SCRIPT"; }
 test_verification_internal_dns() { grep -q "nslookup attackbox-proxy" "$DEPLOY_SCRIPT"; }
 test_verification_external_dns_blocked() { grep -q "External DNS blocked" "$DEPLOY_SCRIPT"; }
-test_verification_curl_nr() { grep -q "sudo.*curl" "$DEPLOY_SCRIPT" && grep -q 'url="https.*host' "$DEPLOY_SCRIPT"; }
+test_verification_curl_nr() { grep -q "sudo.*curl.*log_url\|metric_url" "$DEPLOY_SCRIPT"; }
 test_verification_before_ssh() { local ver_line=$(grep -n "run_verification_enhanced" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:run_verification_enhanced()" | tail -1 | cut -d: -f1); local ssh_line=$(grep -n "disable_ssh" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:disable_ssh()" | head -1 | cut -d: -f1); [[ -n "$ver_line" && -n "$ssh_line" && "$ver_line" -lt "$ssh_line" ]]; }
 test_no_host_attackbox_binary() { ! grep -q '"/usr/local/bin/attackbox"' "$DEPLOY_SCRIPT"; }
 test_busybox_prepull() { grep -q "docker pull busybox@sha256:" "$DEPLOY_SCRIPT"; }
+test_bootstrap_before_docker() { local boot_line=$(grep -n "bootstrap_firewall" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:bootstrap_firewall()" | head -1 | cut -d: -f1); local dock_line=$(grep -n "start_docker" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:start_docker()" | head -1 | cut -d: -f1); [[ -n "$boot_line" && -n "$dock_line" && "$boot_line" -lt "$dock_line" ]]; }
+test_docker_before_prepare() { local dock_line=$(grep -n "start_docker" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:start_docker()" | head -1 | cut -d: -f1); local prep_line=$(grep -n "prepare_bait" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:prepare_bait()" | head -1 | cut -d: -f1); [[ -n "$dock_line" && -n "$prep_line" && "$dock_line" -lt "$prep_line" ]]; }
+test_prepare_before_final_firewall() { local prep_line=$(grep -n "^[[:space:]]*prepare_bait$" "$DEPLOY_SCRIPT" | head -1 | cut -d: -f1); local fw_line=$(grep -n "^[[:space:]]*setup_firewall$" "$DEPLOY_SCRIPT" | head -1 | cut -d: -f1); [[ -n "$prep_line" && -n "$fw_line" && "$prep_line" -lt "$fw_line" ]]; }
+test_attackbox_service_in_units() { grep -q '"attackbox.service"' "$DEPLOY_SCRIPT"; }
+test_nr_exact_paths() { grep -q '/log/v1' "$DEPLOY_SCRIPT" && grep -q '/metric/v1' "$DEPLOY_SCRIPT"; }
+test_mktemp_shipper_build() { ! grep -q '/tmp/shipper-build' "$DEPLOY_SCRIPT"; }
 main() {
     echo "Attack-box deployment test suite - Full Semantic Controls"; echo "=========================================================="
     [[ ! -f "$DEPLOY_SCRIPT" ]] && { echo -e "${RED}✗${NC} Deploy script not found"; exit 1; }
@@ -100,6 +106,12 @@ main() {
     run_test "Verification before SSH" test_verification_before_ssh
     run_test "No host attackbox binary" test_no_host_attackbox_binary
     run_test "Busybox prepull" test_busybox_prepull
+    run_test "Bootstrap before Docker" test_bootstrap_before_docker
+    run_test "Docker before prepare" test_docker_before_prepare
+    run_test "Prepare before final firewall" test_prepare_before_final_firewall
+    run_test "attackbox.service in units" test_attackbox_service_in_units
+    run_test "NR exact paths" test_nr_exact_paths
+    run_test "mktemp shipper build" test_mktemp_shipper_build
     echo ""; echo "=========================================================="; echo "Test Results"; echo "=========================================================="
     echo "Tests run:    $TESTS_RUN"; echo -e "Tests passed: ${GREEN}$TESTS_PASSED${NC}"
     if [[ $TESTS_FAILED -gt 0 ]]; then echo -e "Tests failed: ${RED}$TESTS_FAILED${NC}"; exit 1; else echo -e "Tests failed: 0"; echo ""; echo -e "${GREEN}✓${NC} All tests passed"; exit 0; fi
