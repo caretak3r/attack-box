@@ -10,10 +10,7 @@ services:
     # Non-root user 65532:65532 (Chainguard nonroot, matches host abx-bait group)
     user: "65532:65532"
     
-    # gVisor runtime for additional isolation
-    # NOTE: Only runc is available on this host; runsc execution blocked
-    # This directive is included for deployment to hosts with gVisor installed
-    runtime: runsc
+    # gVisor: layer compose.gvisor.yaml on hosts that have runsc installed
     
     # Read-only root filesystem
     read_only: true
@@ -47,9 +44,14 @@ services:
         target: /run/attackbox
         read_only: true
 
-    # Redaction secret
+    # Redaction secret. readSecret rejects any group/other mode bit and bait
+    # runs as 65532, so the file must be owned by 65532 with mode 0400.
     secrets:
-      - attackbox_secret
+      - source: attackbox_secret
+        target: attackbox_secret
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
 
     # Environment configuration
     environment:
@@ -177,9 +179,13 @@ services:
     secrets:
       - source: proxy_tls_cert
         target: /etc/nginx/ssl/server.crt
+        uid: "65532"
+        gid: "65532"
         mode: 0400
       - source: proxy_tls_key
         target: /etc/nginx/ssl/server.key
+        uid: "65532"
+        gid: "65532"
         mode: 0400
 
     # Publish on loopback only: map unprivileged internal ports to host
@@ -253,4 +259,5 @@ secrets:
 # 7. Only intended /run/attackbox mount (read-only)
 # 8. Published ports default to loopback (127.0.0.1)
 # 9. gVisor (runsc) runtime is a hard requirement for production deployment
+#    (apply it with: docker compose -f compose.yaml -f compose.gvisor.yaml up -d)
 # 10. Local log driver for bounded disk usage

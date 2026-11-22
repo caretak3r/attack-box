@@ -1,0 +1,10 @@
+# gVisor override. Usage:
+#   docker compose -f compose.yaml -f compose.gvisor.yaml up -d
+#
+# Requires runsc registered with Docker (see docker/README.md).
+# The bait connects to the host shipper's unix socket through a bind mount.
+# gVisor blocks host unix sockets by default: run runsc with --host-uds=open
+# (or --host-uds=create) or the spool connection fails.
+services:
+  bait:
+    runtime: runsc

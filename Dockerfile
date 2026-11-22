@@ -10,25 +10,44 @@ COPY go.mod go.sum* ./
 RUN go mod download
 COPY . .
 
-# Build static binary with security flags
+# Build static binaries with security flags
 # CGO_ENABLED=0: pure Go, no C dependencies
 # -trimpath: remove local path information
 # -ldflags='-s -w': strip debug info and symbol table
+# Output goes under /work (writable by the builder user), not /bin.
 RUN CGO_ENABLED=0 go build \
     -trimpath \
     -ldflags='-s -w -X main.version=container' \
-    -o /bin/attackbox \
+    -o /work/out/attackbox \
     ./cmd/attackbox
+
+# Shipper stage: the shipper runs on the HOST, not in a container.
+# Build only the binary and export it:
+#   docker build --target shipper-export --output type=local,dest=./dist .
+# Or build the image with `--target shipper` and copy /attackbox-shipper out.
+FROM builder AS shipper-build
+RUN CGO_ENABLED=0 go build \
+    -trimpath \
+    -ldflags='-s -w -X main.version=container' \
+    -o /work/out/attackbox-shipper \
+    ./cmd/attackbox-shipper
+
+FROM scratch AS shipper-export
+COPY --from=shipper-build /work/out/attackbox-shipper /attackbox-shipper
+
+FROM cgr.dev/chainguard/static@sha256:8658e9eaeb2294fa0e49b0667f7d66b4e21fa7690b8d2a4c30cd1d013ceb9eb7 AS shipper
+COPY --from=shipper-build /work/out/attackbox-shipper /attackbox-shipper
+ENTRYPOINT ["/attackbox-shipper"]
 
 # Runtime stage: Chainguard static (distroless, no shell)
 # Verification: docker pull cgr.dev/chainguard/static:latest
 # Command output: Digest: sha256:8658e9eaeb2294fa0e49b0667f7d66b4e21fa7690b8d2a4c30cd1d013ceb9eb7
-FROM cgr.dev/chainguard/static@sha256:8658e9eaeb2294fa0e49b0667f7d66b4e21fa7690b8d2a4c30cd1d013ceb9eb7
+FROM cgr.dev/chainguard/static@sha256:8658e9eaeb2294fa0e49b0667f7d66b4e21fa7690b8d2a4c30cd1d013ceb9eb7 AS bait
 
 # Non-root UID/GID 65532 (Chainguard nonroot)
 USER 65532:65532
 
-COPY --from=builder --chown=65532:65532 /bin/attackbox /attackbox
+COPY --from=builder --chown=65532:65532 /work/out/attackbox /attackbox
 
 # Built-in healthcheck support via -healthcheck flag
 ENTRYPOINT ["/attackbox"]
