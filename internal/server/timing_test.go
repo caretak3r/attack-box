@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -191,6 +192,13 @@ func TestTimingOffByDefault(t *testing.T) {
 	}
 	if got := r.clk.recorded(); len(got) != 0 {
 		t.Fatalf("zero Timing waited %v", got)
+	}
+}
+
+func TestTimingRejectsNaNJitter(t *testing.T) {
+	tm := Timing{PerChunk: time.Millisecond, Jitter: math.NaN()}
+	if _, err := tm.normalize(); err == nil {
+		t.Fatal("normalize accepted NaN Jitter")
 	}
 }
 

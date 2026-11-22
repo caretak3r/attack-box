@@ -431,12 +431,17 @@ func (c *call) wait(total, every time.Duration, idle func() bool) bool {
 		if idle != nil && step > every {
 			step = every
 		}
+		timer := s.cfg.After(step)
 		select {
-		case <-s.cfg.After(step):
+		case <-timer:
 		case <-ctx.Done():
-			result = "client_closed"
-			if errors.Is(context.Cause(ctx), ErrShutdown) {
-				result = holdServerShutdown
+			// Both can be ready at once and select picks at random. A hold
+			// that ran its full duration is complete, whatever came after.
+			if step < remaining || !ready(timer) {
+				result = "client_closed"
+				if errors.Is(context.Cause(ctx), ErrShutdown) {
+					result = holdServerShutdown
+				}
 			}
 		}
 		if result != "completed" {
@@ -451,6 +456,16 @@ func (c *call) wait(total, every time.Duration, idle func() bool) bool {
 	c.holdResult = result
 	c.holdMS = s.cfg.Now().Sub(began).Milliseconds()
 	return result == "completed"
+}
+
+// ready reports whether ch has a value or is closed, without blocking.
+func ready(ch <-chan time.Time) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
 }
 
 // ErrShutdown is the cancel cause the process puts on the http.Server base

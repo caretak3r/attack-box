@@ -3,6 +3,7 @@ package telemetry
 import (
 	"bytes"
 	"context"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -87,6 +88,38 @@ func TestAsyncStalledLocalDoesNotBlockFanOut(t *testing.T) {
 	if err := local.Close(context.Background()); err == nil || !strings.Contains(err.Error(), "dropped") {
 		t.Errorf("Close after drops = %v", err)
 	}
+}
+
+// TestAsyncReportsDropsAtRuntime checks that a drop shows up in the local log
+// once the writer recovers, not only in the error from Close.
+func TestAsyncReportsDropsAtRuntime(t *testing.T) {
+	w := &stallWriter{release: make(chan struct{})}
+	local := NewAsync(NewJSONLog(w), 1)
+	for i := 0; i < 6; i++ {
+		local.Emit(Event{Action: "x"})
+	}
+	dropped := local.Dropped()
+	if dropped == 0 {
+		t.Fatal("nothing dropped")
+	}
+	close(w.release)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		w.mu.Lock()
+		out := w.buf.String()
+		w.mu.Unlock()
+		if strings.Contains(out, `"action":"local_dropped"`) {
+			if !strings.Contains(out, `"dropped_total":`+strconv.FormatInt(dropped, 10)) {
+				t.Errorf("report has the wrong count, want %d:\n%s", dropped, out)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("drops never reported before Close:\n%s", out)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	local.Close(context.Background())
 }
 
 func TestAsyncOwnsTaskLabels(t *testing.T) {
