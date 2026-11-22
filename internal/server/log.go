@@ -65,20 +65,12 @@ func (s *Server) finish(c *call) {
 	if c.streamCut != "" {
 		attrs["stream_result"] = c.streamCut
 	}
-	obs := c.obs
 	var labels []string
 	task, probeID, sessionID := "", "", c.sessionID
 	if d := c.dec; d != nil {
 		sessionID = d.SessionID
 		task, probeID, labels = d.Class.Task, d.Probe.ID, d.Class.Labels
 		attrs["task"] = task
-		if len(d.Declarations) > 0 {
-			attrs["declarations"] = d.Declarations
-		}
-		obs = append(append([]responder.Observation(nil), d.Observations...), obs...)
-	}
-	if len(obs) > 0 {
-		attrs["observations"] = obs
 	}
 
 	attrs["direction"] = "request"
@@ -135,9 +127,101 @@ func (s *Server) finish(c *call) {
 			"persona": s.persona, "probe_id": probeID, "task": task,
 		}))
 	}
+	if c.dec != nil || len(c.obs) > 0 {
+		s.emitProbe(c, now, sessionID, ua, resource, result, status)
+	}
+	route := telemetry.SafeLabels(map[string]string{"persona": s.persona, "endpoint": c.endpoint})
 	s.cfg.Sink.Count("attackbox.requests", 1, telemetry.SafeLabels(map[string]string{
 		"persona": s.persona, "endpoint": c.endpoint, "status_class": strconv.Itoa(status/100) + "xx",
 	}))
+	s.cfg.Sink.Count("attackbox.request_bytes", float64(len(c.body)), route)
+	s.cfg.Sink.Count("attackbox.response_bytes", float64(c.w.n), route)
+	if c.disconnected(status) {
+		s.cfg.Sink.Gauge("attackbox.stream_disconnect_seconds", now.Sub(c.start).Seconds(), route)
+	}
+}
+
+// disconnected reports whether the client left before the response ended.
+func (c *call) disconnected(status int) bool {
+	return status == 499 || c.holdResult == "client_closed" || c.streamCut == "client_closed"
+}
+
+// emitProbe writes the probe stream record: the gate issued, the session's
+// behavioral gate and nonce, declarations, follow-up and concurrency
+// observations, and hold, retry and disconnect timing. It also feeds the
+// session and probe metrics, which carry only bounded labels.
+func (s *Server) emitProbe(c *call, now time.Time, sessionID, ua, resource, result string, status int) {
+	persona := telemetry.SafeLabels(map[string]string{"persona": s.persona})
+	attrs := map[string]any{"route": c.endpoint}
+	action, probeID := "status_hit", ""
+	obs := c.obs
+	if d := c.dec; d != nil {
+		action, probeID = "decision", d.Probe.ID
+		attrs["ticket"] = d.Ticket
+		attrs["nonce"] = d.Nonce
+		attrs["behavior"] = d.Behavior
+		attrs["new_session"] = d.NewSession
+		attrs["session_age_ms"] = d.SessionAge.Milliseconds()
+		if d.Probe.Hold != "" {
+			attrs["hold"] = d.Probe.Hold
+		}
+		if d.Probe.Status != 0 {
+			attrs["probe_status"] = d.Probe.Status
+			attrs["retry_after"] = d.Probe.RetryAfter
+		}
+		if len(d.Declarations) > 0 {
+			attrs["declarations"] = d.Declarations
+		}
+		obs = append(append([]responder.Observation(nil), d.Observations...), obs...)
+		if d.NewSession {
+			s.cfg.Sink.Count("attackbox.sessions", 1, persona)
+		}
+		s.cfg.Sink.Gauge("attackbox.session_duration_seconds", d.SessionAge.Seconds(), persona)
+	}
+	for _, o := range obs {
+		switch {
+		case c.dec != nil && o.ProbeID == c.dec.Followup:
+			attrs["followup"] = o.ProbeID
+			s.cfg.Sink.Count("attackbox.probe_followups", 1, telemetry.SafeLabels(map[string]string{
+				"persona": s.persona, "probe_id": o.ProbeID,
+			}))
+			if o.ProbeID == "retry" {
+				s.cfg.Sink.Gauge("attackbox.retry_delay_seconds", float64(o.DelayMS)/1000, persona)
+			}
+		case o.ProbeID == "concurrency" && o.Result["active"] != "":
+			if n, err := strconv.Atoi(o.Result["active"]); err == nil {
+				s.cfg.Sink.Gauge("attackbox.concurrent_status_requests", float64(n), persona)
+			}
+		}
+	}
+	if len(obs) > 0 {
+		attrs["observations"] = obs
+	}
+	if c.holdResult != "" {
+		attrs["hold_result"] = c.holdResult
+		attrs["hold_ms"] = c.holdMS
+	}
+	if c.streamCut != "" {
+		attrs["stream_result"] = c.streamCut
+	}
+	if c.disconnected(status) {
+		attrs["disconnect_ms"] = now.Sub(c.start).Milliseconds()
+	}
+	s.cfg.Sink.Emit(telemetry.Event{
+		Timestamp: now,
+		Stream:    telemetry.StreamProbe,
+		SessionID: sessionID,
+		RequestID: c.id,
+		SrcIP:     c.src,
+		UserAgent: ua,
+		Persona:   s.persona,
+		Action:    action,
+		Resource:  resource,
+		Result:    result,
+		Status:    status,
+		ProbeID:   probeID,
+		Attrs:     attrs,
+	})
 }
 
 // logRedactMargin is how far past MaxLogBody the redactor still looks. Redaction

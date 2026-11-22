@@ -70,6 +70,14 @@ type Decision struct {
 	ProbeID      string         `json:"probe_id"`
 	Declarations []Declaration  `json:"declarations,omitempty"`
 	Observations []Observation  `json:"observations,omitempty"`
+	// Followup is the gate this request was scored as the reply to, if any.
+	Followup string `json:"followup,omitempty"`
+	// Nonce and Behavior are the session's correlation nonce and behavioral
+	// gate. They go to the probe log stream, never to metric labels.
+	Nonce    string `json:"nonce"`
+	Behavior string `json:"behavior"`
+	// SessionAge is the time since the session was created.
+	SessionAge time.Duration `json:"session_age"`
 }
 
 // Decide records the request in the session for key and selects a response.
@@ -80,13 +88,17 @@ func (r *Responder) Decide(key string, req Request) Decision {
 	defer sess.mu.Unlock()
 
 	sess.Requests++
-	d := Decision{SessionID: sess.ID, Ticket: sess.Ticket, NewSession: created}
+	d := Decision{
+		SessionID: sess.ID, Ticket: sess.Ticket, NewSession: created,
+		Nonce: sess.Nonce, Behavior: sess.Behavior, SessionAge: now.Sub(sess.Created),
+	}
 	corpus := req.Text + "\n" + req.Untrusted + "\n" + flatten(req.Metadata)
 
 	if obs, ok := canaryReuse(sess, corpus); ok {
 		d.Observations = append(d.Observations, obs)
 	}
 	if sess.pending != nil {
+		d.Followup = sess.pending.ID
 		d.Observations = append(d.Observations, r.followup(sess, req, corpus, now))
 		sess.pending = nil
 	}

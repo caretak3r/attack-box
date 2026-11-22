@@ -311,7 +311,10 @@ func TestMetricLabelHygiene(t *testing.T) {
 	}
 	endpoints := map[string]bool{}
 	for _, c := range r.sink.counts {
-		if c.name != "attackbox.requests" && c.name != "attackbox.probes" {
+		switch c.name {
+		case "attackbox.requests", "attackbox.probes", "attackbox.sessions", "attackbox.probe_followups",
+			"attackbox.request_bytes", "attackbox.response_bytes":
+		default:
 			t.Fatalf("unexpected metric %q", c.name)
 		}
 		for k, v := range c.attrs {

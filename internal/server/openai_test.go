@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"attackbox/internal/responder"
+	"attackbox/internal/telemetry"
 )
 
 func TestOpenAIModels(t *testing.T) {
@@ -334,6 +335,17 @@ func TestHoldClientDisconnect(t *testing.T) {
 		if !stream && (edge.Status != 499 || edge.Result != "client_closed") {
 			t.Fatalf("status = %d result = %q", edge.Status, edge.Result)
 		}
+		probes := r.sink.stream(telemetry.StreamProbe)
+		p := probes[len(probes)-1]
+		if p.Attrs["hold_result"] != "client_closed" || p.Attrs["hold"] != "silent" {
+			t.Fatalf("stream=%v probe attrs = %v", stream, p.Attrs)
+		}
+		if _, ok := p.Attrs["disconnect_ms"]; !ok {
+			t.Fatalf("stream=%v probe has no disconnect_ms: %v", stream, p.Attrs)
+		}
+		if g := r.sink.metric("attackbox.stream_disconnect_seconds", true); len(g) != 1 {
+			t.Fatalf("stream=%v disconnect gauges = %v", stream, g)
+		}
 	}
 }
 
@@ -434,7 +446,14 @@ func TestEdgeStatusOverlap(t *testing.T) {
 		}
 	}
 	peak := 0
-	for _, e := range r.sink.edges("request") {
+	probes := r.sink.stream(telemetry.StreamProbe)
+	if len(probes) != 4 {
+		t.Fatalf("%d probe events, want 4", len(probes))
+	}
+	for _, e := range probes {
+		if e.Action != "status_hit" || e.SessionID == "" {
+			t.Fatalf("probe event = %+v", e)
+		}
 		obs, _ := e.Attrs["observations"].([]responder.Observation)
 		for _, o := range obs {
 			if o.ProbeID != "concurrency" {
@@ -449,5 +468,12 @@ func TestEdgeStatusOverlap(t *testing.T) {
 	}
 	if peak != 4 {
 		t.Fatalf("peak overlap = %d, want 4", peak)
+	}
+	active := 0.0
+	for _, g := range r.sink.metric("attackbox.concurrent_status_requests", true) {
+		active = max(active, g.value)
+	}
+	if active != 4 {
+		t.Fatalf("concurrent_status_requests max = %v, want 4", active)
 	}
 }

@@ -33,6 +33,7 @@ type memSink struct {
 	mu     sync.Mutex
 	events []telemetry.Event
 	counts []count
+	gauges []count
 }
 
 func (m *memSink) Emit(e telemetry.Event) {
@@ -47,7 +48,28 @@ func (m *memSink) Count(name string, v float64, attrs map[string]string) {
 	m.counts = append(m.counts, count{name, v, attrs})
 }
 
-func (m *memSink) Gauge(string, float64, map[string]string) {}
+func (m *memSink) Gauge(name string, v float64, attrs map[string]string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.gauges = append(m.gauges, count{name, v, attrs})
+}
+
+// metric returns the recorded counters (or gauges) called name.
+func (m *memSink) metric(name string, gauge bool) []count {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	src := m.counts
+	if gauge {
+		src = m.gauges
+	}
+	var out []count
+	for _, c := range src {
+		if c.name == name {
+			out = append(out, c)
+		}
+	}
+	return out
+}
 
 func (m *memSink) stream(name string) []telemetry.Event {
 	m.mu.Lock()

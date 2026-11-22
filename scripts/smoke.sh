@@ -91,6 +91,11 @@ expect "log edge events" '"stream":"edge"' "$log"
 expect "log request capture" '"direction":"request"' "$log"
 expect "log response capture" '"direction":"response"' "$log"
 expect "log sse response body" 'data: [DONE]' "$(grep '"direction":"response"' "$work/attackbox.log")"
+expect "log probe stream" '"stream":"probe"' "$log"
+expect "log probe nonce" '"nonce":"' "$(grep '"stream":"probe"' "$work/attackbox.log")"
+for m in requests probes sessions probe_followups request_bytes response_bytes session_duration_seconds; do
+	expect "metric attackbox.$m" "\"name\":\"attackbox.$m\"" "$log"
+done
 [[ "$log" != *"sk-smoke-not-a-real-key"* ]] || fail "raw bearer token in log"
 echo "smoke: ok   bearer token redacted"
 echo "smoke: PASS"
