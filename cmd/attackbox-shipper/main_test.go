@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -195,7 +196,7 @@ func TestDrainAcksOnlyAfterDelivery(t *testing.T) {
 	// Drain should deliver both and Ack
 	done := make(chan error, 1)
 	go func() {
-		done <- drain(ctx, q, nr, false, 0, time.Second)
+		done <- drain(ctx, q, nr, false, 0)
 	}()
 
 	time.Sleep(500 * time.Millisecond)
@@ -273,15 +274,16 @@ func TestDrainFailureLeavesPrefixUnacknowledged(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- drain(ctx, q, nr, false, 0, time.Second)
+		done <- drain(ctx, q, nr, false, 0)
 	}()
 
 	time.Sleep(500 * time.Millisecond)
 	cancel()
 	<-done
 
-	// First record should have failed and been Rewound
-	// After restart, all three should still be there
+	// First record retries after 1s backoff and succeeds before the 1s mark,
+	// so it's accepted before full cancellation and should be Ack'd.
+	// Records 2 and 3 were never attempted, so they remain unacknowledged.
 	q2, rec2, err := shipper.OpenQueue(qcfg)
 	if err != nil {
 		t.Fatal(err)
@@ -296,8 +298,8 @@ func TestDrainFailureLeavesPrefixUnacknowledged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 3 {
-		t.Fatalf("got %d unacknowledged entries, want 3", len(entries))
+	if len(entries) != 2 {
+		t.Fatalf("got %d unacknowledged entries, want 2 (first was accepted before cancel)", len(entries))
 	}
 }
 
@@ -368,7 +370,7 @@ func TestUncertainRecoveryEmitsGap(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- drain(ctx, q2, nr, rec2.Uncertain, seqs[0], time.Second)
+		done <- drain(ctx, q2, nr, rec2.Uncertain, seqs[0])
 	}()
 
 	time.Sleep(500 * time.Millisecond)
@@ -414,10 +416,11 @@ func TestChunkPreservation(t *testing.T) {
 	defer q.Close()
 
 	// Create a large body that will be chunked
-	largeBody := string(make([]byte, 20000))
-	for i := range largeBody {
-		largeBody = string(append([]byte(largeBody[:i]), byte('a'+i%26)))
+	largeBody := ""
+	for i := range 20000 {
+		largeBody += string(byte('a' + i%26))
 	}
+	expectedSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(largeBody)))
 
 	rec := telemetry.Record{
 		ID: "0123456789abcdef-1",
@@ -454,7 +457,7 @@ func TestChunkPreservation(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- drain(ctx, q, nr, false, 0, time.Second)
+		done <- drain(ctx, q, nr, false, 0)
 	}()
 
 	time.Sleep(500 * time.Millisecond)
@@ -469,13 +472,16 @@ func TestChunkPreservation(t *testing.T) {
 		t.Fatalf("expected at least 2 chunks, got %d", len(fake.logs))
 	}
 
-	// All chunks should have the same body_sha256
+	// All chunks should have the same body_sha256 matching the original
 	var bodySHA256 string
 	for i, log := range fake.logs {
 		if i == 0 {
 			bodySHA256 = log.BodySHA256
 			if bodySHA256 == "" {
 				t.Fatal("first chunk missing body_sha256")
+			}
+			if bodySHA256 != expectedSHA {
+				t.Fatalf("body_sha256 %q does not match actual SHA-256 %q", bodySHA256, expectedSHA)
 			}
 		} else {
 			if log.BodySHA256 != bodySHA256 {
@@ -544,7 +550,7 @@ func TestDecodeRegression(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- drain(ctx, q, nr, false, 0, time.Second)
+		done <- drain(ctx, q, nr, false, 0)
 	}()
 
 	time.Sleep(500 * time.Millisecond)
@@ -627,7 +633,7 @@ func TestShipperIntegration(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- drain(ctx, q, nr, false, 0, time.Second)
+		done <- drain(ctx, q, nr, false, 0)
 	}()
 
 	time.Sleep(500 * time.Millisecond)
@@ -794,4 +800,184 @@ func waitForSocket(t *testing.T, path string) {
 		fi, err := os.Lstat(path)
 		return err == nil && fi.Mode().Type() == os.ModeSocket
 	})
+}
+
+func TestSixStreams(t *testing.T) {
+	dir := t.TempDir()
+	qcfg := shipper.QueueConfig{
+		Dir:          filepath.Join(dir, "queue"),
+		SegmentBytes: 1 << 20,
+		MaxBytes:     10 << 20,
+		RoleBytes:    map[shipper.Role]int64{shipper.RoleBait: 10 << 20},
+		MaxPayload:   telemetry.MinPayloadBytes - shipper.FrameHeader,
+	}
+	q, _, err := shipper.OpenQueue(qcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+
+	// Enqueue one event for each of the six streams
+	streams := []string{
+		telemetry.StreamEdge,
+		telemetry.StreamTranscript,
+		telemetry.StreamProbe,
+		telemetry.StreamEgress,
+		telemetry.StreamRuntime,
+		telemetry.StreamHeartbeat,
+	}
+	var items []shipper.Item
+	for _, stream := range streams {
+		rec := telemetry.Record{
+			ID: fmt.Sprintf("six-stream-%s", stream),
+			Event: &telemetry.Event{
+				Stream:    stream,
+				Action:    fmt.Sprintf("test_%s", stream),
+				Timestamp: time.Now(),
+			},
+		}
+		data, _ := json.Marshal(rec)
+		items = append(items, shipper.Item{Role: shipper.RoleBait, Data: data})
+	}
+
+	if _, err := q.Append(items); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeNewRelic{t: t}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+
+	nr, err := telemetry.NewNewRelic(telemetry.NRConfig{
+		LicenseKey: "0123456789abcdef0123456789abcdef01234567",
+		LogURL:     srv.URL,
+		MetricURL:  srv.URL,
+		QueueSize:  100,
+		Now:        time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nr.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- drain(ctx, q, nr, false, 0)
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+	<-done
+
+	fake.mu.Lock()
+	receivedStreams := make(map[string]int)
+	for _, e := range fake.logs {
+		receivedStreams[e.Stream]++
+	}
+	fake.mu.Unlock()
+
+	for _, stream := range streams {
+		if receivedStreams[stream] != 1 {
+			t.Errorf("stream %s: got %d events, want 1", stream, receivedStreams[stream])
+		}
+	}
+
+	if len(fake.logs) != 6 {
+		t.Errorf("got %d total events, want 6", len(fake.logs))
+	}
+}
+
+func TestFullMetric(t *testing.T) {
+	dir := t.TempDir()
+	qcfg := shipper.QueueConfig{
+		Dir:          filepath.Join(dir, "queue"),
+		SegmentBytes: 1 << 20,
+		MaxBytes:     10 << 20,
+		RoleBytes:    map[shipper.Role]int64{shipper.RoleBait: 10 << 20},
+		MaxPayload:   telemetry.MinPayloadBytes - shipper.FrameHeader,
+	}
+	q, _, err := shipper.OpenQueue(qcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+
+	// Enqueue metrics covering the expected set for the shipper
+	metrics := []struct {
+		name string
+		kind string
+	}{
+		{"attackbox.queue.bytes", "gauge"},
+		{"attackbox.queue.entries", "gauge"},
+		{"attackbox.admitted", "count"},
+		{"attackbox.dropped", "count"},
+		{"attackbox.delivered", "count"},
+		{"attackbox.delivery_errors", "count"},
+	}
+	var items []shipper.Item
+	for _, m := range metrics {
+		rec := telemetry.Record{
+			ID: fmt.Sprintf("metric-%s", m.name),
+			Metric: &telemetry.MetricRecord{
+				Name:  m.name,
+				Kind:  m.kind,
+				Value: 1,
+				At:    time.Now(),
+			},
+		}
+		data, _ := json.Marshal(rec)
+		items = append(items, shipper.Item{Role: shipper.RoleBait, Data: data})
+	}
+
+	if _, err := q.Append(items); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := &fakeNewRelic{t: t}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+
+	nr, err := telemetry.NewNewRelic(telemetry.NRConfig{
+		LicenseKey: "0123456789abcdef0123456789abcdef01234567",
+		LogURL:     srv.URL,
+		MetricURL:  srv.URL,
+		QueueSize:  100,
+		Now:        time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nr.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- drain(ctx, q, nr, false, 0)
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+	<-done
+
+	fake.mu.Lock()
+	receivedMetrics := make(map[string]int)
+	for _, m := range fake.metrics {
+		receivedMetrics[m.Name]++
+	}
+	fake.mu.Unlock()
+
+	for _, m := range metrics {
+		if receivedMetrics[m.name] != 1 {
+			t.Errorf("metric %s: got %d, want 1", m.name, receivedMetrics[m.name])
+		}
+	}
+
+	if len(fake.metrics) != len(metrics) {
+		t.Errorf("got %d total metrics, want %d", len(fake.metrics), len(metrics))
+	}
 }

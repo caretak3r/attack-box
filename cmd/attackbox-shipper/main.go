@@ -214,7 +214,7 @@ func run(ctx context.Context, cfg config, stderr io.Writer) error {
 	drainDone := make(chan error, 1)
 	ingestDone := make(chan error, 1)
 	go func() {
-		drainDone <- drain(runCtx, q, nr, rec.Uncertain, rec.UncertainThrough, cfg.shutdownTimeout/2)
+		drainDone <- drain(runCtx, q, nr, rec.Uncertain, rec.UncertainThrough)
 	}()
 	go func() {
 		ingestDone <- ing.Serve(runCtx)

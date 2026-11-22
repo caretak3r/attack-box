@@ -39,14 +39,14 @@ const (
 // entry stays in memory and is retried; nothing behind it is delivered or
 // acknowledged first. Uncertain recovery suppresses metrics up to
 // uncertainThrough to avoid double-counting.
-func drain(ctx context.Context, q drainQueue, nr drainSink, uncertain bool, uncertainThrough uint64, timeout time.Duration) error {
+func drain(ctx context.Context, q drainQueue, nr drainSink, uncertain bool, uncertainThrough uint64) error {
 	var skipThrough uint64
 	if uncertain {
 		skipThrough = uncertainThrough
-		// Signal the suppressed range; losing this signal must not stop the drain.
-		_ = nr.ShipMetric("attackbox.metric_replay_gap", "gauge", 1, time.Now(), map[string]string{
-			"uncertain_through": fmt.Sprintf("%d", uncertainThrough),
-		})
+		// Signal the suppressed range.
+		if err := nr.ShipMetric("attackbox.metric_replay_gap", "gauge", 1, time.Now(), nil); err != nil {
+			return fmt.Errorf("failed to emit metric_replay_gap: %w", err)
+		}
 	}
 
 	var (
@@ -121,8 +121,8 @@ func drain(ctx context.Context, q drainQueue, nr drainSink, uncertain bool, unce
 // deliver hands entries to the sink in order and returns how many were taken
 // from the front. blocked reports that the sink failed an item, so the rest
 // must wait. Metrics at or below skipThrough are taken but not shipped. A
-// delivery that finishes after ctx is done is not counted, so shutdown never
-// acknowledges it. err is set for a payload that does not decode.
+// delivery that succeeded counts even if ctx ended during the call, but
+// nothing after it is attempted. err is set for a payload that does not decode.
 func deliver(ctx context.Context, nr drainSink, entries []shipper.Entry, skipThrough uint64) (n int, blocked bool, err error) {
 	for _, e := range entries {
 		if ctx.Err() != nil {
@@ -142,9 +142,6 @@ func deliver(ctx context.Context, nr drainSink, entries []shipper.Entry, skipThr
 			if err := nr.ShipMetric(m.Name, m.Kind, m.Value, m.At, m.Attrs); err != nil {
 				return n, true, nil
 			}
-		}
-		if ctx.Err() != nil {
-			return n, false, nil
 		}
 		n++
 	}

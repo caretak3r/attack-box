@@ -124,7 +124,7 @@ func runDrain(t *testing.T, q drainQueue, s drainSink, uncertain bool, through u
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- drain(ctx, q, s, uncertain, through, time.Second) }()
+	go func() { done <- drain(ctx, q, s, uncertain, through) }()
 	return func() error {
 		cancel()
 		select {
@@ -200,7 +200,7 @@ func TestDrainRetriesRefusedEventWithBackoff(t *testing.T) {
 
 func TestDrainReturnsQueueBrokenFromRead(t *testing.T) {
 	q := &fakeQueue{readErr: shipper.ErrQueueBroken}
-	err := drain(context.Background(), q, &fakeSink{}, false, 0, time.Second)
+	err := drain(context.Background(), q, &fakeSink{}, false, 0)
 	if !errors.Is(err, shipper.ErrQueueBroken) {
 		t.Fatalf("got %v, want ErrQueueBroken", err)
 	}
