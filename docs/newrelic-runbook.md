@@ -116,7 +116,7 @@ Run these queries within **10 minutes** of deploying the decoy to confirm all te
 
 ```nrql
 FROM Log
-SELECT count(*)
+SELECT count(*) AS 'Events'
 WHERE stream IN ('edge', 'transcript', 'probe', 'runtime', 'egress', 'heartbeat')
 FACET stream
 SINCE 10 minutes ago
@@ -140,7 +140,7 @@ SINCE 10 minutes ago
 
 ```nrql
 FROM Log
-SELECT count(*) AS 'Events', latest(timestamp) AS 'Last Event'
+SELECT count(*) AS 'Events' AS 'Events', latest(timestamp) AS 'Last Event'
 WHERE stream = 'heartbeat'
 FACET source
 SINCE 10 minutes ago
@@ -160,7 +160,7 @@ Both should update within the last **90 seconds**.
 
 ```nrql
 FROM Metric
-SELECT count(*)
+SELECT count(*) AS 'Events'
 WHERE metricName LIKE 'attackbox.%'
 FACET metricName
 SINCE 10 minutes ago
@@ -226,7 +226,7 @@ SINCE 5 minutes ago
 
 ```nrql
 FROM NrIntegrationError
-SELECT count(*)
+SELECT count(*) AS 'Events'
 SINCE 10 minutes ago
 ```
 
@@ -419,7 +419,7 @@ LIMIT 100
    ```nrql
    FROM Log
    SELECT timestamp, session_id, src_ip, action
-   WHERE stream = 'probe' AND action = 'canary-reuse'
+   WHERE stream = 'probe' AND action = 'decision'
    FACET record_id, body_sha256, chunk_index
    SINCE 1 hour ago
    ```
@@ -477,8 +477,8 @@ High rate may be:
 ```nrql
 -- WRONG: Loses all but one chunk
 FROM Log
-SELECT uniqueCount(record_id)
-WHERE stream = 'probe' AND action = 'canary-reuse'
+SELECT count(*) AS 'Events'
+WHERE stream = 'probe' AND action = 'decision'
 ```
 
 This discards chunks 1, 2, 3, ... and breaks body reassembly.
@@ -491,13 +491,17 @@ FROM Log
 SELECT latest(timestamp) AS 'Time',
        latest(session_id) AS 'Session'
 WHERE stream = 'probe'
-  AND action = 'canary-reuse'
+  AND action = 'decision'
   AND record_id IS NOT NULL
 FACET record_id, body_sha256, chunk_index
 SINCE 1 hour ago
 ```
 
 Each row is one unique chunk. If the event is unchunked, `chunk_index = 0` and `chunk_count = 1`.
+
+**Note:** Canary observations have `probe_id = 'canary-reuse'` within the `observations` array attribute. Array filtering syntax (`observations.probe_id`) requires account-side validation.
+
+
 
 ### Reconstructing Chunked Bodies
 
@@ -517,14 +521,12 @@ Manually concatenate the `message` fields in chunk order (0, 1, 2, ...).
 
 **Dashboards:** Use `FACET record_id, body_sha256, chunk_index` for event tables.
 
-**Alerts:** Use `uniqueCount(record_id)` for approximate counts (acceptable for thresholds). For exact counts, use a subquery or accept slight overcounting.
-
 **Example alert:**
 ```nrql
 -- Count unique record_ids (may overcount by chunk_count - 1 per event)
 FROM Log
-SELECT uniqueCount(record_id)
-WHERE stream = 'probe' AND action = 'canary-reuse'
+SELECT count(*) AS 'Events'
+WHERE stream = 'probe' AND action = 'decision'
 ```
 
 For critical alerts (Falco, canary), overcounting is acceptable; the alert fires on any event.
@@ -709,7 +711,7 @@ FROM Log
 SELECT timestamp, action, resource
 WHERE session_id = '<session-id-here>'
   AND stream IN ('probe', 'egress')
-  AND action IN ('canary-reuse', 'egress_blocked')
+  AND action IN ('decision', 'egress_blocked')
   AND record_id IS NOT NULL
 ORDER BY timestamp ASC
 ```
@@ -721,8 +723,8 @@ ORDER BY timestamp ASC
 **Step 1: Activity Summary**
 ```nrql
 FROM Log
-SELECT count(*) AS 'Requests',
-       uniqueCount(session_id) AS 'Sessions',
+SELECT count(*) AS 'Events' AS 'Requests',
+       count(DISTINCT session_id) AS 'Sessions' -- Note: High-cardinality, use Log only,
        latest(user_agent) AS 'User-Agent'
 WHERE stream = 'edge' AND direction = 'request' AND src_ip = '<ip-here>'
 SINCE 1 day ago
@@ -778,7 +780,7 @@ LIMIT 200
 **Most Common Models:**
 ```nrql
 FROM Log
-SELECT count(*) AS 'Sessions'
+SELECT count(*) AS 'Events' AS 'Sessions'
 WHERE stream = 'probe' AND action = 'register-model'
 FACET client_model
 SINCE 1 day ago
@@ -840,7 +842,7 @@ LIMIT 50
 3. Verify the metric names:
    ```nrql
    FROM Metric
-   SELECT count(*)
+   SELECT count(*) AS 'Events'
    WHERE metricName LIKE 'attackbox.%'
    FACET metricName
    SINCE 1 hour ago

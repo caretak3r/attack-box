@@ -153,16 +153,20 @@ NRQL query reference organized by use case:
 **Wrong:**
 ```nrql
 -- Loses all but one chunk
-SELECT uniqueCount(record_id) WHERE stream = 'probe' AND action = 'canary-reuse'
+SELECT count(*) WHERE stream = 'probe' AND action = 'decision'
 ```
 
 **Correct:**
 ```nrql
 -- Preserves every distinct chunk
 SELECT latest(timestamp)
-WHERE stream = 'probe' AND action = 'canary-reuse'
+WHERE stream = 'probe' AND action = 'decision'
 FACET record_id, body_sha256, chunk_index
 ```
+
+**Note:** Canary observations require `observations.probe_id` filtering (pending array-query validation).
+
+See `docs/newrelic-runbook.md` → "Chunk-Safe Deduplication" for details.
 
 See `docs/newrelic-runbook.md` → "Chunk-Safe Deduplication" for details.
 
