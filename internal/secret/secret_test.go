@@ -28,6 +28,10 @@ func TestScrubRedactsCredentialShapes(t *testing.T) {
 		"bearer jwt":        {"bearer eyJ0.eyJ1.sig", "eyJ0.eyJ1.sig"},
 		"basic":             {"Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"},
 		"sk key":            {"use sk-proj-abcdefgh1234", "sk-proj-abcdefgh1234"},
+		"sk glued word":     {"use xsk-proj-abcdefgh1234", "sk-proj-abcdefgh1234"},
+		"sk glued key_":     {"openai_key_sk-Ab3dEf9hJk2mNp", "sk-Ab3dEf9hJk2mNp"},
+		"sk glued Bearer":   {"Bearersk-ant-api03-Zx81Qw44Lm09", "sk-ant-api03-Zx81Qw44Lm09"},
+		"sk glued after sk": {"task-sk-abcdefgh1234", "sk-abcdefgh1234"},
 		"cookie line":       {"Cookie: a=b7; c=d8", "b7"},
 		"cookie second":     {"Cookie: a=b7; c=d8", "d8"},
 		"form":              {"user=x&password=pw1&x=1", "pw1"},
@@ -101,6 +105,8 @@ func TestScrubKeepsBenignText(t *testing.T) {
 		"a basic idea about tokens",
 		`{"prompt_cache_key":"abc"}`,
 		"task-force sk-short",
+		"risk-assessment and task-management-tool notes",
+		"see the disk-usage-report-2024 and risk-factor-2024-annual-summary",
 		"https://example.test/path?q=1",
 		"https://example.test/search?q=token+usage&page=2#top",
 		`{"tools":[{"type":"function","function":{"name":"run","parameters":{"type":"object","properties":{"argv":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"},"password":{"type":"string","description":"login password"}},"required":["argv"]}}}],"parallel_tool_calls":true}`,
@@ -139,6 +145,21 @@ func TestScrubExactJSON(t *testing.T) {
 		}
 		if json.Valid([]byte(in)) && !json.Valid([]byte(out)) {
 			t.Errorf("valid JSON became invalid: %q", out)
+		}
+	}
+}
+
+// A key glued to a word keeps the word and loses only the key.
+func TestScrubGluedSKKeepsPrefix(t *testing.T) {
+	cases := map[string]string{
+		"use xsk-proj-abcdefgh1234 now": "use x[redacted] now",
+		"Bearersk-Ab3dEf9hJk2mNp7":      "Bearer[redacted]",
+		"task-sk-abcdefgh1234 ok":       "task-[redacted] ok",
+		"a sk-abcdefgh1234 b":           "a [redacted] b",
+	}
+	for in, want := range cases {
+		if out := Scrub(in, nil); out != want {
+			t.Errorf("%q\n got %q\nwant %q", in, out, want)
 		}
 	}
 }

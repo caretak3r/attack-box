@@ -46,11 +46,14 @@ import (
 // and every checkpoint rename are followed by a directory fsync. Checkpoints
 // are written to an O_EXCL temp file, fsynced, then renamed.
 //
-// Recovery at Open: an incomplete frame at the end of the newest segment is a
-// torn write and is truncated. Any other bad frame (CRC mismatch, bad role,
-// oversize length, seq not increasing, short frame in an older segment) stops
-// that segment at the last good frame; the valid prefix is still delivered
-// and the file is renamed to .bad instead of deleted once acknowledged. A
+// Recovery at Open: an incomplete last frame of the newest segment (short
+// header, short payload, or a last frame whose CRC fails with nothing after
+// it) is a torn write and is truncated. Any other bad frame (CRC mismatch
+// with more data after it, bad role, oversize length, seq not increasing,
+// short frame in an older segment) stops that segment at the last good frame;
+// the valid prefix is still delivered and the file is renamed to .bad
+// instead of deleted once acknowledged. The next seq is above every seq found
+// in a segment, including frames past a bad one, and above the checkpoint's. A
 // missing, corrupt or inconsistent checkpoint means the replay start is
 // unknown: the queue replays from the oldest segment and reports Uncertain,
 // so the caller can replay logs (deduplicable by record key) and suppress
@@ -292,8 +295,9 @@ func OpenQueue(cfg QueueConfig) (*Queue, Recovery, error) {
 }
 
 // openQueueDir creates the directory if it is missing, then requires a real
-// directory owned by the effective uid with no group or other access, and
-// pins it as a Root so later operations cannot be redirected.
+// directory owned by the effective uid, and pins it as a Root so later
+// operations cannot be redirected. A directory with group or other access
+// bits is tightened to 0700; if that fails the open fails.
 func openQueueDir(dir string) (*os.Root, error) {
 	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("shipper queue: %w", err)
@@ -302,7 +306,7 @@ func openQueueDir(dir string) (*os.Root, error) {
 	if err != nil {
 		return nil, fmt.Errorf("shipper queue: %w", err)
 	}
-	if err := checkPrivateDir(dir, fi); err != nil {
+	if err := checkQueueDir(dir, fi); err != nil {
 		return nil, err
 	}
 	root, err := os.OpenRoot(dir)
@@ -313,6 +317,11 @@ func openQueueDir(dir string) (*os.Root, error) {
 	if err == nil && !os.SameFile(fi, pinned) {
 		err = fmt.Errorf("%s changed while opening", dir)
 	}
+	if err == nil && fi.Mode().Perm()&0o077 != 0 {
+		if err = root.Chmod(".", 0o700); err != nil {
+			err = fmt.Errorf("%s mode %04o allows group or other access and chmod failed: %w", dir, fi.Mode().Perm(), err)
+		}
+	}
 	if err != nil {
 		root.Close()
 		return nil, fmt.Errorf("shipper queue: %w", err)
@@ -320,12 +329,9 @@ func openQueueDir(dir string) (*os.Root, error) {
 	return root, nil
 }
 
-func checkPrivateDir(dir string, fi os.FileInfo) error {
+func checkQueueDir(dir string, fi os.FileInfo) error {
 	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
 		return fmt.Errorf("shipper queue: %s is not a directory", dir)
-	}
-	if fi.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("shipper queue: %s mode %04o allows group or other access", dir, fi.Mode().Perm())
 	}
 	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Geteuid() {
 		return fmt.Errorf("shipper queue: %s is owned by uid %d, not %d", dir, st.Uid, os.Geteuid())
@@ -366,16 +372,17 @@ func (q *Queue) syncDir() error {
 type segScan struct {
 	end      int64
 	lastSeq  uint64
-	torn     bool // incomplete final frame
-	corrupt  bool // any other bad frame
-	boundary bool // the probed offset is a frame boundary
+	highSeq  uint64 // highest seq of any whole frame, including those past a bad one
+	torn     bool   // incomplete final frame
+	corrupt  bool   // any other bad frame
+	boundary bool   // the probed offset is a frame boundary
 	after    [roleSlots]int64
 }
 
 // scanSegment walks the frames of one segment. Frames at or after probe add
 // their bytes to after; probe < 0 counts nothing.
 func scanSegment(f *os.File, size int64, minSeq uint64, maxPayload int, probe int64) (segScan, error) {
-	s := segScan{lastSeq: minSeq, boundary: probe == 0}
+	s := segScan{lastSeq: minSeq, highSeq: minSeq, boundary: probe == 0}
 	br := bufio.NewReaderSize(io.NewSectionReader(f, 0, size), 1<<16)
 	var hdr [FrameHeader]byte
 	var payload []byte
@@ -391,8 +398,12 @@ func scanSegment(f *os.File, size int64, minSeq uint64, maxPayload int, probe in
 		seq := binary.BigEndian.Uint64(hdr[4:12])
 		role := Role(hdr[12])
 		if n == 0 || int64(n) > int64(maxPayload) || !role.valid() || seq <= s.lastSeq {
+			if size-s.end == FrameHeader {
+				s.torn = true // nothing follows the header, so the write never finished
+				return s, nil
+			}
 			s.corrupt = true
-			return s, nil
+			return s, s.scanPastBad(f, size, maxPayload)
 		}
 		if size-s.end-FrameHeader < int64(n) {
 			s.torn = true
@@ -402,21 +413,51 @@ func scanSegment(f *os.File, size int64, minSeq uint64, maxPayload int, probe in
 		if _, err := io.ReadFull(br, payload); err != nil {
 			return s, err
 		}
-		if frameCRC(hdr[:13], payload) != binary.BigEndian.Uint32(hdr[13:17]) {
-			s.corrupt = true
-			return s, nil
-		}
 		frame := FrameHeader + int64(n)
+		if frameCRC(hdr[:13], payload) != binary.BigEndian.Uint32(hdr[13:17]) {
+			if s.end+frame == size {
+				s.torn = true // the last write did not fully reach the disk
+				return s, nil
+			}
+			s.corrupt = true
+			return s, s.scanPastBad(f, size, maxPayload)
+		}
 		if probe >= 0 && s.end >= probe {
 			s.after[role] += frame
 		}
 		s.end += frame
 		s.lastSeq = seq
+		s.highSeq = seq
 		if s.end == probe {
 			s.boundary = true
 		}
 	}
 	return s, nil
+}
+
+// scanPastBad walks the frame headers after a bad frame, skipping payloads
+// and ignoring checksums, only to find the highest seq still on disk so a new
+// record never reuses it. It stops at the first header it cannot step over.
+func (s *segScan) scanPastBad(f *os.File, size int64, maxPayload int) error {
+	var hdr [FrameHeader]byte
+	for off := s.end; size-off >= FrameHeader; {
+		if _, err := f.ReadAt(hdr[:], off); err != nil {
+			return err
+		}
+		n := int64(binary.BigEndian.Uint32(hdr[0:4]))
+		seq := binary.BigEndian.Uint64(hdr[4:12])
+		if n == 0 || n > int64(maxPayload) || !Role(hdr[12]).valid() || off+FrameHeader+n > size {
+			return nil
+		}
+		if off > s.end {
+			if seq <= s.highSeq {
+				return nil
+			}
+			s.highSeq = seq
+		}
+		off += FrameHeader + n
+	}
+	return nil
 }
 
 func frameCRC(head, payload []byte) uint32 {
@@ -478,6 +519,7 @@ func (q *Queue) recover(rec *Recovery) error {
 		lastSeq = ck.Seq
 	}
 	scanFloor := uint64(0)
+	highSeq := uint64(0)
 	for i, n := range nums {
 		name := segName(n)
 		f, err := q.openRegular(name, os.O_RDWR, 0)
@@ -509,6 +551,7 @@ func (q *Queue) recover(rec *Recovery) error {
 		if err != nil {
 			return err
 		}
+		highSeq = max(highSeq, s.highSeq)
 		seg := &segment{num: n, size: s.end, bad: s.torn || s.corrupt}
 		if seg.bad {
 			rec.Quarantined = append(rec.Quarantined, name)
@@ -529,7 +572,7 @@ func (q *Queue) recover(rec *Recovery) error {
 		scanFloor = max(scanFloor, s.lastSeq)
 		q.segs = append(q.segs, seg)
 	}
-	lastSeq = max(lastSeq, scanFloor)
+	lastSeq = max(lastSeq, scanFloor, highSeq)
 	q.nextSeq = lastSeq + 1
 
 	nextSeg := uint64(1)

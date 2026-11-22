@@ -199,6 +199,10 @@ var (
 	bearerRe   = regexp.MustCompile(`(?i)\b(bearer)[ \t]+([A-Za-z0-9._~+/=-]+)`)
 	basicRe    = regexp.MustCompile(`(?i)\b(basic)[ \t]+([A-Za-z0-9+/]{4,}={0,2})`)
 	skRe       = regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{8,}`)
+	// A key glued to a word character ("xsk-...", "key_sk-..."). Words such as
+	// "risk-assessment" match the shape, so gluedSK also checks the body.
+	gluedSKRe  = regexp.MustCompile(`([A-Za-z0-9_])(sk-[A-Za-z0-9_-]{8,})`)
+	alnumRunRe = regexp.MustCompile(`[A-Za-z0-9]{10,}`)
 	authLineRe = regexp.MustCompile(`(?i)\b((?:proxy-)?authori[sz]ation)[ \t]*[:=]` + fold + `*(?:(bearer|basic|digest|token|negotiate|ntlm|hoba|mutual|vapid|scram-sha-1|scram-sha-256|aws4-hmac-sha256)` + fold + `+)?(` + authParams + `|(?:[^\s"'\\]|\\[^"nrt])+)`)
 	cookieRe   = regexp.MustCompile(`(?i)\b((?:set-)?cookie)[ \t]*[:=][ \t]*((?:="[^"\r\n\\;]*"|=\\"[^"\\\r\n;]*\\"|[^\r\n"\\]|\\[^"nrt]|\r?\n[ \t]|\\r\\n[ \t]|\\n[ \t])+)`)
 	userinfoRe = regexp.MustCompile(`(?i)((?:\b[a-z][a-z0-9+.-]*:)?//)([^/\s:@"'<>\\]*):((?:[^/\s@"'<>\\]|\\[^"nrt])+)@`)
@@ -332,12 +336,24 @@ func Scrub(s string, fp Fingerprinter) string {
 		}
 		return sub[1] + sub[2] + ":" + mark(sub[3]) + "@"
 	})
-	return skRe.ReplaceAllStringFunc(s, func(m string) string {
+	s = skRe.ReplaceAllStringFunc(s, func(m string) string {
 		if keep(m) {
 			return m
 		}
 		return mark(m)
 	})
+	return replaceSub(gluedSKRe, s, func(sub []string) string {
+		if keep(sub[2]) || !looksLikeKey(sub[2]) {
+			return sub[0]
+		}
+		return sub[1] + mark(sub[2])
+	})
+}
+
+// looksLikeKey tells a random key body from a hyphenated word that happens to
+// follow "sk-": a key has a digit and a long unbroken alphanumeric run.
+func looksLikeKey(k string) bool {
+	return strings.ContainsAny(k, "0123456789") && alnumRunRe.MatchString(k)
 }
 
 // literals are unquoted form/YAML values that carry no secret, matching the

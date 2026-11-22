@@ -296,6 +296,176 @@ func TestQueueTruncatesTornTail(t *testing.T) {
 	}
 }
 
+// A frame cut short at EOF, whatever the cut point, is dropped without
+// quarantine and later appends continue from the last whole frame.
+func TestQueueTornTailAnyCut(t *testing.T) {
+	var whole [FrameHeader]byte
+	binary.BigEndian.PutUint32(whole[0:4], 40)
+	binary.BigEndian.PutUint64(whole[4:12], 4)
+	whole[12] = byte(RoleBait)
+	for name, tail := range map[string][]byte{
+		"one byte":         whole[:1],
+		"short header":     whole[:9],
+		"header minus one": whole[:FrameHeader-1],
+		"header only":      whole[:],
+		"zero header":      make([]byte, FrameHeader),
+		"short payload":    append(slices.Clone(whole[:]), "abc"...),
+		"payload minus 1":  append(slices.Clone(whole[:]), bytes.Repeat([]byte("p"), 39)...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := queueDir(t)
+			cfg := testConfig(dir)
+			q, _ := mustOpen(t, cfg)
+			mustAppend(t, q, RoleBait, 0, 3)
+			q.Close()
+			seg := segFiles(t, dir, ".q")[0]
+			f, err := os.OpenFile(seg, os.O_WRONLY|os.O_APPEND, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.Write(tail)
+			f.Close()
+
+			q2, rec := mustOpen(t, cfg)
+			if rec.TruncatedBytes != int64(len(tail)) || rec.Uncertain || len(rec.Quarantined) != 0 {
+				t.Fatalf("recovery = %+v", rec)
+			}
+			if bad := segFiles(t, dir, ".bad"); len(bad) != 0 {
+				t.Fatalf("quarantined files = %v", bad)
+			}
+			wantPayloads(t, readAll(t, q2), 0, 3)
+			if err := q2.Ack(3); err != nil {
+				t.Fatal(err)
+			}
+			if seqs := mustAppend(t, q2, RoleBait, 3, 4); seqs[0] != 4 {
+				t.Fatalf("seq after truncation = %d", seqs[0])
+			}
+			if bad := segFiles(t, dir, ".bad"); len(bad) != 0 {
+				t.Fatalf("quarantined files after ack = %v", bad)
+			}
+		})
+	}
+}
+
+// The last frame of the newest segment with a bad checksum and nothing after
+// it is a write that did not finish, not mid-file corruption.
+func TestQueueBadChecksumOnLastFrameIsTorn(t *testing.T) {
+	dir := queueDir(t)
+	cfg := testConfig(dir)
+	q, _ := mustOpen(t, cfg)
+	mustAppend(t, q, RoleBait, 0, 3)
+	q.Close()
+	seg := segFiles(t, dir, ".q")[0]
+	b, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b[len(b)-2] ^= 0xff
+	if err := os.WriteFile(seg, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	q2, rec := mustOpen(t, cfg)
+	if rec.TruncatedBytes != int64(FrameHeader+len(payload(2))) || len(rec.Quarantined) != 0 {
+		t.Fatalf("recovery = %+v", rec)
+	}
+	wantPayloads(t, readAll(t, q2), 0, 2)
+	if seqs := mustAppend(t, q2, RoleBait, 2, 3); seqs[0] != 3 {
+		t.Fatalf("seq after truncation = %d", seqs[0])
+	}
+}
+
+// A torn tail followed by another restart must not pile up .bad files.
+func TestQueueRepeatedTornRestartsLeaveNoBad(t *testing.T) {
+	dir := queueDir(t)
+	cfg := testConfig(dir)
+	for i := range 4 {
+		q, _ := mustOpen(t, cfg)
+		mustAppend(t, q, RoleBait, i, i+1)
+		q.Close()
+		segs := segFiles(t, dir, ".q")
+		f, err := os.OpenFile(segs[len(segs)-1], os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Write([]byte{0, 0, 0, 9, 1})
+		f.Close()
+	}
+	q, rec := mustOpen(t, cfg)
+	if len(rec.Quarantined) != 0 {
+		t.Fatalf("recovery = %+v", rec)
+	}
+	wantPayloads(t, readAll(t, q), 0, 4)
+	if err := q.Ack(4); err != nil {
+		t.Fatal(err)
+	}
+	if bad := segFiles(t, dir, ".bad"); len(bad) != 0 {
+		t.Fatalf("quarantined files = %v", bad)
+	}
+}
+
+// Frames past a corrupt one are still on disk, so new records must not reuse
+// their sequence numbers.
+func TestQueueSeqSurvivesMidFileCorruption(t *testing.T) {
+	dir := queueDir(t)
+	cfg := testConfig(dir)
+	q, _ := mustOpen(t, cfg)
+	mustAppend(t, q, RoleBait, 0, 5)
+	q.Close()
+	seg := segFiles(t, dir, ".q")[0]
+	b, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := FrameHeader + len(payload(0))
+	b[frame+FrameHeader+2] ^= 0xff // second frame, seq 2
+	if err := os.WriteFile(seg, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(filepath.Join(dir, ckptName))
+
+	q2, rec := mustOpen(t, cfg)
+	if len(rec.Quarantined) != 1 {
+		t.Fatalf("recovery = %+v", rec)
+	}
+	if seqs := mustAppend(t, q2, RoleBait, 5, 6); seqs[0] != 6 {
+		t.Fatalf("seq after recovery = %d, want 6", seqs[0])
+	}
+}
+
+// A checkpoint that fell behind the segments must not pull seq backwards.
+func TestQueueSeqNeverRegresses(t *testing.T) {
+	for name, ck := range map[string]string{
+		"corrupt":      "{not json",
+		"behind":       `{"gen":9,"segment":1,"offset":0,"seq":1}`,
+		"missing":      "",
+		"other offset": `{"gen":9,"segment":1,"offset":5,"seq":0}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := queueDir(t)
+			cfg := testConfig(dir)
+			q, _ := mustOpen(t, cfg)
+			mustAppend(t, q, RoleBait, 0, 6)
+			q.Close()
+			path := filepath.Join(dir, ckptName)
+			if ck == "" {
+				os.Remove(path)
+			} else if err := os.WriteFile(path, []byte(ck), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			q2, _ := mustOpen(t, cfg)
+			if seqs := mustAppend(t, q2, RoleBait, 6, 7); seqs[0] != 7 {
+				t.Fatalf("seq = %d, want 7", seqs[0])
+			}
+			q2.Close()
+			q3, _ := mustOpen(t, cfg)
+			if seqs := mustAppend(t, q3, RoleBait, 7, 8); seqs[0] != 8 {
+				t.Fatalf("seq after second restart = %d, want 8", seqs[0])
+			}
+		})
+	}
+}
+
 func TestQueueQuarantinesCorruption(t *testing.T) {
 	dir := queueDir(t)
 	cfg := testConfig(dir)
@@ -454,8 +624,24 @@ func TestQueueDirChecks(t *testing.T) {
 	if err := os.Chmod(open, 0o770); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := OpenQueue(testConfig(open)); err == nil || !strings.Contains(err.Error(), "group or other") {
-		t.Fatalf("group-writable dir: %v", err)
+	q, _ := mustOpen(t, testConfig(open))
+	q.Close()
+	if fi, err := os.Lstat(open); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("group-writable dir after open: %v %v", fi, err)
+	}
+	for _, mode := range []os.FileMode{0o750, 0o705, 0o777, 0o755} {
+		dir := filepath.Join(base, fmt.Sprintf("m%03o", mode))
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, mode); err != nil {
+			t.Fatal(err)
+		}
+		q, _ := mustOpen(t, testConfig(dir))
+		q.Close()
+		if fi, err := os.Lstat(dir); err != nil || fi.Mode().Perm() != 0o700 {
+			t.Fatalf("mode %04o dir after open: %v %v", mode, fi, err)
+		}
 	}
 	real := filepath.Join(base, "real")
 	if err := os.Mkdir(real, 0o700); err != nil {
@@ -469,7 +655,7 @@ func TestQueueDirChecks(t *testing.T) {
 		t.Fatalf("symlinked dir: %v", err)
 	}
 	created := filepath.Join(base, "new")
-	q, _ := mustOpen(t, testConfig(created))
+	q, _ = mustOpen(t, testConfig(created))
 	q.Close()
 	if fi, err := os.Lstat(created); err != nil || fi.Mode().Perm() != 0o700 {
 		t.Fatalf("created dir mode: %v %v", fi, err)
