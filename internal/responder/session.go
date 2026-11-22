@@ -62,6 +62,8 @@ type Session struct {
 	Behavior string
 	Canaries Canaries
 	Created  time.Time
+	// LastSeen belongs to Store and is guarded by Store.mu, not mu, so a busy
+	// session never stalls the store.
 	LastSeen time.Time
 
 	Requests      int
@@ -141,13 +143,8 @@ func (s *Store) Get(key string) (*Session, bool) {
 	now := s.Now()
 	if el, ok := s.items[key]; ok {
 		sess := el.Value.(*Session)
-		sess.mu.Lock()
-		expired := now.Sub(sess.LastSeen) > s.cfg.IdleTTL
-		if !expired {
+		if now.Sub(sess.LastSeen) <= s.cfg.IdleTTL {
 			sess.LastSeen = now
-		}
-		sess.mu.Unlock()
-		if !expired {
 			s.lru.MoveToFront(el)
 			return sess, false
 		}

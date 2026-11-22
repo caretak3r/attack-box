@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"attackbox/internal/responder"
+	"attackbox/internal/secret"
 	"attackbox/internal/telemetry"
 )
 
@@ -312,15 +313,38 @@ func resultFor(status int) string {
 
 var sensitiveQuery = []string{"key", "token", "secret", "password", "passwd", "auth", "session", "sig", "credential"}
 
+const (
+	maxQueryParams = 64
+	maxQueryValue  = 512
+	truncatedMark  = "[truncated]"
+)
+
+// sensitiveParam judges a query key like a JSON or header key, plus the
+// substring list for names the classifier does not split (apikeyfoo).
+func sensitiveParam(name string) bool {
+	if secret.IsCredentialName(name) {
+		return true
+	}
+	lk := strings.ToLower(name)
+	for _, f := range sensitiveQuery {
+		if strings.Contains(lk, f) {
+			return true
+		}
+	}
+	return false
+}
+
 // redactQuery masks the value of credential-looking parameters and scrubs the
-// rest with the body redactor.
+// rest with the body redactor. Parameter count and value size are capped
+// before scrubbing so a hostile query cannot make the scrub expensive.
 func (s *Server) redactQuery(raw string) string {
 	if raw == "" {
 		return ""
 	}
+	red := s.cfg.Redactor
 	vals, err := url.ParseQuery(raw)
 	if err != nil && len(vals) == 0 {
-		return truncRunes(s.cfg.Redactor.Text(raw), maxQueryLen)
+		return capQuery(red.Text(truncBytes(raw, 4*maxQueryLen)))
 	}
 	keys := make([]string, 0, len(vals))
 	for k := range vals {
@@ -329,19 +353,31 @@ func (s *Server) redactQuery(raw string) string {
 	sort.Strings(keys)
 	var parts []string
 	for _, k := range keys {
-		lk := strings.ToLower(k)
-		sensitive := false
-		for _, f := range sensitiveQuery {
-			sensitive = sensitive || strings.Contains(lk, f)
-		}
+		sensitive := sensitiveParam(k)
+		name := red.Text(truncBytes(k, maxQueryValue))
 		for _, v := range vals[k] {
-			if sensitive {
-				v = "[redacted:" + s.cfg.Redactor.Fingerprint(v) + "]"
-			} else {
-				v = s.cfg.Redactor.Text(v)
+			if len(parts) == maxQueryParams {
+				parts = append(parts, truncatedMark)
+				return capQuery(strings.Join(parts, "&"))
 			}
-			parts = append(parts, s.cfg.Redactor.Text(k)+"="+v)
+			switch {
+			case sensitive:
+				v = "[redacted:" + red.Fingerprint(v) + "]"
+			case len(v) > maxQueryValue:
+				v = red.Text(truncBytes(v, maxQueryValue)) + truncatedMark
+			default:
+				v = red.Text(v)
+			}
+			parts = append(parts, name+"="+v)
 		}
 	}
-	return truncRunes(strings.Join(parts, "&"), maxQueryLen)
+	return capQuery(strings.Join(parts, "&"))
+}
+
+// capQuery bounds the logged query and says so when it cuts.
+func capQuery(q string) string {
+	if c := truncRunes(q, maxQueryLen); c != q {
+		return c + truncatedMark
+	}
+	return q
 }

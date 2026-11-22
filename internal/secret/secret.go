@@ -199,8 +199,8 @@ var (
 	bearerRe   = regexp.MustCompile(`(?i)\b(bearer)[ \t]+([A-Za-z0-9._~+/=-]+)`)
 	basicRe    = regexp.MustCompile(`(?i)\b(basic)[ \t]+([A-Za-z0-9+/]{4,}={0,2})`)
 	skRe       = regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{8,}`)
-	authLineRe = regexp.MustCompile(`(?i)\b((?:proxy-)?authori[sz]ation)[ \t]*:` + fold + `*(?:(bearer|basic|digest|token|negotiate|ntlm|hoba|mutual|vapid|scram-sha-1|scram-sha-256|aws4-hmac-sha256)` + fold + `+)?(` + authParams + `|(?:[^\s"'\\]|\\[^"nrt])+)`)
-	cookieRe   = regexp.MustCompile(`(?i)\b((?:set-)?cookie)[ \t]*:[ \t]*((?:="[^"\r\n\\;]*"|=\\"[^"\\\r\n;]*\\"|[^\r\n"\\]|\\[^"nrt]|\r?\n[ \t]|\\r\\n[ \t]|\\n[ \t])+)`)
+	authLineRe = regexp.MustCompile(`(?i)\b((?:proxy-)?authori[sz]ation)[ \t]*[:=]` + fold + `*(?:(bearer|basic|digest|token|negotiate|ntlm|hoba|mutual|vapid|scram-sha-1|scram-sha-256|aws4-hmac-sha256)` + fold + `+)?(` + authParams + `|(?:[^\s"'\\]|\\[^"nrt])+)`)
+	cookieRe   = regexp.MustCompile(`(?i)\b((?:set-)?cookie)[ \t]*[:=][ \t]*((?:="[^"\r\n\\;]*"|=\\"[^"\\\r\n;]*\\"|[^\r\n"\\]|\\[^"nrt]|\r?\n[ \t]|\\r\\n[ \t]|\\n[ \t])+)`)
 	userinfoRe = regexp.MustCompile(`(?i)((?:\b[a-z][a-z0-9+.-]*:)?//)([^/\s:@"'<>\\]*):((?:[^/\s@"'<>\\]|\\[^"nrt])+)@`)
 )
 
