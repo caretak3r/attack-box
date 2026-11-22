@@ -89,6 +89,7 @@ type NRConfig struct {
 	HeartbeatInterval time.Duration // 0 means 30s; negative disables
 	Backoff           []time.Duration
 	MaxRetryAfter     time.Duration // cap on a 429 Retry-After wait; default 30s
+	HeartbeatAttrs    func() map[string]any // merged into each heartbeat, must not block
 	OnError           func(error)
 }
 
@@ -345,6 +346,28 @@ func (n *NewRelic) Emit(e Event) {
 	}
 }
 
+// TryEmit queues e like Emit but reports false and queues nothing when the
+// client is closed or the queue cannot take every chunk, so a caller with a
+// durable buffer keeps the event instead of dropping it. TryEmit must not be
+// called concurrently with Emit or with itself.
+func (n *NewRelic) TryEmit(e Event) bool {
+	if e.Timestamp.IsZero() {
+		e.Timestamp = n.cfg.Now()
+	}
+	e.Attrs = maps.Clone(e.Attrs)
+	e.TaskLabels = slices.Clone(e.TaskLabels)
+	chunks := Chunk(e, MaxChunk)
+	n.closeMu.RLock()
+	defer n.closeMu.RUnlock()
+	if n.closed || cap(n.queue)-len(n.queue) < len(chunks) {
+		return false
+	}
+	for _, c := range chunks {
+		n.queue <- c // room was checked; ship() only frees space
+	}
+	return true
+}
+
 // Count adds value to a counter, summed until the next flush.
 func (n *NewRelic) Count(name string, value float64, attrs map[string]string) {
 	n.record(name, true, value, attrs)
@@ -476,6 +499,11 @@ func (n *NewRelic) heartbeatLoop() {
 			"lost_total":    n.lost.Load(),
 			"errors_total":  n.errs.Load(),
 		}}
+		if n.cfg.HeartbeatAttrs != nil {
+			for k, v := range n.cfg.HeartbeatAttrs() {
+				e.Attrs[k] = v
+			}
+		}
 		if item, err := logItem(e); err == nil {
 			common, _ := json.Marshal(map[string]any{"attributes": n.cfg.Common})
 			n.postOnce(n.cfg.LogURL, envelope(common, "logs", item), 1)
