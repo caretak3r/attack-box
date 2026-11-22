@@ -219,9 +219,40 @@ Verification: `gofmt -l .` (no output), `go vet ./...`, `go test -race -count=1 
 
 Verification: `gofmt -l .` (no output), `go vet ./...`, `go test -race -count=1 -cover ./...` (`internal/server` 95.2%).
 
+### Process entry point (`cmd/attackbox`)
+
+- One process serves all enabled personas. Each persona has its own listener and `http.Server` with `ReadHeaderTimeout` 10 s, `ReadTimeout` 30 s, `WriteTimeout` = `MAX_STREAM` + 30 s, `IdleTimeout` 60 s and 32 KiB header limit. All listeners share one responder and session store, so one client keeps one session across ports.
+- Every listener binds before serving starts. A bind failure stops startup and closes the listeners that were already bound.
+- Keys: `ATTACKBOX_SECRET_FILE` (at least 32 bytes) derives separate session, embedding and redaction keys with HMAC-SHA256 (`attackbox/session`, `attackbox/embed`, `attackbox/redact`). The same file gives the same session IDs and embeddings after a restart. Without the file, the keys are random for each process.
+- Logs: JSON lines on stdout, always. New Relic is added when `ATTACKBOX_NR_LICENSE_KEY` is set. The process refuses to start when the key is missing and `ATTACKBOX_NR_DISABLED=true` is not set, and when both are set. New Relic delivery errors are written to the local log only (`stream=runtime`, `action=newrelic_error`, key scrubbed).
+- Shutdown on SIGINT/SIGTERM: listeners stop; in-flight requests get `SHUTDOWN_TIMEOUT`, then connections are closed; New Relic is flushed with the same timeout. A final local `runtime`/`stopped` event records `nr_sent`, `nr_dropped`, `nr_lost` and `nr_errors`. The exit code is 1 when a listener failed or New Relic lost or dropped events; delivery failure is never reported as success.
+- Flags: `-version`; `-check-config` validates the environment and exits (2 on error); `-healthcheck URL` does a GET to a loopback `http://` URL only and exits 0 on HTTP 200 (container probe for an image without a shell).
+- Release build: `CGO_ENABLED=0 go build -trimpath -ldflags='-s -w -X main.version=<v>' ./cmd/attackbox`. Compiled Go does not stop decompilation; the binary contains the probe texts and route tables.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ATTACKBOX_OPENAI_ADDR` | `:8080` | generic OpenAI-compatible listener (`off` disables); private container port behind the TLS proxy |
+| `ATTACKBOX_VLLM_ADDR` | `off` | vLLM persona listener (discovery profile, for example `:8000`) |
+| `ATTACKBOX_OLLAMA_ADDR` | `off` | Ollama persona listener (discovery profile, for example `:11434`) |
+| `ATTACKBOX_NR_LICENSE_KEY` | none | dedicated ingest license key, sent only in `Api-Key` |
+| `ATTACKBOX_NR_DISABLED` | `false` | `true` keeps local JSON logs only |
+| `ATTACKBOX_NR_LOG_URL` / `ATTACKBOX_NR_METRIC_URL` | US endpoints | EU: `https://log-api.eu.newrelic.com/log/v1`, `https://metric-api.eu.newrelic.com/metric/v1`; `http` only on loopback |
+| `ATTACKBOX_INSTANCE` | `attackbox` | `instance` attribute on every New Relic item; `[A-Za-z0-9._-]{1,64}` |
+| `ATTACKBOX_SECRET_FILE` | none | key file, at least 32 bytes |
+| `ATTACKBOX_MODELS` | `qwen3:8b,gpt-oss:20b,llama3.1:8b` | comma list of served model names |
+| `ATTACKBOX_TRUSTED_PROXIES` | none | comma list of IPs/CIDRs whose `X-Forwarded-For` is believed |
+| `ATTACKBOX_MAX_SESSIONS` | `10000` | session store bound |
+| `ATTACKBOX_MAX_BODY_BYTES` | `1048576` | request body cap |
+| `ATTACKBOX_MAX_IN_FLIGHT` / `ATTACKBOX_MAX_PER_SOURCE` | `256` / `8` | concurrency bounds |
+| `ATTACKBOX_HOLD_SILENT` / `ATTACKBOX_IDLE_INTERVAL` / `ATTACKBOX_MAX_STREAM` | `150s` / `45s` / `180s` | hold gates; `HOLD_SILENT` must not exceed `MAX_STREAM` |
+| `ATTACKBOX_READ_HEADER_TIMEOUT` / `ATTACKBOX_READ_TIMEOUT` / `ATTACKBOX_IDLE_TIMEOUT` | `10s` / `30s` / `60s` | HTTP server timeouts |
+| `ATTACKBOX_SHUTDOWN_TIMEOUT` | `15s` | drain and flush limit |
+
+Verification: `go test -race ./cmd/...` (88.9%) runs all three listeners on loopback against a fake New Relic intake (checks `Api-Key`, gzip payloads, `instance`, no raw bearer token, flush on shutdown), a 403 intake (run returns a lost-events error and logs `newrelic_error`), port conflicts and shutdown with a stalled connection. `scripts/smoke.sh` builds the release binary, starts all three personas on loopback with New Relic disabled and checks JSON, SSE, Responses events, NDJSON, unknown-model errors, vLLM `/metrics` and `/openapi.json`, Ollama no-op delete, SIGTERM exit 0 and token redaction in the log. It contacts only `127.0.0.1`.
+
 ### Not yet implemented
 
-`cmd` entry point (listeners with `ReadHeaderTimeout`/`ReadTimeout`, shared `SessionKey`/`EmbedSeed`, NR wiring, graceful shutdown), live-server smoke test, Dockerfile/Compose, deployment script, operator documentation, benchmarks.
+Dockerfile/Compose, deployment script, operator documentation with Mermaid diagrams, benchmarks, and the open items in `SECURITY_FIXES.md`.
 
 ## Decoy VPS layers
 

@@ -10,6 +10,7 @@ Three read-only research agents reviewed primary documentation and public GitHub
 - `responder-review.md`: independent review of the first responder commit. Fix H1 Unicode bidirectional-mark normalization and H3 per-field declaration bounds before deployment; review the remaining findings.
 - `telemetry-security.md`: independent security review of the first telemetry commit. Fix the High raw-credential leakage finding and all Medium findings before deployment; review Low findings.
 - `server-review.md`: independent snapshot review, subsequently triaged by the host. Its slot-leak and missing-route claims were false; follow only the validated actions in `SECURITY_FIXES.md`.
+- `protocol-review.md`: official-client contract mismatches in streaming usage, prompt arrays, Responses fields/cancellation, token embeddings and Ollama management responses. Fix all ten before claiming client compatibility.
 
 ## Required application in this repository
 

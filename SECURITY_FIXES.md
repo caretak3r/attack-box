@@ -29,3 +29,11 @@ The host triaged `research/server-review.md` against the live source. Several re
 - Validate malformed X-Forwarded-For handling with a security test and keep the trusted-proxy behavior explicit.
 
 Remaining action: add streaming frame-loop cancellation, XFF malformed-input and disconnect regression tests, and verify cancelled Responses against the selected client contract. Do not implement the review's false route/leak findings.
+
+## Protocol fidelity
+
+Read `research/protocol-review.md` and fix all ten client-visible mismatches with contract tests: streamed `usage:null`, multi-prompt completion choices, Responses required fields/logprobs/usage details, cancelled nested item status, token-array embedding cardinality/counts, Ollama unload reason, `/api/create` non-streaming JSON and `/api/copy` success body. If a deliberately emulated older release differs, gate that behavior explicitly by persona version and document it; do not silently ignore the current contract.
+
+## Runtime defaults
+
+`cmd/attackbox/config.go` currently defaults `ATTACKBOX_OPENAI_ADDR` to `:8080`, which binds every interface and contradicts the private-application-listener design. Change the development default to `127.0.0.1:8080`; deployment must explicitly set the intended public or container address. Add a test proving the zero-configuration listener is loopback-only.
