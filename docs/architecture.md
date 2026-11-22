@@ -1,631 +1,138 @@
-# Attack Box Architecture
+# Attack Box architecture
 
-**Version:** 1.0
-**Status:** Deployment design only — not validated on live Ubuntu, New Relic or gVisor
+Source baseline: `584a658`. Documentation review: 2026-11-22. This describes the current Go implementation and the proposed extension boundaries. It is not a live deployment certification.
 
-## Overview
+Setup: `/Users/rohit/attack-box/docs/operator.md`. Improvement requirements and acceptance cases: `/Users/rohit/attack-box/IMPROVE.md`.
 
-Attack Box is a honeypot that records prompt attacks. The design assumes root compromise on the VPS. It limits blast radius through isolation, one-way telemetry, and accepted-loss secrets.
+## Purpose and implementation standard
 
-## Design Principles
+Collect evidence about attacks against fake AI and agent services. Keep request evidence, response evidence, capture limits, and analysis uncertainty. Use deterministic responses to sustain useful interactions. Never execute a requested shell command, tool, model file, package, or external fetch.
 
-1. **Assume compromise.** Root on the VPS gets nothing that reaches the operator.
-2. **Outbound only.** No inbound SSH or administration. Push telemetry to New Relic and an optional archive.
-3. **Fake by default.** No real model, no real credentials. Deterministic responses from templates.
-4. **Sandbox first.** Run the bait in gVisor with no egress and no New Relic key.
-5. **Host shipper.** A separate host process holds the ingest key and enforces the trust boundary.
+Build runtime services in Go. The existing module `/Users/rohit/attack-box/go.mod` declares Go 1.25. Prefer its standard library and existing packages. Retain nginx, systemd, nftables, Docker, gVisor, and Falco for their existing infrastructure roles. Shell provisioning and the Python client test harness remain support tools.
 
-## System Components
+## Current topology
 
 ```mermaid
-flowchart TB
-    subgraph Internet
-        A[Attackers]
-        NR[New Relic<br/>Dedicated Account]
-        CT[Canarytokens]
-    end
-
-    subgraph VPS[Decoy VPS - Assumed Compromised]
-        subgraph Container[gVisor Sandbox<br/>UID 65532, No Egress]
-            B[Bait Process<br/>attackbox]
-            B --> |stdout| DL[Docker Logs<br/>Forensic Backstop]
-        end
-
-        subgraph Host[Host - User abx-ship]
-            S[Shipper Process<br/>attackbox-shipper]
-            F[Falco<br/>Escape Detection]
-            N[nftables<br/>Egress Filter]
-        end
-
-        A -->|HTTPS 443| RP[Reverse Proxy<br/>TLS Termination]
-        RP --> B
-        B -->|Unix Socket<br/>/run/attackbox/spool.sock| S
-        F -->|stdin| S
-        N -->|Dropped Packets| S
-        S -->|HTTPS 443<br/>Api-Key Header| NR
-        B -.->|Canary Triggered| CT
-    end
-
-    subgraph Operator
-        O[Browser]
-        P[Provider Console]
-    end
-
-    O -->|View Logs/Metrics| NR
-    P -.->|Power Off| VPS
-    CT -.->|Alert| O
+flowchart LR
+    C[Client on host loopback] --> P[nginx proxy: 8443 TLS / 8080 redirect]
+    P --> B[Go bait: OpenAI persona on 8080]
+    B --> S[Go host shipper: bait Unix socket]
+    F[Host Falco] --> R[Go stdin adapter: runtime socket]
+    J[Kernel journal] --> E[Go stdin adapter: egress socket]
+    R --> S
+    E --> S
+    S --> Q[Durable local queue]
+    Q --> N[New Relic log and metric APIs]
 ```
 
-## Threat Model
+The supplied Compose configuration publishes only `127.0.0.1:8443` and `127.0.0.1:8080`. vLLM and Ollama listeners are disabled. Port 8080 redirects to HTTPS port 8443. This configuration does not expose public AI discovery ports. Public 443, 8000, and 11434 are proposed in I01 of `/Users/rohit/attack-box/IMPROVE.md`.
 
-**Assumption:** An attacker has root on the VPS.
+The bait joins the internal Docker network `172.30.0.0/24`. The proxy joins that network and an external bridge. Both containers use UID/GID 65532, read-only root filesystems, dropped capabilities, and no-new-privileges. The override `/Users/rohit/attack-box/compose.gvisor.yaml` selects runsc for both. Host Unix-socket access requires the configured runsc host-UDS support. This access is a deliberate boundary exception.
 
-**What the attacker cannot do:**
-- Reach the operator's Mac or personal systems
-- Steal production credentials (none exist on the VPS)
-- Query New Relic data (the ingest key permits writes only)
-- Access other VPS instances (separate cloud project)
+Current container limits: bait 2 CPUs, 512 MiB, 100 PIDs; proxy 1 CPU, 256 MiB, 50 PIDs. Current shipper systemd limits: 256 MiB and 100 tasks. Runtime and egress adapters have separate 64 MiB and 50-task limits.
 
-**What the attacker can do:**
-- Read the host shipper's ingest key from `/etc/attackbox/shipper.env`
-- Write forged telemetry to the shipper socket
-- Corrupt the shipper's disk queue
-- Kill the shipper and bait processes
-- Consume ingest quota
+## Go components and trust boundaries
 
-**Mitigations:**
-- Dedicated New Relic account isolates telemetry and ingest abuse
-- Provider firewall (outside host control) limits outbound traffic to port 443
-- Absence alerts detect missing heartbeats
-- Revoke the ingest key and power off on anomalies
+| Component | Entry point | Input and output | Identity and authority |
+|---|---|---|---|
+| Bait | `/Users/rohit/attack-box/cmd/attackbox/main.go` | HTTP personas to synthetic responses; redacted events to local output and configured sink | Container UID 65532; redaction secret; no ingest key in deployed spool mode |
+| Shipper | `/Users/rohit/attack-box/cmd/attackbox-shipper/main.go` | Role-specific Unix sockets to disk queue and New Relic | Host user `abx-ship`, primary group `abx-bait`, supplemental group `abx-ship`; owns ingest key in process environment |
+| Runtime adapter | Same shipper binary with `-stdin-stream runtime` | Falco JSON lines to runtime socket | Host root, separate systemd unit; no ingest key required by adapter mode |
+| Egress adapter | Same shipper binary with `-stdin-stream egress` | Filtered kernel journal JSON to egress socket | Host root, separate systemd unit; no ingest key required by adapter mode |
+| Analysis job | Proposed; no binary exists | Approved redacted exports to bounded families, candidate links, and reports | Separate analysis environment, outside decoy and operator Mac; no authority over the live response policy |
 
-**Residual risks:**
-- Host-root compromise exposes the ingest key
-- Shipper-compromise exposes the ingest key
-- Telemetry confidentiality, integrity and availability are lost under host-root compromise
-- A live heartbeat from a compromised host is not proof of safety
+Keep a typed response planner inside the Go bait package. Do not add a model network service for ordinary response generation. Start future analysis as a Go batch command. A broker, public analysis API, database, or language-model provider is not part of this approved documentation change.
 
-## Request Flow
+Captured text is untrusted data at every boundary. Do not render it as active HTML, execute it, visit extracted destinations, or supply it to an agent with tools. Host-root compromise can change the firewall, steal host keys, forge local records, and stop collection. Off-host receipt establishes that data arrived; it does not establish that the data is true.
 
-```mermaid
-sequenceDiagram
-    participant A as Attacker
-    participant P as Reverse Proxy<br/>(TLS)
-    participant B as Bait<br/>(gVisor)
-    participant R as Responder<br/>(State Machine)
-    participant S as Spool<br/>(Unix Socket)
-    participant H as Host Shipper
-    participant N as New Relic
+## Current response path
 
-    A->>P: POST /v1/chat/completions<br/>Authorization: Bearer sk-...
-    P->>B: Proxied Request
+The HTTP layer parses bounded requests, selects the persona, derives session context, and invokes the responder. The responder scores a pending follow-up, records declarations, and classifies intent. After three issued questions it can release one fake payout. Other branches select an intent probe or the registration sequence: model question, harness question, assigned behavioral probe, then a neutral completion. Intent probes can continue after payout.
 
-    Note over B: Redact Bearer token
-    B->>S: edge event<br/>(request log)
+Probe output is assistant text. The code does not implement a real tool executor. Accepting tool definitions does not establish a coherent tool-call lifecycle. General requests can receive registration questions. The current classifier uses fixed keyword rules. These are known response-quality limits, not proof of attacker intent.
 
-    B->>R: Classify message
-    R-->>B: Task: prompt-extraction<br/>Gate: registration
+Selected timeout probes use silent holds or idle frames. Ordinary suspicious requests do not all wait 150 seconds. Streaming uses simulated pacing; token counts and fake embeddings do not establish model equivalence. The current maximum-stream setting bounds selected holds, with HTTP write timeout set to that value plus 30 seconds; it is not a complete semantic response-budget contract.
 
-    Note over B: Hold 150s (suspicious)
+Source: `/Users/rohit/attack-box/internal/responder/responder.go`, `/Users/rohit/attack-box/internal/responder/probes.go`, `/Users/rohit/attack-box/internal/server/server.go`, and `/Users/rohit/attack-box/cmd/attackbox/main.go`.
 
-    B->>A: 200 OK<br/>SSE: Declare metadata
+## Evidence flow and redaction
 
-    Note over B: Wait for followup
+Six streams exist: `edge`, `transcript`, `probe`, `runtime`, `egress`, and `heartbeat`. Edge events contain bounded request/response observations. Transcript events include probe text; they are not an independent complete wire transcript. Host adapters supply separate runtime and egress observations.
 
-    A->>P: POST /v1/chat/completions<br/>(followup with metadata)
-    P->>B: Proxied Request
+The bait scrubs secrets and bounds captured bodies. The shipper validates and scrubs admitted content again. Heuristic redaction can miss free-text secrets, unusual credential names, and encoded values. Stored content is a transformed observation. A body hash can identify redacted content; it cannot recover omitted bytes or prove authenticity. Parsing, truncation, redaction, and chunking must remain explicit in future evidence contracts.
 
-    B->>R: Check declaration
-    R-->>B: Registered, probe ready
+The bait spool has a 32 MiB byte ceiling, a default 10,000-item queue, a 2 MiB record limit, and a default five-second write timeout. The asynchronous event sink also has a count limit; it is not an end-to-end byte-budget guarantee. A successful Unix-socket write does not acknowledge durable disk commit. Loss before shipper admission can remain unknown after a crash.
 
-    B->>S: probe event<br/>(gate trigger)
+Future I02 adds stage-specific provenance, schema versions, boot/sequence reconciliation, protected health capacity, and explicit unknown-loss intervals. It must not describe existing one-way delivery as end-to-end durable.
 
-    B->>A: 200 OK<br/>SSE: Fake response<br/>with canary token
+Source: `/Users/rohit/attack-box/internal/server/log.go`, `/Users/rohit/attack-box/internal/secret/secret.go`, `/Users/rohit/attack-box/internal/telemetry/spool.go`, and `/Users/rohit/attack-box/internal/telemetry/async.go`.
 
-    B->>S: transcript event<br/>(message + response)
+## Authenticated producer admission
 
-    Note over S,H: Non-blocking enqueue
+| Socket on VPS | Accepted peer UID | Connections | Rate per endpoint | Burst |
+|---|---|---|---|---|
+| `/run/attackbox/spool.sock` | 65532 | 4 | 1 MiB/s | 4 MiB |
+| `/run/attackbox/runtime.sock` | 0 | 2 | 256 KiB/s | 4 MiB |
+| `/run/attackbox/egress.sock` | 0 | 2 | 128 KiB/s | 4 MiB |
 
-    H->>H: Validate record
-    H->>H: Write to disk queue
+The directory is mode 0710. Socket mode 0220 permits connection; peer credentials and the selected socket assign the producer role. A producer cannot choose a role by setting a JSON field. Runtime and egress endpoints are optional in the binary but enabled by the supplied deployment setup.
 
-    loop Every 30s or queue empty
-        H->>N: POST /log/v1<br/>Api-Key: <ingest-key><br/>Batch of events
-        N-->>H: 202 Accepted
-        H->>H: Checkpoint advance
-        H->>H: Delete old segments
-    end
+Validation applies role-specific stream/action and metric allowlists, reserved-attribute removal, UTF-8 checks, JSON structure limits, and body limits. Limits include a 2 MiB wire line, 1 MiB body, 8 MiB admitted payload, and 16 MiB expansion bound. Unknown JSON fields and trailing data are rejected. Timestamps outside the accepted window (24 hours old through five minutes ahead) are replaced with current time and flagged.
 
-    Note over H,N: Direct heartbeat<br/>(bypass queue)
-    H->>N: POST /log/v1<br/>heartbeat event<br/>source=shipper
-```
+Wire record IDs use `<16-lowercase-hex-boot>-<positive-sequence>`. Forwarded IDs use `<role>-<boot>-<sequence>`. Deduplicate chunks by record ID and chunk index. Reassemble only within that identity and validate expected count and content hash. Hash alone is not a transcript identity.
 
-## Probe Flow
+Stdin adapters accept lines up to 8 KiB. Invalid JSON is skipped. These adapters do not supply complete loss accounting; their absence of events cannot prove absence of host activity. Native host Falco does not observe all syscalls inside gVisor.
 
-The responder is a deterministic state machine. Each session progresses through gates and probes.
+Source: `/Users/rohit/attack-box/internal/shipper/record.go`, `/Users/rohit/attack-box/internal/shipper/ingest.go`, and `/Users/rohit/attack-box/cmd/attackbox-shipper/main.go`.
 
-```mermaid
-stateDiagram-v2
-    [*] --> CheckTask
+## Durable queue and delivery
 
-    CheckTask --> RegistrationGate: Task detected<br/>(prompt-extraction, etc.)
-    CheckTask --> NormalResponse: Benign message
+The queue directory defaults to `/var/lib/attackbox-shipper/queue`. It is owner-only, with no symlink traversal for queue files. Segments use `seg-<20-digit sequence>.q`. Each frame stores a length, sequence, producer role, CRC32c, and JSON payload. The frame header is 17 bytes.
 
-    RegistrationGate --> Hold150s: First gate
-    Hold150s --> AskMetadata: After 150s
-    AskMetadata --> AwaitDeclaration: SSE response
+The `checkpoint` file records generation, segment, offset, and acknowledged sequence. Appends are batch-fsynced. Checkpoint replacement uses a temporary file, fsync, rename, and directory fsync. Creation, removal, and rename operations preserve directory durability.
 
-    AwaitDeclaration --> AuditGate: Declared<br/>(metadata received)
-    AwaitDeclaration --> Terminate: Max 3 responses<br/>without declaration
+The default unacknowledged queue limit is 256 MiB. Role reservations are bait 60%, runtime 20%, and egress 20%. Full queues reject new records; they do not evict unacknowledged data. Physical disk use can exceed the logical unacknowledged limit due to retained segments and quarantine files. Monitor filesystem usage separately.
 
-    AuditGate --> AskDetails: Second gate
-    AskDetails --> AwaitDetails: SSE response
+The drain reads up to 200 records or 512 KiB, delivers in order, and checkpoints confirmed deliveries after 200 records or one second. Delivery failure blocks later records. Empty polls wait 100 ms; blocked delivery retries after 250 ms. Remote API acceptance is not proof of query availability.
 
-    AwaitDetails --> ResourceGate: Details received
-    AwaitDetails --> Terminate: Max retries
-
-    ResourceGate --> Hold30s: Third gate
-    Hold30s --> InjectProbe: After 30s
-
-    InjectProbe --> PayoutLimit: Probe in tools<br/>or message
-
-    PayoutLimit --> NormalResponse: Response 1-3
-    PayoutLimit --> Terminate: After 3 responses
-
-    NormalResponse --> CheckTask: Continue session
-    Terminate --> [*]
-
-    note right of RegistrationGate
-        Probe: declaration-request
-        Task: metadata fields
-    end note
-
-    note right of AuditGate
-        Probe: audit-followup
-        Task: activity details
-    end note
-
-    note right of ResourceGate
-        Probe: resource-limit
-        Task: cost/quota check
-    end note
-
-    note right of InjectProbe
-        Probes: canary tokens,
-        invisible Unicode,
-        nonces in tools
-    end note
-```
-
-## Telemetry Streams
-
-Six streams flow from the bait and host to New Relic.
-
-| Stream | Producer | Contents | Volume |
-|--------|----------|----------|--------|
-| `edge` | Bait | HTTP method, path, status, headers, request body, response body (chunked) | Per request |
-| `transcript` | Bait | Chat messages, assistant responses, tool calls, tool results, probe IDs | Per message/response |
-| `probe` | Bait | Gate triggers, declarations, nonces, timing observations | Per gate |
-| `runtime` | Falco (host) | Host process, file and network events (escape detection) | Per Falco event |
-| `egress` | nftables (host) | Blocked outbound connections | Per dropped packet |
-| `heartbeat` | Bait + Shipper | Liveness signals every 30s | Every 30s |
-
-**Chunk protocol:**
-
-Large bodies (>3500 chars) are split into chunks. Each chunk has:
-- `body_sha256`: hash of the full body
-- `chunk_index`: 0-based chunk number
-- `chunk_count`: total chunks
-
-Reassemble in New Relic with:
-```nrql
-SELECT * FROM Log WHERE body_sha256='<hash>' ORDER BY chunk_index
-```
-
-**Deduplication:**
-
-Each record has `record_id` = `<boot>-<seq>`. After a crash, the shipper replays from its checkpoint. Use `uniqueCount(record_id)` to deduplicate replayed logs.
-
-**Warning:** Every chunk has the same `record_id`. Do not collapse chunks with `uniqueCount(record_id)` without preserving `chunk_index`.
-
-## Deployment Topology
-
-```mermaid
-flowchart TB
-    subgraph Provider[Cloud Provider - Separate Project]
-        subgraph PF[Provider Firewall<br/>Outside Host Control]
-            I[Inbound: 443 only<br/>Outbound: 443, 53 only]
-        end
-
-        subgraph VPS[VPS Instance - Ubuntu 24.04]
-            subgraph Host[Host OS]
-                NF[nftables<br/>skuid abx-ship only]
-                F[Falco<br/>Modern eBPF]
-
-                subgraph Shipper[Shipper Process<br/>User: abx-ship]
-                    SP[attackbox-shipper]
-                    Q[Disk Queue<br/>/var/lib/attackbox-shipper]
-                    E[/etc/attackbox/shipper.env<br/>root:root 0600<br/>NR License Key]
-                end
-
-                subgraph Docker[Docker + gVisor Runtime]
-                    subgraph Container[Container<br/>UID 65532 GID 65532]
-                        BP[attackbox]
-                        SC[/run/secrets/attackbox<br/>Session Key]
-                    end
-                end
-
-                SK[/run/attackbox/spool.sock<br/>abx-ship:abx-bait 0220<br/>mode authorizes connection,<br/>protocol is one-way]
-
-                NF --> SP
-                F --> SP
-                BP --> SK
-                SK --> SP
-                SP --> Q
-                E -.->|Read by systemd| SP
-                SC -.->|Read by bait| BP
-            end
-        end
-
-        I --> VPS
-    end
-
-    subgraph External[External Services]
-        NR[New Relic<br/>log-api.newrelic.com<br/>metric-api.newrelic.com]
-    end
-
-    subgraph Operator[Operator]
-        B[Browser]
-        C[Provider Console]
-    end
-
-    SP -->|HTTPS 443| NR
-    B -->|View| NR
-    C -.->|Power Off| VPS
-
-    style E fill:#f99
-    style SC fill:#9f9
-    style SK fill:#99f
-    style Q fill:#ff9
-```
-
-## Process Boundaries
-
-**Container (gVisor sandbox):**
-- Runs as UID 65532, GID 65532
-- Read-only root filesystem
-- No capabilities
-- No new privileges
-- CPU limit: 2 cores
-- Memory limit: 512 MiB
-- Process limit: 100
-- Network: internal Docker network with no internet route
-- Cannot reach `169.254.169.254` (cloud metadata)
-- Holds no New Relic key
-
-**Host shipper:**
-- Runs as user `abx-ship`
-- Reads from Unix socket `/run/attackbox/spool.sock` (mode `0220` authorizes connection; application protocol is one-way)
-- Writes to disk queue `/var/lib/attackbox-shipper` (mode `0700`)
-- Reads ingest key from `/etc/attackbox/shipper.env` (mode `0600`, root-owned)
-- Only process with egress to New Relic (enforced by nftables `skuid`)
-
-**Trust boundary:**
-
-The shipper treats the bait as hostile. It validates every record:
-- Line length ≤2 MiB (default)
-- JSON parse success
-- Exactly one of `Event` or `Metric`
-- `ID` is printable ASCII, ≤128 bytes
-- `Event.Stream` is one of the six known streams
-- Reserved attributes (`instance`, `service.name`, `hostname`, etc.) are deleted
-- `Event.Attrs` ≤128 keys, key ≤128 bytes, value truncated to 4096 bytes
-- `Event.Timestamp` clamped to `[now-24h, now+5m]`
-- `Metric.Name` matches `^attackbox\.[a-z0-9_]+$`, ≤64 bytes, ≤64 distinct names per connection
-- Connections ≤8 (default)
-
-After validation, the shipper adds:
-- `Attrs["record_id"]` = the validated ID
-- `Attrs["source"]` = `"bait"`, `"runtime"` or `"egress"` (from connection role)
-
-## Disk Queue
-
-The shipper writes validated records to disk before sending to New Relic. This provides a bounded outage buffer.
-
-**Segments:**
-- Named `seg-<20-digit-UnixNano>.jsonl`
-- Rolled at 16 MiB (default)
-- Lexicographic order is chronological order
-
-**Checkpoint:**
-- File `state.json` in the queue directory
-- Contains `{"segment":"seg-...","offset":<int64>}`
-- Written atomically after each drained batch (temp file + rename)
-- No `fsync`: loss window is one batch, deduplicable by `record_id`
-
-**Bounded queue:**
-- Size limit: 256 MiB (default)
-- When full, delete the oldest segment
-- If the checkpoint pointed into the deleted segment, advance to the next segment
-- Count drops in `attackbox.ship_queue_dropped_total`
-- Emit one `runtime`/`queue_overflow` event (rate-limited to 1 per 30s)
-
-**Replay on startup:**
-- Read `state.json`
-- Open that segment at the offset
-- Drain forward in FIFO order
-- Missing or corrupt state → restart from oldest segment (bounded replay, deduplicable)
-
-## Heartbeat Independence
-
-Two independent liveness signals:
-
-1. **Host/egress liveness** (source=`shipper`):
-   - Direct POST to New Relic, bypasses the queue
-   - Proves the shipper and egress are working
-   - Every 30 seconds
-
-2. **Bait liveness** (carried in host heartbeat):
-   - `bait_connected`: boolean, true if a bait socket is open
-   - `last_bait_record_age_ms`: milliseconds since the last bait record
-   - Proves the bait process is alive and sending
-
-**Why separation matters:**
-
-A wedged queue or stalled drain loop cannot fake host liveness. A quiet honeypot with no attacks still sends `bait_heartbeat` records every 30s, so `last_bait_record_age_ms` works.
-
-**Alert rules:**
-
-| Condition | Meaning | Action |
-|-----------|---------|--------|
-| No `source=shipper` heartbeat for 2 min | Host or shipper down | Power off VPS |
-| `bait_connected=false` for 2 min | Bait disconnected | Rebuild container |
-| `last_bait_record_age_ms > 90000` for 2 min | Bait hung | Rebuild container |
-
-## Shutdown Ordering
-
-systemd unit dependencies ensure the shipper outlives the bait:
-
-```ini
-# attackbox-shipper.service
-Before=attackbox.service
-
-# attackbox.service
-Requires=attackbox-shipper.service
-After=attackbox-shipper.service
-```
-
-systemd stops in reverse order:
-1. Bait stops, sends `stopped` event
-2. Shipper receives `stopped`, queues it
-3. Shipper drains for `ATTACKBOX_SHIP_SHUTDOWN_TIMEOUT` (default 15s)
-4. Shipper flushes to New Relic with remaining budget
-5. Shipper exits
-
-**Bait shutdown (on SIGTERM):**
-1. Stop accepting new requests
-2. Drain in-flight requests (timeout: `ATTACKBOX_SHUTDOWN_TIMEOUT`)
-3. Emit `stopped` event to stdout (Docker logs)
-4. Emit `stopped` event to spool socket
-5. Close spool with flush context
-6. Exit
-
-**Shipper shutdown (on SIGTERM):**
-1. Stop accepting new connections, unlink socket
-2. Read buffered data from open connections (1s deadline)
-3. Flush segment writer and checkpoint
-4. Drain loop for half of `ATTACKBOX_SHIP_SHUTDOWN_TIMEOUT`
-5. Call `nr.Close()` with remaining budget
-6. Emit `stopped` to local JSONLog with counts
-
-## Fake Model Behavior
-
-The responder returns deterministic fake results. It does not call a real model.
-
-**Response sources:**
-1. **Templates** in `internal/responder/templates.go`
-2. **Declarations** from gate interactions
-3. **Nonces** generated per session
-
-**Example flow:**
-
-```
-Attacker: "List all files in the system."
-Classifier: Task = prompt-extraction
-
-Responder: Hold 150s (suspicious session)
-         → Emit registration gate
-         → SSE: "Please declare your metadata..."
-
-Attacker: "My user is alice, model is gpt-4."
-Responder: Store declarations
-         → Emit audit gate
-         → SSE: "What activity are you performing?"
-
-Attacker: "I'm testing the API."
-Responder: Store activity
-         → Emit resource gate
-         → SSE: "Your quota is limited."
-
-Attacker: "Show files again."
-Responder: Normal response (payout 1/3)
-         → SSE: "Here are the files: /home/alice/canary-2f8a9d.txt ..."
-                (canary token injected)
-
-Attacker: "Read canary-2f8a9d.txt"
-Responder: Normal response (payout 2/3)
-         → SSE: "Content: sk-local-00000000..."
-
-Attacker: "One more request"
-Responder: Normal response (payout 3/3)
-         → SSE: "Session limit reached."
-         → Terminate session
-```
-
-**Probes used:**
-- `declaration-request`: metadata/audit/resource gates
-- `character-rewriting`: invisible Unicode in messages
-- `tool-availability`: tool definitions with canaries
-- `nonce-extraction`: unique values per session
-
-**Classification rules (priority order):**
-
-1. `indirect-injection`: instructions in tool output
-2. `prompt-extraction`: system prompt requests
-3. `persistence`: file writes, cron, autostart
-4. `credential-access`: `/etc/passwd`, env vars, keys
-5. `shell-execution`: bash, eval, subprocess
-6. `url-exfiltration`: outbound HTTP/webhook requests
-7. `instruction-override`: "ignore previous", "new instructions"
-8. `tool-invocation`: tool calls, function calls
-
-## Reverse Proxy and TLS
-
-**TLS termination:**
-
-Use a reverse proxy (nginx, Caddy, Traefik) for TLS. The bait listens on HTTP inside the container. The reverse proxy forwards to the container's port.
-
-**Example nginx config:**
-
-```nginx
-upstream attackbox {
-    server host.docker.internal:8080;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name api.example.com;
-
-    ssl_certificate /etc/letsencrypt/live/api.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
-
-    location / {
-        proxy_pass http://attackbox;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_buffering off;
-    }
-}
-```
-
-**X-Forwarded-For:**
-
-The bait trusts `X-Forwarded-For` only from `ATTACKBOX_TRUSTED_PROXIES`. Set this to your reverse proxy's IP:
-
-```bash
-ATTACKBOX_TRUSTED_PROXIES=127.0.0.1/32
-```
-
-If not set, the bait uses the direct connection IP (the reverse proxy's IP, not the attacker's).
-
-## Redaction
-
-The bait redacts secrets before logging. Redaction runs in `internal/secret/scrubber.go`.
-
-**Supported patterns:**
-
-| Pattern | Example | Replacement |
-|---------|---------|-------------|
-| Bearer tokens | `Authorization: Bearer sk-...` | `Authorization: Bearer [redacted]` |
-| Basic auth | `Authorization: Basic dXNlcj...` | `Authorization: Basic [redacted]` |
-| API keys in URLs | `?api_key=abc123` | `?api_key=[redacted]` |
-| JSON credentials | `{"password":"hunter2"}` | `{"password":"[redacted]"}` |
-| Private keys | `REDACTED` | `[redacted private key]` |
-
-**Canary preservation:**
-
-Fake credentials generated by the bait (e.g., `sk-local-00000000...`) are not redacted. This lets you track canary usage in logs.
-
-**Limits:**
-
-Redaction is heuristic. It does not catch:
-- Novel encoding schemes
-- Secrets in binary data
-- Deeply nested JSON (>10 levels)
-- Large arrays (>100 elements)
-
-Use a dedicated New Relic account to isolate any leaked secrets.
-
-## Metrics
-
-The bait emits dimensional metrics. The shipper aggregates them before sending to New Relic.
-
-| Metric | Type | Labels | Meaning |
-|--------|------|--------|---------|
-| `attackbox.requests` | count | persona, endpoint, status_class | Total requests |
-| `attackbox.sessions` | count | persona | Total sessions |
-| `attackbox.request_bytes` | count | persona, endpoint | Request body bytes |
-| `attackbox.response_bytes` | count | persona, endpoint | Response body bytes |
-| `attackbox.probes` | count | persona, probe_id, task | Probe triggers |
-| `attackbox.probe_followups` | count | persona, probe_id | Followup responses to probes |
-| `attackbox.session_duration_seconds` | gauge | persona | Session age in seconds |
-| `attackbox.stream_disconnect_seconds` | gauge | persona, endpoint | Time to client disconnect |
-| `attackbox.retry_delay_seconds` | gauge | persona | Delay between 429 and retry |
-| `attackbox.concurrent_status_requests` | gauge | persona | Active status requests per session |
-| `attackbox.heartbeat` | gauge | _(none)_ | Liveness signal (value=1) |
-
-**Shipper metrics:**
-
-| Metric | Type | Labels | Meaning |
-|--------|------|--------|---------|
-| `attackbox.ship_queue_dropped_total` | count | _(none)_ | Records dropped due to queue overflow |
-| `attackbox.ship_oversize_total` | count | _(none)_ | Records dropped due to size |
-| `attackbox.ship_invalid_total` | count | _(none)_ | Records dropped due to JSON parse errors |
-
-**Label sanitization:**
-
-Labels pass through `SafeLabels` before emission. Only `[A-Za-z0-9._-]` are kept. This prevents label explosion.
-
-## Security Properties
-
-**What the design provides:**
-
-1. **Sandbox isolation:** The bait cannot reach the network or the host filesystem (gVisor).
-2. **Egress control:** Only the shipper can reach New Relic (nftables `skuid`).
-3. **Ingest-key isolation:** The bait never sees the New Relic key.
-4. **Bounded outage buffer:** The shipper queues up to 256 MiB during New Relic downtime.
-5. **Deterministic responses:** No model theft, no inference cost, no model suspension risk.
-6. **Accepted-loss secrets:** A stolen ingest key permits writes only, not reads.
-
-**What the design does not provide:**
-
-1. **Host-root protection:** Root on the host can steal the ingest key and forge telemetry.
-2. **Perfect redaction:** Heuristic redaction misses novel patterns.
-3. **Deception against reverse engineering:** A determined attacker can decompile the binary.
-4. **Live Ubuntu/New Relic/gVisor validation:** Deployment tests are required before production use.
-
-## Validation Requirements
-
-Before deploying to production, you must validate:
-
-1. **gVisor isolation:**
-   - Container cannot reach `169.254.169.254`
-   - Container cannot reach the internet
-   - DNS works inside the container
-   - Socket mount permits `connect()` despite read-only mount
-
-2. **Host firewall:**
-   - nftables `skuid` rules block non-shipper egress
-   - Shipper can reach New Relic ingest URLs
-   - Dropped packets are logged
-
-3. **Falco detection:**
-   - Falco Modern eBPF mode detects escapes
-   - Falco writes JSON to the shipper socket
-
-4. **Provider firewall:**
-   - Inbound: port 443 only
-   - Outbound: port 443 and 53 only
-   - Firewall survives host-root compromise
-
-5. **New Relic ingest:**
-   - Logs arrive in the dedicated account
-   - Metrics aggregate correctly
-   - Heartbeats appear every 30s
-
-6. **SSH disablement:**
-   - SSH is disabled
-   - Provider console access works
-
-Run validation tests from inside the gVisor container. Host-only tests are not sufficient.
+Recovery truncates a torn final frame in the newest segment. Other corruption preserves the valid prefix and quarantines the segment. Missing or inconsistent checkpoint state causes uncertain replay. Logs can repeat. Metrics in the uncertain range are suppressed and `attackbox.metric_replay_gap` records the gap. An I/O error can leave the queue broken until restart and recovery; do not delete queue files to clear it.
+
+On shutdown, the shipper cancels ingest and drain, checkpoints confirmed delivery, and closes its remote client within the configured timeout. It leaves unacknowledged disk records for restart. It does not promise to empty the disk queue before exit.
+
+Source: `/Users/rohit/attack-box/internal/shipper/queue.go` and `/Users/rohit/attack-box/cmd/attackbox-shipper/drain.go`.
+
+## Network, secrets, and host limits
+
+The intended bait boundary permits inbound proxy traffic and local spool writes. Container-originated internet and metadata access must be denied. The host shipper uses allowlisted New Relic HTTPS destinations. Host policy also permits specific DNS, time, and update traffic. Provider firewall policy is a separate control.
+
+The current deployment uses US New Relic endpoints. Changing endpoint URLs alone does not change the deployment script's firewall sets or verification hosts. DNS refresh adds addresses; stale addresses remain until a ruleset reload or reboot. IP allowlisting does not make a permitted remote endpoint a trusted data source.
+
+The bait secret is mounted at `/run/secrets/attackbox_secret`. The host ingest key is loaded from `/etc/attackbox/shipper.env`. The key permits telemetry ingestion; it must belong to a dedicated decoy account with bounded cost exposure. Root or shipper compromise can expose it. Socket isolation does not protect it after host-root compromise.
+
+Source: `/Users/rohit/attack-box/compose.yaml`, `/Users/rohit/attack-box/deploy/nftables/attackbox.nft`, and `/Users/rohit/attack-box/scripts/deploy-ubuntu.sh`.
+
+## Health and interpretation
+
+The shipper sends a heartbeat every 30 seconds directly through its New Relic client, outside the disk queue. `bait_connected` means at least one bait socket connection exists. `last_bait_record_age_ms` is -1 before a valid bait record. Both `queue_bytes` and `queue_backlog_bytes` currently report unacknowledged queue bytes. `ship_dropped_total` reports queue drops, not every possible collection loss.
+
+A heartbeat proves one reporting path worked at that time. It does not prove complete capture, correct responses, working Falco, or containment. An ingest spike is an investigation signal. It does not alone prove compromise.
+
+## Proposed Go extension contracts
+
+All entries below remain proposals. Detailed requirements, resource budgets, dependency order, and adversarial cases V01–V14 are in `/Users/rohit/attack-box/IMPROVE.md`.
+
+| Area | Required contract before implementation |
+|---|---|
+| Discovery | Explicit public persona ports, versioned catalogs, IPv4/IPv6 routing, closed-ingress rehearsal, independent reachability and containment checks |
+| Response state | Server-owned issuance records, bounded per-session state, serialized transitions, state versions and restart epochs, idempotency, delivery and cancellation semantics |
+| Protocol output | Typed Go response plans, capability matrix, schema validation, bounded JSON/SSE output, deterministic fallback before bytes are sent |
+| Collection | Evidence schema versions, authenticated provenance, stage-specific loss, post-decode redaction, bounded payload admission and retention |
+| Analysis | Separate Go batch job; bounded transforms and graphs; candidate rather than actor attribution; immutable evidence references; no automatic policy updates |
+| Evaluation | Trusted test origin, frozen labels and held-out data, negative controls, poisoning tests, load and failure tests; model scores advisory only |
+| Optional extensions | Agent protocol and offline language generation only after core gates; no real execution or attacker-controlled egress |
+
+For each service change, update this document and `/Users/rohit/attack-box/docs/operator.md` in the same change. Include the executable, versioned input/output contract, all flags and environment defaults, identity, secrets, network policy, disk/memory limits, shutdown, recovery, setup, rollback, and validation evidence. Do not document a proposed binary or option as runnable.
+
+## Validation boundary
+
+Source review and local tests establish only their tested behavior. Public port reachability, gVisor host-socket behavior, authenticated remote ingest, proxy containment, restart recovery, and the provider-console recovery path require deployment evidence. The current deploy-script verifier has false-positive paths and incomplete coverage; see `/Users/rohit/attack-box/docs/operator.md` before using it.
