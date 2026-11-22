@@ -406,12 +406,12 @@ func (cn *conn) batch() (items []Item, more bool, err error) {
 		if len(items) > 0 && !cn.lineBuffered() {
 			break
 		}
-		line, oversize, err := cn.readLine()
+		line, n, oversize, err := cn.readLine()
 		if err != nil {
 			return items, false, err
 		}
 		// A wait cut by shutdown still admits the line already read.
-		werr := cfg.sleep(cn.in.ctx, cn.rs.bucket.take(int64(len(line))+1))
+		werr := cfg.sleep(cn.in.ctx, cn.rs.bucket.take(int64(n)+1))
 		item, ok, err := cn.admit(line, oversize)
 		if ok {
 			items = append(items, item)
@@ -472,12 +472,12 @@ func (cn *conn) lineBuffered() bool {
 }
 
 // readLine returns one line without its newline. A line over MaxLine is
-// discarded through its newline and reported as oversize; the returned slice
-// then holds no data but its length counts the discarded bytes for the rate
-// limit. A final line without a newline is dropped at EOF.
-func (cn *conn) readLine() (line []byte, oversize bool, err error) {
+// discarded through its newline and reported as oversize; line is then nil and
+// n counts the discarded bytes for the rate limit. For a kept line n is
+// len(line). A final line without a newline is dropped at EOF.
+func (cn *conn) readLine() (line []byte, n int, oversize bool, err error) {
 	cfg := &cn.in.cfg
-	cn.c.SetReadDeadline(cfg.Now().Add(cfg.IdleTimeout))
+	cn.setReadDeadline(cfg.Now().Add(cfg.IdleTimeout))
 	var buf []byte
 	discarded := 0
 	started := false
@@ -485,20 +485,21 @@ func (cn *conn) readLine() (line []byte, oversize bool, err error) {
 		frag, err := cn.br.ReadSlice('\n')
 		if !started && len(frag) > 0 {
 			started = true
-			cn.c.SetReadDeadline(cfg.Now().Add(cfg.LineTimeout))
+			cn.setReadDeadline(cfg.Now().Add(cfg.LineTimeout))
 		}
 		switch {
 		case err == nil:
 			frag = frag[:len(frag)-1]
 			if discarded > 0 || len(buf)+len(frag) > MaxLine {
-				return make([]byte, discarded+len(buf)+len(frag)), true, nil
+				return nil, discarded + len(buf) + len(frag), true, nil
 			}
 			if buf == nil {
 				// The reader reuses its buffer; the caller keeps the line
 				// past the next read.
-				return bytes.Clone(frag), false, nil
+				return bytes.Clone(frag), len(frag), false, nil
 			}
-			return append(buf, frag...), false, nil
+			buf = append(buf, frag...)
+			return buf, len(buf), false, nil
 		case errors.Is(err, bufio.ErrBufferFull):
 			if discarded > 0 || len(buf)+len(frag) > MaxLine {
 				discarded += len(buf) + len(frag)
@@ -507,9 +508,19 @@ func (cn *conn) readLine() (line []byte, oversize bool, err error) {
 			}
 			buf = append(buf, frag...)
 		default:
-			return nil, false, err
+			return nil, 0, false, err
 		}
 	}
+}
+
+// setReadDeadline sets the read deadline unless shutdown has begun. Shutdown
+// cancels the context before it cuts the open reads, so a deadline set here
+// either sees the cancel or is cut afterwards; it never outlives the cut.
+func (cn *conn) setReadDeadline(t time.Time) {
+	if cn.in.ctx.Err() != nil {
+		t = time.Unix(1, 0)
+	}
+	cn.c.SetReadDeadline(t)
 }
 
 // mark records seq for boot and reports whether it is new. A seq at or below

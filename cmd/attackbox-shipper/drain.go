@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -10,140 +11,142 @@ import (
 	"attackbox/internal/telemetry"
 )
 
-// drain reads entries from the queue and delivers them to New Relic. It
-// checkpoints only after successful delivery, so a crash or New Relic outage
-// replays unacknowledged records. Uncertain recovery suppresses metrics up to
+// drainQueue is the part of shipper.Queue the drain loop uses.
+type drainQueue interface {
+	Read(max, maxBytes int) ([]shipper.Entry, error)
+	Ack(n int) error
+}
+
+// drainSink is the part of telemetry.NewRelic the drain loop uses. Both calls
+// block until New Relic accepts the item or the attempt fails.
+type drainSink interface {
+	ShipEvent(telemetry.Event) error
+	ShipMetric(name, kind string, value float64, at time.Time, attrs map[string]string) error
+}
+
+const (
+	drainReadMax      = 200 // entries per Read
+	drainReadMaxBytes = 512 << 10
+	drainAckEvery     = 200 // checkpoint after this many delivered records
+	drainAckInterval  = time.Second
+	drainIdlePoll     = 100 * time.Millisecond // wait before re-reading an empty queue
+	drainRetryWait    = 250 * time.Millisecond // wait after the sink failed a delivery
+)
+
+// drain reads entries from the queue and delivers them to New Relic
+// synchronously. It checkpoints only records the sink confirmed, so a crash or
+// New Relic outage replays everything the checkpoint does not cover. A failed
+// entry stays in memory and is retried; nothing behind it is delivered or
+// acknowledged first. Uncertain recovery suppresses metrics up to
 // uncertainThrough to avoid double-counting.
-func drain(ctx context.Context, q *shipper.Queue, nr *telemetry.NewRelic, uncertain bool, uncertainThrough uint64, timeout time.Duration) error {
-	const (
-		readMax      = 200 // entries per Read
-		readMaxBytes = 512 << 10
-		ackEvery     = 200 // checkpoint after this many delivered records
-		ackInterval  = time.Second
-	)
-
-	ticker := time.NewTicker(ackInterval)
-	defer ticker.Stop()
-
-	var (
-		pending   []shipper.Entry
-		toAck     int
-		lastAck   time.Time
-		delivered int
-		retryAt   time.Time
-		metricAt  uint64
-	)
-
+func drain(ctx context.Context, q drainQueue, nr drainSink, uncertain bool, uncertainThrough uint64, timeout time.Duration) error {
+	var skipThrough uint64
 	if uncertain {
-		metricAt = uncertainThrough
-		// Emit metric_replay_gap to signal suppressed metrics
-		if err := nr.ShipMetric("attackbox.metric_replay_gap", "gauge", 1, time.Now(), map[string]string{
+		skipThrough = uncertainThrough
+		// Signal the suppressed range; losing this signal must not stop the drain.
+		_ = nr.ShipMetric("attackbox.metric_replay_gap", "gauge", 1, time.Now(), map[string]string{
 			"uncertain_through": fmt.Sprintf("%d", uncertainThrough),
-		}); err != nil {
-			// Log but don't fail on this signal metric
-		}
+		})
 	}
 
-	for {
-		if len(pending) == 0 && toAck == 0 {
-			// Read more from queue
-			entries, err := q.Read(readMax, readMaxBytes)
+	var (
+		pending []shipper.Entry
+		toAck   int
+		lastAck = time.Now()
+	)
+	checkpoint := func() error {
+		if toAck == 0 {
+			return nil
+		}
+		if err := q.Ack(toAck); err != nil {
+			return err
+		}
+		toAck = 0
+		lastAck = time.Now()
+		return nil
+	}
+
+	for ctx.Err() == nil {
+		idle := false
+		if len(pending) == 0 {
+			entries, err := q.Read(drainReadMax, drainReadMaxBytes)
 			if err != nil {
 				return err
 			}
-			if len(entries) == 0 {
-				// Queue is empty; wait for context or new data
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(100 * time.Millisecond):
-					continue
-				}
-			}
 			pending = entries
-			retryAt = time.Time{}
-		}
-		// Deliver pending entries synchronously
-		delivered = 0
-		for i, e := range pending {
-			var rec telemetry.Record
-			if err := json.Unmarshal(e.Data, &rec); err != nil {
-				// Corrupt JSON: fail closed, do not Ack
-				return fmt.Errorf("corrupt queue payload at seq %d: %w", e.Seq, err)
-			}
-
-			if rec.Event != nil {
-				// ShipEvent blocks until delivered or permanently failed
-				if err := nr.ShipEvent(*rec.Event); err != nil {
-					// Transient failure: stop, Rewind will replay from here
-					q.Rewind()
-					time.Sleep(250 * time.Millisecond)
-					break
-				}
-			} else if rec.Metric != nil {
-				// Skip metrics in uncertain range
-				if uncertain && e.Seq <= metricAt {
-					delivered = i + 1
-					continue
-				}
-				// ShipMetric blocks until delivered or permanently failed
-				if err := nr.ShipMetric(rec.Metric.Name, rec.Metric.Kind, rec.Metric.Value, rec.Metric.At, rec.Metric.Attrs); err != nil {
-					// Transient failure: stop, Rewind will replay
-					q.Rewind()
-					time.Sleep(250 * time.Millisecond)
-					break
-				}
-			}
-			// If context was cancelled during ShipEvent/ShipMetric, Rewind and exit
-			if ctx.Err() != nil {
-				q.Rewind()
-				return ctx.Err()
-			}
-			delivered = i + 1
-		}
-		if delivered > 0 {
-			pending = pending[delivered:]
-			toAck += delivered
+			idle = len(entries) == 0
 		}
 
-		// Checkpoint if we've accumulated enough or enough time has passed
-		now := time.Now()
-		shouldAck := toAck >= ackEvery || (toAck > 0 && now.Sub(lastAck) >= ackInterval)
-
-		select {
-		case <-ticker.C:
-			if toAck > 0 {
-				shouldAck = true
-			}
-		default:
+		n, blocked, err := deliver(ctx, nr, pending, skipThrough)
+		pending = pending[n:]
+		toAck += n
+		if err != nil {
+			// Fail closed on a payload that does not decode, but keep what
+			// was delivered before it.
+			return errors.Join(err, checkpoint())
 		}
 
-		if shouldAck {
-			if err := q.Ack(toAck); err != nil {
+		if toAck >= drainAckEvery || (toAck > 0 && time.Since(lastAck) >= drainAckInterval) {
+			if err := checkpoint(); err != nil {
 				return err
 			}
-			toAck = 0
-			lastAck = now
 		}
 
-		// Check for context cancellation
+		var wait time.Duration
+		switch {
+		case blocked:
+			wait = drainRetryWait
+		case idle:
+			wait = drainIdlePoll
+		default:
+			continue
+		}
+		t := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
-			// Ack what we delivered before cancellation, but don't try to drain more
-			// because shutdown cannot acknowledge queued-only records
-			if toAck > 0 {
-				q.Ack(toAck)
-			}
-			return ctx.Err()
-		default:
+		case <-t.C:
 		}
-
-		// If we're waiting for retry, sleep a bit
-		if !retryAt.IsZero() && len(pending) > 0 {
-			waitFor := time.Until(retryAt)
-			if waitFor > 0 {
-				time.Sleep(waitFor)
-			}
-		}
+		t.Stop()
 	}
+
+	// Shutdown: ack what was delivered. Entries still pending replay on the
+	// next start. The checkpoint error outranks ctx.Err, which the caller
+	// treats as a clean stop.
+	if err := checkpoint(); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+// deliver hands entries to the sink in order and returns how many were taken
+// from the front. blocked reports that the sink failed an item, so the rest
+// must wait. Metrics at or below skipThrough are taken but not shipped. A
+// delivery that finishes after ctx is done is not counted, so shutdown never
+// acknowledges it. err is set for a payload that does not decode.
+func deliver(ctx context.Context, nr drainSink, entries []shipper.Entry, skipThrough uint64) (n int, blocked bool, err error) {
+	for _, e := range entries {
+		if ctx.Err() != nil {
+			return n, false, nil
+		}
+		var rec telemetry.Record
+		if err := json.Unmarshal(e.Data, &rec); err != nil {
+			return n, false, fmt.Errorf("corrupt queue payload at seq %d: %w", e.Seq, err)
+		}
+		switch {
+		case rec.Event != nil:
+			if err := nr.ShipEvent(*rec.Event); err != nil {
+				return n, true, nil
+			}
+		case rec.Metric != nil && e.Seq > skipThrough:
+			m := rec.Metric
+			if err := nr.ShipMetric(m.Name, m.Kind, m.Value, m.At, m.Attrs); err != nil {
+				return n, true, nil
+			}
+		}
+		if ctx.Err() != nil {
+			return n, false, nil
+		}
+		n++
+	}
+	return n, false, nil
 }
