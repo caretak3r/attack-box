@@ -15,7 +15,7 @@ func BenchmarkChunkSmallBody(b *testing.B) {
 		Action:    "request",
 		Body:      "short log message",
 	}
-	
+
 	for b.Loop() {
 		_ = Chunk(e, MaxChunk)
 	}
@@ -28,7 +28,7 @@ func BenchmarkChunkTypicalLog(b *testing.B) {
 		Action:    "completion",
 		Body:      strings.Repeat("typical log entry with some content. ", 20), // ~700 chars
 	}
-	
+
 	for b.Loop() {
 		_ = Chunk(e, MaxChunk)
 	}
@@ -41,7 +41,7 @@ func BenchmarkChunkLargeBody(b *testing.B) {
 		Action:    "capture",
 		Body:      strings.Repeat("x", 10000), // 10KB, requires chunking
 	}
-	
+
 	for b.Loop() {
 		_ = Chunk(e, MaxChunk)
 	}
@@ -56,7 +56,7 @@ func BenchmarkChunkMultibyte(b *testing.B) {
 		Action:    "request",
 		Body:      body,
 	}
-	
+
 	for b.Loop() {
 		_ = Chunk(e, MaxChunk)
 	}
@@ -69,7 +69,7 @@ func BenchmarkChunkEmptyBody(b *testing.B) {
 		Action:    "ping",
 		Body:      "",
 	}
-	
+
 	for b.Loop() {
 		_ = Chunk(e, MaxChunk)
 	}
@@ -83,7 +83,7 @@ func BenchmarkChunkMaxSize(b *testing.B) {
 		Action:    "log",
 		Body:      strings.Repeat("x", MaxChunk),
 	}
-	
+
 	for b.Loop() {
 		_ = Chunk(e, MaxChunk)
 	}
@@ -96,7 +96,7 @@ func BenchmarkChunkSmallLimit(b *testing.B) {
 		Action:    "request",
 		Body:      strings.Repeat("x", 1000),
 	}
-	
+
 	for b.Loop() {
 		_ = Chunk(e, 500)
 	}
@@ -126,7 +126,7 @@ func BenchmarkAttributes(b *testing.B) {
 		ChunkIndex: 0,
 		ChunkCount: 1,
 	}
-	
+
 	for b.Loop() {
 		_ = e.Attributes()
 	}
@@ -137,7 +137,7 @@ func BenchmarkMessage(b *testing.B) {
 		Action: "request",
 		Body:   "log message body",
 	}
-	
+
 	for b.Loop() {
 		_ = e.Message()
 	}
@@ -148,7 +148,7 @@ func BenchmarkMessageEmptyBody(b *testing.B) {
 		Action: "ping",
 		Body:   "",
 	}
-	
+
 	for b.Loop() {
 		_ = e.Message()
 	}

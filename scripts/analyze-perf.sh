@@ -21,55 +21,56 @@ main() {
     echo "=== Performance Analysis ==="
     echo "Run directory: ${RUN_DIR}"
     echo
-    
+
     for bench_file in "${RUN_DIR}"/*.bench.txt; do
         if [[ ! -f "${bench_file}" ]]; then
             continue
         fi
-        
+
         local name
         name=$(basename "${bench_file}" .bench.txt)
-        # Extract benchmarks with median ns/op (using simple averaging for 5 runs)
+        # Extract average ns/op for each benchmark (5 runs)
         grep '^Benchmark' "${bench_file}" | \
-            awk '{name=$1; gsub(/^Benchmark/,"",name); gsub(/-[0-9]+$/,"",name); sum[name]+=$3; count[name]++} 
-                 END {for(n in sum) printf "%-40s %10.0f ns/op\n", n, sum[n]/count[n]}' | \
+            awk '{name=$1; gsub(/^Benchmark/,"",name); gsub(/-[0-9]+$/,"",name); sum[name]+=$3; count[name]++}
+                 END {for(n in sum) printf "%-40s %10.0f ns/op (avg)\n", n, sum[n]/count[n]}' | \
             sort -k2 -n -r | head -15
-        
+
         echo
     done
-    
-    echo "=== Opportunity Score Calculation ==="
-    echo "Score = (ns/op / 1000) * usage_factor"
-    echo "where usage_factor is estimated frequency per request"
+
+    echo "=== Opportunity Score Estimation ==="
+    echo "Formula: (avg_ns_op / 1000000) * estimated_frequency"
+    echo "Frequency estimates are ASSUMPTIONS, not measured data:"
+    echo "  - secret.Scrub: 5× per request (assumed)"
+    echo "  - telemetry.Chunk: 2× per request (assumed)"
+    echo "  - responder.Classify: 1× per request (assumed)"
     echo
-    echo "High-impact functions (hotspot score >= 2.0):"
-    echo "  - Scrub: ~10,000-100,000 ns/op, called 1-10x per request"
-    echo "  - Chunk: ~1,000-10,000 ns/op, called 1-5x per request"
-    echo "  - Classify: ~1,000-10,000 ns/op, called 1x per request"
+    echo "These scores are NOT production hotspot measurements."
+    echo "Real per-request profiling required before optimization."
     echo
-    
+
     # Compute rough opportunity scores based on typical operations
     for bench_file in "${RUN_DIR}"/*.bench.txt; do
         if [[ ! -f "${bench_file}" ]]; then
             continue
         fi
-        
+
         local name
         name=$(basename "${bench_file}" .bench.txt)
-        
-        
+
+
         grep '^Benchmark' "${bench_file}" | \
             awk -v name="${name}" '{
-                bench=$1; 
-                gsub(/^Benchmark/,"",bench); 
-                gsub(/-[0-9]+$/,"",bench); 
-                sum[bench]+=$3; 
+                bench=$1;
+                gsub(/^Benchmark/,"",bench);
+                gsub(/-[0-9]+$/,"",bench);
+                sum[bench]+=$3;
                 count[bench]++
             }
             END {
                 for (b in sum) {
                     avg = sum[b]/count[b]
-                    
+
                     # Estimate usage frequency based on benchmark name
                     freq = 1
                     if (b ~ /Scrub/ && name == "secret") {
@@ -79,10 +80,10 @@ main() {
                     } else if (b ~ /Classify/ && name == "responder") {
                         freq = 1
                     }
-                    
+
                     # Opportunity score: (time in ms) * frequency
                     score = (avg / 1000000) * freq
-                    
+
                     if (score >= 2.0) {
                         printf "  %-38s %10.2f ms * %d = %.2f (HIGH)\n", b, avg/1000000, freq, score
                     } else if (score >= 0.5) {
@@ -90,9 +91,9 @@ main() {
                     }
                 }
             }' | sort -t= -k2 -n -r
-        
+
         echo
-        
+
         echo
     done
 }

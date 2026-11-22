@@ -88,7 +88,7 @@ func BenchmarkScrubLargeLog(b *testing.B) {
 	}
 	sb.WriteString(`],"metadata":{"api_key":"sk-9876543210fedcba"}}}}`)
 	text := sb.String()
-	
+
 	b.ResetTimer()
 	for b.Loop() {
 		_ = Scrub(text, benchFP)
@@ -118,7 +118,7 @@ func BenchmarkScrubAdversarialCookie(b *testing.B) {
 		sb.WriteString(string(rune('0' + (i % 10))))
 	}
 	text := sb.String()
-	
+
 	b.ResetTimer()
 	for b.Loop() {
 		_ = Scrub(text, benchFP)
@@ -144,7 +144,7 @@ func BenchmarkIsCredentialName(b *testing.B) {
 		"status",
 		"timestamp",
 	}
-	
+
 	b.ResetTimer()
 	for b.Loop() {
 		for _, name := range names {
