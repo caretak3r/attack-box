@@ -1,0 +1,415 @@
+{
+  "name": "AttackBox Overview",
+  "description": "Real-time monitoring of honeypot activity, streams, and system health",
+  "permissions": "PUBLIC_READ_WRITE",
+  "pages": [
+    {
+      "name": "Overview",
+      "description": "High-level status and activity metrics",
+      "widgets": [
+        {
+          "title": "Active Sessions (Last Hour)",
+          "layout": {
+            "column": 1,
+            "row": 1,
+            "width": 4,
+            "height": 3
+          },
+          "visualization": {
+            "id": "viz.billboard"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Metric SELECT uniqueCount(session_id) AS 'Sessions' WHERE metricName = 'attackbox.requests' SINCE 1 hour ago"
+              }
+            ]
+          }
+        },
+        {
+          "title": "Request Rate",
+          "layout": {
+            "column": 5,
+            "row": 1,
+            "width": 4,
+            "height": 3
+          },
+          "visualization": {
+            "id": "viz.line"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Metric SELECT rate(sum(attackbox.requests), 1 minute) AS 'Requests/min' WHERE metricName = 'attackbox.requests' TIMESERIES AUTO FACET persona"
+              }
+            ]
+          }
+        },
+        {
+          "title": "Heartbeat Status",
+          "layout": {
+            "column": 9,
+            "row": 1,
+            "width": 4,
+            "height": 3
+          },
+          "visualization": {
+            "id": "viz.billboard"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Log SELECT latest(timestamp) AS 'Last Heartbeat', (now() - latest(timestamp)) / 1000 AS 'Age (seconds)' WHERE stream = 'heartbeat' AND source = 'shipper' SINCE 5 minutes ago"
+              }
+            ],
+            "thresholds": [
+              {
+                "alertSeverity": "WARNING",
+                "value": 60
+              },
+              {
+                "alertSeverity": "CRITICAL",
+                "value": 120
+              }
+            ]
+          }
+        },
+        {
+          "title": "Stream Health",
+          "layout": {
+            "column": 1,
+            "row": 4,
+            "width": 6,
+            "height": 3
+          },
+          "visualization": {
+            "id": "viz.table"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Log SELECT count(*) AS 'Events', latest(timestamp) AS 'Last Event' WHERE stream IN ('edge', 'transcript', 'probe', 'runtime', 'egress', 'heartbeat') FACET stream SINCE 10 minutes ago"
+              }
+            ]
+          }
+        },
+        {
+          "title": "Top Attack Tasks",
+          "layout": {
+            "column": 7,
+            "row": 4,
+            "width": 6,
+            "height": 3
+          },
+          "visualization": {
+            "id": "viz.bar"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Metric SELECT sum(attackbox.probes) AS 'Probes' WHERE metricName = 'attackbox.probes' FACET task SINCE 1 hour ago LIMIT 10"
+              }
+            ]
+          }
+        },
+        {
+          "title": "Canary Activity (Deduped)",
+          "layout": {
+            "column": 1,
+            "row": 7,
+            "width": 12,
+            "height": 3
+          },
+          "visualization": {
+            "id": "viz.table"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Log SELECT latest(timestamp) AS 'Time', latest(session_id) AS 'Session', latest(src_ip) AS 'Source', latest(action) AS 'Action' WHERE stream = 'probe' AND action = 'canary-reuse' AND record_id IS NOT NULL FACET record_id, body_sha256, chunk_index SINCE 1 hour ago LIMIT 50"
+              }
+            ]
+          }
+        },
+        {
+          "title": "Probe Distribution",
+          "layout": {
+            "column": 1,
+            "row": 10,
+            "width": 6,
+            "height": 3
+          },
+          "visualization": {
+            "id": "viz.pie"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Metric SELECT sum(attackbox.probes) WHERE metricName = 'attackbox.probes' FACET probe_id SINCE 1 hour ago LIMIT 15"
+              }
+            ]
+          }
+        },
+        {
+          "title": "Traffic by Persona",
+          "layout": {
+            "column": 7,
+            "row": 10,
+            "width": 6,
+            "height": 3
+          },
+          "visualization": {
+            "id": "viz.area"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Metric SELECT rate(sum(attackbox.requests), 1 minute) WHERE metricName = 'attackbox.requests' TIMESERIES AUTO FACET persona"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Security Events",
+      "description": "Critical security signals and blocked activity",
+      "widgets": [
+        {
+          "title": "Falco Critical Events (Deduped)",
+          "layout": {
+            "column": 1,
+            "row": 1,
+            "width": 12,
+            "height": 4
+          },
+          "visualization": {
+            "id": "viz.table"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Log SELECT latest(timestamp) AS 'Time', latest(action) AS 'Action', latest(resource) AS 'Details' WHERE stream = 'runtime' AND action = 'falco' AND priority IN ('Critical', 'Emergency') AND record_id IS NOT NULL FACET record_id, body_sha256, chunk_index SINCE 1 hour ago LIMIT 100"
+              }
+            ]
+          }
+        },
+        {
+          "title": "Blocked Egress Attempts (Deduped)",
+          "layout": {
+            "column": 1,
+            "row": 5,
+            "width": 12,
+            "height": 4
+          },
+          "visualization": {
+            "id": "viz.table"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Log SELECT latest(timestamp) AS 'Time', latest(dst_ip) AS 'Destination', latest(dst_port) AS 'Port', latest(proto) AS 'Protocol' WHERE stream = 'egress' AND action = 'egress_blocked' AND record_id IS NOT NULL FACET record_id, body_sha256, chunk_index SINCE 1 hour ago LIMIT 100"
+              }
+            ]
+          }
+        },
+        {
+          "title": "Egress Block Rate",
+          "layout": {
+            "column": 1,
+            "row": 9,
+            "width": 6,
+            "height": 3
+          },
+          "visualization": {
+            "id": "viz.line"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Log SELECT count(*) AS 'Blocks' WHERE stream = 'egress' AND action = 'egress_blocked' TIMESERIES 1 minute SINCE 1 hour ago"
+              }
+            ]
+          }
+        },
+        {
+          "title": "Runtime Events by Action",
+          "layout": {
+            "column": 7,
+            "row": 9,
+            "width": 6,
+            "height": 3
+          },
+          "visualization": {
+            "id": "viz.bar"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Log SELECT count(*) WHERE stream = 'runtime' FACET action SINCE 1 hour ago LIMIT 20"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Telemetry Health",
+      "description": "Shipper and ingest monitoring",
+      "widgets": [
+        {
+          "title": "Bait Connection Status",
+          "layout": {
+            "column": 1,
+            "row": 1,
+            "width": 4,
+            "height": 3
+          },
+          "visualization": {
+            "id": "viz.billboard"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Log SELECT latest(bait_connected) AS 'Bait Connected', latest(last_bait_record_age_ms) / 1000 AS 'Age (sec)' WHERE stream = 'heartbeat' AND source = 'shipper' SINCE 5 minutes ago"
+              }
+            ],
+            "thresholds": [
+              {
+                "alertSeverity": "WARNING",
+                "value": 60
+              },
+              {
+                "alertSeverity": "CRITICAL",
+                "value": 90
+              }
+            ]
+          }
+        },
+        {
+          "title": "Queue Backlog",
+          "layout": {
+            "column": 5,
+            "row": 1,
+            "width": 4,
+            "height": 3
+          },
+          "visualization": {
+            "id": "viz.line"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Log SELECT latest(queue_backlog_bytes) / 1048576 AS 'Backlog (MB)' WHERE stream = 'heartbeat' AND source = 'shipper' TIMESERIES 1 minute SINCE 1 hour ago"
+              }
+            ]
+          }
+        },
+        {
+          "title": "Ingest Errors",
+          "layout": {
+            "column": 9,
+            "row": 1,
+            "width": 4,
+            "height": 3
+          },
+          "visualization": {
+            "id": "viz.billboard"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Log SELECT count(*) AS 'Errors' WHERE stream = 'runtime' AND action = 'newrelic_error' SINCE 10 minutes ago"
+              }
+            ],
+            "thresholds": [
+              {
+                "alertSeverity": "WARNING",
+                "value": 10
+              },
+              {
+                "alertSeverity": "CRITICAL",
+                "value": 50
+              }
+            ]
+          }
+        },
+        {
+          "title": "NrIntegrationError Events",
+          "layout": {
+            "column": 1,
+            "row": 4,
+            "width": 12,
+            "height": 3
+          },
+          "visualization": {
+            "id": "viz.table"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM NrIntegrationError SELECT timestamp, message, newRelicFeature SINCE 1 hour ago LIMIT 100"
+              }
+            ]
+          }
+        },
+        {
+          "title": "Dropped Records",
+          "layout": {
+            "column": 1,
+            "row": 7,
+            "width": 6,
+            "height": 3
+          },
+          "visualization": {
+            "id": "viz.line"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Log SELECT latest(ship_dropped_total) AS 'Shipper Drops' WHERE stream = 'heartbeat' AND source = 'shipper' TIMESERIES 1 minute SINCE 1 hour ago"
+              }
+            ]
+          }
+        },
+        {
+          "title": "Spool Clients",
+          "layout": {
+            "column": 7,
+            "row": 7,
+            "width": 6,
+            "height": 3
+          },
+          "visualization": {
+            "id": "viz.line"
+          },
+          "rawConfiguration": {
+            "nrqlQueries": [
+              {
+                "accountId": 0,
+                "query": "FROM Log SELECT latest(spool_clients) AS 'Connected Clients' WHERE stream = 'heartbeat' AND source = 'shipper' TIMESERIES 1 minute SINCE 1 hour ago"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
