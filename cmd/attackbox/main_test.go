@@ -98,6 +98,16 @@ func TestLoadConfigFull(t *testing.T) {
 	if c2.timing {
 		t.Fatal("ATTACKBOX_TIMING=false must turn response pacing off")
 	}
+	if c.spoolSocket != "" || c.spoolQueue != telemetry.DefaultSpoolQueue || c.spoolTimeout != telemetry.DefaultSpoolTimeout {
+		t.Fatalf("spool defaults = %q %d %v", c.spoolSocket, c.spoolQueue, c.spoolTimeout)
+	}
+	c3, err := loadConfig(envOf(map[string]string{"ATTACKBOX_SPOOL_SOCKET": "/run/attackbox/spool.sock", "ATTACKBOX_SPOOL_QUEUE": "100000", "ATTACKBOX_SPOOL_TIMEOUT": "2s"}))
+	if err != nil {
+		t.Fatalf("spool mode needs no key: %v", err)
+	}
+	if c3.nrKey != "" || c3.nrDisabled || c3.spoolSocket != "/run/attackbox/spool.sock" || c3.spoolQueue != 100000 || c3.spoolTimeout != 2*time.Second {
+		t.Fatalf("spool config = %+v", c3)
+	}
 }
 
 func TestLoadConfigErrors(t *testing.T) {
@@ -146,6 +156,12 @@ func TestLoadConfigErrors(t *testing.T) {
 		"per-source cap":    {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_PER_SOURCE": "1001"}, "ATTACKBOX_MAX_PER_SOURCE"},
 		"per-source>total":  {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_PER_SOURCE": "20", "ATTACKBOX_MAX_IN_FLIGHT": "10"}, "must not exceed ATTACKBOX_MAX_IN_FLIGHT"},
 		"duration cap":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SHUTDOWN_TIMEOUT": "2h"}, "ATTACKBOX_SHUTDOWN_TIMEOUT"},
+		"spool+disabled":    {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SPOOL_SOCKET": "/run/attackbox/spool.sock"}, "ATTACKBOX_NR_DISABLED=true conflicts with ATTACKBOX_SPOOL_SOCKET"},
+		"spool+key":         {map[string]string{"ATTACKBOX_NR_LICENSE_KEY": testNRKey, "ATTACKBOX_SPOOL_SOCKET": "/run/attackbox/spool.sock"}, "only the host shipper holds the key"},
+		"relative spool":    {map[string]string{"ATTACKBOX_SPOOL_SOCKET": "spool.sock"}, "ATTACKBOX_SPOOL_SOCKET: spool: socket path must be absolute"},
+		"long spool":        {map[string]string{"ATTACKBOX_SPOOL_SOCKET": "/" + strings.Repeat("s", 107)}, "at most 107"},
+		"spool queue cap":   {map[string]string{"ATTACKBOX_SPOOL_SOCKET": "/run/s.sock", "ATTACKBOX_SPOOL_QUEUE": "100001"}, "ATTACKBOX_SPOOL_QUEUE: want an integer from 1 to 100000"},
+		"spool timeout":     {map[string]string{"ATTACKBOX_SPOOL_SOCKET": "/run/s.sock", "ATTACKBOX_SPOOL_TIMEOUT": "0s"}, "ATTACKBOX_SPOOL_TIMEOUT"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -165,6 +181,11 @@ func TestCLIFlags(t *testing.T) {
 	out.Reset()
 	if code := cli([]string{"-check-config"}, envOf(map[string]string{"ATTACKBOX_NR_DISABLED": "1"}), &out, &errb); code != 0 || !strings.Contains(out.String(), "new relic disabled") {
 		t.Fatalf("check-config: code %d out %q err %q", code, out.String(), errb.String())
+	}
+	out.Reset()
+	if code := cli([]string{"-check-config"}, envOf(map[string]string{"ATTACKBOX_SPOOL_SOCKET": "/run/attackbox/spool.sock"}), &out, &errb); code != 0 ||
+		!strings.Contains(out.String(), "new relic off (host shipper), spool /run/attackbox/spool.sock") {
+		t.Fatalf("check-config spool: code %d out %q err %q", code, out.String(), errb.String())
 	}
 	errb.Reset()
 	if code := cli([]string{"-check-config"}, envOf(nil), &out, &errb); code != 2 || !strings.Contains(errb.String(), "ATTACKBOX_NR_LICENSE_KEY") {
@@ -547,4 +568,199 @@ func TestLossError(t *testing.T) {
 	if err := lossError(telemetry.Stats{Lost: 2, LastError: "status 403"}); err == nil || err.Error() != "new relic: 2 lost, 0 dropped; last error: status 403" {
 		t.Fatalf("with last error: %v", err)
 	}
+}
+
+// spoolPeer is a fake host shipper: it accepts unix connections and keeps
+// every line it reads.
+type spoolPeer struct {
+	ln    net.Listener
+	mu    sync.Mutex
+	lines []string
+	wg    sync.WaitGroup
+}
+
+func newSpoolPeer(t *testing.T) (*spoolPeer, string) {
+	t.Helper()
+	// macOS limits sun_path to 104 bytes; t.TempDir() paths are too long.
+	dir, err := os.MkdirTemp("", "abx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "spool.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &spoolPeer{ln: ln}
+	t.Cleanup(func() { ln.Close(); p.wg.Wait() })
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			p.wg.Add(1)
+			go func() {
+				defer p.wg.Done()
+				defer c.Close()
+				r := bufio.NewReaderSize(c, 4<<20)
+				for {
+					l, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					p.mu.Lock()
+					p.lines = append(p.lines, l)
+					p.mu.Unlock()
+				}
+			}()
+		}
+	}()
+	return p, sock
+}
+
+func (p *spoolPeer) records(t *testing.T) []telemetry.Record {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]telemetry.Record, 0, len(p.lines))
+	for _, l := range p.lines {
+		var r telemetry.Record
+		if err := json.Unmarshal([]byte(l), &r); err != nil {
+			t.Fatalf("spool line %q: %v", l, err)
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// TestSpoolMode runs the bait in the spool deployment: no New Relic key, a
+// fake host shipper on a unix socket. Edge, probe and metric records and the
+// stop/stopped events must reach the socket before it closes, and the local
+// log must keep the authoritative stopped record with the spool counters.
+func TestSpoolMode(t *testing.T) {
+	peer, sock := newSpoolPeer(t)
+	a, logs, cancel, done := startApp(t, map[string]string{
+		"ATTACKBOX_SPOOL_SOCKET": sock,
+		"ATTACKBOX_OPENAI_ADDR":  "127.0.0.1:0",
+		"ATTACKBOX_TIMING":       "false",
+	})
+	if a.nr != nil || a.spool == nil {
+		t.Fatal("spool mode must not build a New Relic client")
+	}
+	const bearer = "sk-proj-REALLOOKINGSECRET0123456789"
+	resp, _ := post(t, "http://"+a.addrs()["openai"]+"/v1/chat/completions",
+		`{"model":"qwen3:8b","messages":[{"role":"user","content":"hello"}]}`,
+		map[string]string{"Authorization": "Bearer " + bearer})
+	if resp.StatusCode != 200 {
+		t.Fatalf("chat %d", resp.StatusCode)
+	}
+	if err := stop(t, cancel, done); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	// The spool closed its connection, so the reader ends at EOF once it
+	// has every line.
+	peer.ln.Close()
+	peer.wg.Wait()
+
+	recs := peer.records(t)
+	var boot string
+	streams, actions, metrics := map[string]int{}, map[string]bool{}, map[string]bool{}
+	var shippedStopped *telemetry.Event
+	for i, r := range recs {
+		b, _, ok := strings.Cut(r.ID, "-")
+		if !ok || (boot != "" && b != boot) {
+			t.Fatalf("record %d id %q", i, r.ID)
+		}
+		boot = b
+		switch {
+		case r.Event != nil:
+			streams[r.Event.Stream]++
+			if r.Event.Stream == telemetry.StreamRuntime {
+				actions[r.Event.Action] = true
+				if r.Event.Action == "stopped" {
+					shippedStopped = r.Event
+				}
+			}
+			if r.Event.BodySHA256 != "" || r.Event.ChunkCount != 0 {
+				t.Fatalf("spooled event carries chunk metadata: %+v", r.Event)
+			}
+		case r.Metric != nil:
+			metrics[r.Metric.Name] = true
+		}
+	}
+	if streams[telemetry.StreamEdge] < 2 || streams[telemetry.StreamProbe] < 1 || !metrics["attackbox.requests"] {
+		t.Fatalf("streams %v metrics %v", streams, metrics)
+	}
+	if !actions["start"] || !actions["stop"] || shippedStopped == nil {
+		t.Fatalf("runtime actions on socket = %v, stopped %v", actions, shippedStopped != nil)
+	}
+	if recs[len(recs)-1].Event != shippedStopped {
+		t.Fatal("stopped must be the last record on the socket")
+	}
+	if shippedStopped.Result != "ok" || shippedStopped.Attrs["spool_dropped"] != float64(0) {
+		t.Fatalf("shipped stopped = %+v", shippedStopped)
+	}
+	for _, l := range peer.lines {
+		if strings.Contains(l, bearer) {
+			t.Fatal("raw credential on the spool socket")
+		}
+	}
+
+	var local map[string]any
+	for _, l := range logs.lines(t) {
+		if l["stream"] == "runtime" && l["action"] == "stopped" {
+			local = l
+		}
+		if l["action"] == "start" && (l["spool"] != true || l["newrelic"] != false) {
+			t.Fatalf("start event = %v", l)
+		}
+	}
+	if local == nil || local["result"] != "ok" || local["spool_written"] != float64(len(recs)) ||
+		local["spool_lost"] != float64(0) || local["spool_dropped"] != float64(0) || local["nr_sent"] != nil {
+		t.Fatalf("local stopped = %v (socket got %d records)", local, len(recs))
+	}
+}
+
+// TestSpoolModeNeedsShipper checks that a missing host shipper fails startup
+// instead of running without telemetry.
+func TestSpoolModeNeedsShipper(t *testing.T) {
+	dir, err := os.MkdirTemp("", "abx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	cfg, err := loadConfig(envOf(map[string]string{"ATTACKBOX_SPOOL_SOCKET": filepath.Join(dir, "none.sock"), "ATTACKBOX_OPENAI_ADDR": "127.0.0.1:0"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newApp(cfg, io.Discard); err == nil || !strings.Contains(err.Error(), "spool") {
+		t.Fatalf("err = %v, want spool dial error", err)
+	}
+}
+
+// TestPartialBindClosesSpool checks that a failed listener closes the spool.
+func TestPartialBindClosesSpool(t *testing.T) {
+	peer, sock := newSpoolPeer(t)
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	cfg, err := loadConfig(envOf(map[string]string{
+		"ATTACKBOX_SPOOL_SOCKET": sock,
+		"ATTACKBOX_OPENAI_ADDR":  "127.0.0.1:0",
+		"ATTACKBOX_VLLM_ADDR":    busy.Addr().String(),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newApp(cfg, io.Discard); err == nil || !strings.Contains(err.Error(), "vllm listener") || strings.Contains(err.Error(), "spool close") {
+		t.Fatalf("err = %v, want only the bind error", err)
+	}
+	peer.ln.Close()
+	peer.wg.Wait() // returns only once the spool closed its connection
 }

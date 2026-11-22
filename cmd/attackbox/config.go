@@ -28,6 +28,7 @@ const (
 	maxInFlightCap  = 10_000
 	maxPerSourceCap = 1_000
 	maxDurationCap  = time.Hour
+	spoolQueueCap   = 100_000
 )
 
 // listener is one persona bound to one address.
@@ -53,6 +54,12 @@ type config struct {
 	nrKey       string
 	nrLogURL    string
 	nrMetricURL string
+
+	// spoolSocket enables the spool deployment: telemetry goes to the host
+	// shipper's unix socket and the bait holds no New Relic key.
+	spoolSocket  string
+	spoolQueue   int
+	spoolTimeout time.Duration
 
 	maxSessions  int
 	maxBody      int64
@@ -122,6 +129,9 @@ func loadConfig(getenv func(string) string) (config, error) {
 		nrKey:             strings.TrimSpace(getenv("ATTACKBOX_NR_LICENSE_KEY")),
 		nrLogURL:          env("NR_LOG_URL", ""),
 		nrMetricURL:       env("NR_METRIC_URL", ""),
+		spoolSocket:       env("SPOOL_SOCKET", ""),
+		spoolQueue:        num("SPOOL_QUEUE", telemetry.DefaultSpoolQueue, spoolQueueCap),
+		spoolTimeout:      dur("SPOOL_TIMEOUT", telemetry.DefaultSpoolTimeout),
 		maxSessions:       num("MAX_SESSIONS", 10000, maxSessionsCap),
 		maxBody:           int64(num("MAX_BODY_BYTES", 1<<20, maxBodyCap)),
 		maxLogBody:        num("MAX_LOG_BODY", 128<<10, maxLogBodyCap),
@@ -195,8 +205,17 @@ func loadConfig(getenv func(string) string) (config, error) {
 	switch {
 	case c.nrDisabled && c.nrKey != "":
 		errs = append(errs, errors.New("ATTACKBOX_NR_DISABLED=true conflicts with ATTACKBOX_NR_LICENSE_KEY; unset one"))
-	case !c.nrDisabled && c.nrKey == "":
-		errs = append(errs, errors.New("ATTACKBOX_NR_LICENSE_KEY is required; set ATTACKBOX_NR_DISABLED=true to log locally only"))
+	case c.nrDisabled && c.spoolSocket != "":
+		errs = append(errs, errors.New("ATTACKBOX_NR_DISABLED=true conflicts with ATTACKBOX_SPOOL_SOCKET; unset one"))
+	case c.nrKey != "" && c.spoolSocket != "":
+		errs = append(errs, errors.New("ATTACKBOX_SPOOL_SOCKET conflicts with ATTACKBOX_NR_LICENSE_KEY; in the spool deployment only the host shipper holds the key"))
+	case !c.nrDisabled && c.nrKey == "" && c.spoolSocket == "":
+		errs = append(errs, errors.New("ATTACKBOX_NR_LICENSE_KEY is required; set ATTACKBOX_SPOOL_SOCKET to ship through the host shipper, or ATTACKBOX_NR_DISABLED=true to log locally only"))
+	}
+	if c.spoolSocket != "" {
+		if err := telemetry.ValidSocketPath(c.spoolSocket); err != nil {
+			errs = append(errs, fmt.Errorf("ATTACKBOX_SPOOL_SOCKET: %v", err))
+		}
 	}
 	if !c.nrDisabled && c.nrKey != "" {
 		if err := telemetry.ValidLicenseKey(c.nrKey); err != nil {

@@ -68,7 +68,14 @@ func cli(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 		return 2
 	}
 	if *check {
-		fmt.Fprintf(stdout, "configuration ok: %d listener(s), new relic %s\n", len(cfg.listeners), map[bool]string{true: "disabled", false: "enabled"}[cfg.nrDisabled])
+		mode := "enabled"
+		switch {
+		case cfg.nrDisabled:
+			mode = "disabled"
+		case cfg.spoolSocket != "":
+			mode = "off (host shipper), spool " + cfg.spoolSocket
+		}
+		fmt.Fprintf(stdout, "configuration ok: %d listener(s), new relic %s\n", len(cfg.listeners), mode)
 		return 0
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -119,8 +126,9 @@ func healthcheck(raw string) error {
 // app is one running process: the listeners, their servers and the sinks.
 type app struct {
 	cfg       config
-	local     *telemetry.Async // JSONLog behind a bounded queue, off the request path
-	nr        *telemetry.NewRelic
+	local     *telemetry.Async    // JSONLog behind a bounded queue, off the request path
+	nr        *telemetry.NewRelic // direct mode only
+	spool     *telemetry.Spool    // spool mode only: the host shipper owns egress
 	sink      telemetry.Sink
 	servers   []*http.Server
 	listeners []net.Listener
@@ -132,7 +140,7 @@ type app struct {
 func newApp(cfg config, logOut io.Writer) (*app, error) {
 	a := &app{cfg: cfg, local: telemetry.NewAsync(telemetry.NewJSONLog(logOut), 0)}
 	a.sink = a.local
-	if !cfg.nrDisabled {
+	if cfg.nrKey != "" {
 		nr, err := telemetry.NewNewRelic(telemetry.NRConfig{
 			LicenseKey: cfg.nrKey,
 			LogURL:     cfg.nrLogURL,
@@ -150,6 +158,22 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 		}
 		a.nr = nr
 		a.sink = telemetry.Multi{a.local, nr}
+	}
+	if cfg.spoolSocket != "" {
+		sp, err := telemetry.NewSpool(telemetry.SpoolConfig{
+			Socket:       cfg.spoolSocket,
+			QueueSize:    cfg.spoolQueue,
+			WriteTimeout: cfg.spoolTimeout,
+			// As for New Relic: failures go to the local log only.
+			OnError: func(err error) {
+				a.local.Emit(telemetry.Event{Stream: telemetry.StreamRuntime, Action: "spool_error", Result: "error", Attrs: map[string]any{"error": err.Error()}})
+			},
+		})
+		if err != nil {
+			return nil, errors.Join(err, a.closeLocal())
+		}
+		a.spool = sp
+		a.sink = telemetry.Multi{a.local, sp}
 	}
 
 	redactor := telemetry.NewRedactor(cfg.derive("redact"))
@@ -199,16 +223,20 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 		if err != nil {
 			a.closeListeners()
 			bindErr := fmt.Errorf("%s listener %s: %w", l.persona, l.addr, err)
+			var remoteErr error
+			ctx, cancel := context.WithTimeout(context.Background(), cfg.shutdownTimeout)
 			if a.nr != nil {
-				ctx, cancel := context.WithTimeout(context.Background(), cfg.shutdownTimeout)
-				nrErr := a.nr.Close(ctx)
-				cancel()
-				if nrErr != nil {
-					nrErr = fmt.Errorf("new relic close: %w", nrErr)
+				if err := a.nr.Close(ctx); err != nil {
+					remoteErr = fmt.Errorf("new relic close: %w", err)
 				}
-				return nil, errors.Join(bindErr, nrErr, a.closeLocal())
 			}
-			return nil, errors.Join(bindErr, a.closeLocal())
+			if a.spool != nil {
+				if err := a.spool.Close(ctx); err != nil {
+					remoteErr = fmt.Errorf("spool close: %w", err)
+				}
+			}
+			cancel()
+			return nil, errors.Join(bindErr, remoteErr, a.closeLocal())
 		}
 	}
 	return a, nil
@@ -240,7 +268,7 @@ func (a *app) addrs() map[string]string {
 // stop, in-flight requests get shutdownTimeout, and New Relic is flushed.
 // It returns an error if a listener failed or New Relic lost events.
 func (a *app) run(ctx context.Context) error {
-	a.runtime("start", "ok", map[string]any{"version": version, "listeners": a.addrs(), "newrelic": a.nr != nil})
+	a.runtime("start", "ok", map[string]any{"version": version, "listeners": a.addrs(), "newrelic": a.nr != nil, "spool": a.spool != nil})
 	// Request contexts derive from base. When the grace period ends it is
 	// cancelled with server.ErrShutdown, so cut holds are logged as
 	// server_shutdown rather than client_closed.
@@ -296,15 +324,42 @@ func (a *app) run(ctx context.Context) error {
 			nrErr = lossError(st)
 		}
 	}
+	var spErr error
+	if a.spool != nil {
+		// The host shipper gets a stopped record with the spool counters as
+		// they stand before the drain; the local record below carries the
+		// final ones and stays authoritative.
+		a.spool.Emit(a.stopped(serveErr, nil, attrs))
+		flushCtx, cancelFlush := context.WithTimeout(context.Background(), a.cfg.shutdownTimeout)
+		spErr = a.spool.Close(flushCtx)
+		cancelFlush()
+	}
+	stopped := a.stopped(serveErr, errors.Join(nrErr, spErr), attrs)
+	// Written locally only: the remote sink is closed at this point.
+	a.local.Emit(stopped)
+	return errors.Join(serveErr, nrErr, spErr, a.closeLocal())
+}
+
+// stopped builds the final runtime record. attrs holds the New Relic
+// counters, if any; spool and local counters are read now.
+func (a *app) stopped(serveErr, remoteErr error, nrAttrs map[string]any) telemetry.Event {
+	attrs := make(map[string]any, len(nrAttrs)+6)
+	for k, v := range nrAttrs {
+		attrs[k] = v
+	}
+	loss := false
+	if a.spool != nil {
+		st := a.spool.Stats()
+		attrs["spool_written"], attrs["spool_dropped"], attrs["spool_lost"], attrs["spool_errors"], attrs["spool_resent"] = st.Written, st.Dropped, st.Lost, st.Errors, st.Resent
+		loss = st.Dropped > 0 || st.Lost > 0
+	}
 	localDropped := a.local.Dropped()
 	attrs["local_dropped"] = localDropped
 	result := "ok"
-	if serveErr != nil || nrErr != nil || localDropped > 0 {
+	if serveErr != nil || remoteErr != nil || loss || localDropped > 0 {
 		result = "error"
 	}
-	// Written locally only: New Relic is closed at this point.
-	a.local.Emit(telemetry.Event{Stream: telemetry.StreamRuntime, Action: "stopped", Result: result, Attrs: attrs})
-	return errors.Join(serveErr, nrErr, a.closeLocal())
+	return telemetry.Event{Stream: telemetry.StreamRuntime, Action: "stopped", Result: result, Attrs: attrs}
 }
 
 // lossError reports events New Relic never accepted, or nil if none.
