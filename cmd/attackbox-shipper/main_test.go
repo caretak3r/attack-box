@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -300,6 +301,115 @@ func TestDrainFailureLeavesPrefixUnacknowledged(t *testing.T) {
 	}
 	if len(entries) != 2 {
 		t.Fatalf("got %d unacknowledged entries, want 2 (first was accepted before cancel)", len(entries))
+	}
+}
+
+func TestDrainAcksAcceptedPrefixBeforeRewind(t *testing.T) {
+	dir := t.TempDir()
+	qcfg := shipper.QueueConfig{
+		Dir:          filepath.Join(dir, "queue"),
+		SegmentBytes: 1 << 20,
+		MaxBytes:     10 << 20,
+		RoleBytes:    map[shipper.Role]int64{shipper.RoleBait: 10 << 20},
+		MaxPayload:   telemetry.MinPayloadBytes - shipper.FrameHeader,
+	}
+	q, _, err := shipper.OpenQueue(qcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+
+	// Enqueue two records
+	var items []shipper.Item
+	for i := 1; i <= 2; i++ {
+		rec := telemetry.Record{
+			ID: fmt.Sprintf("ack-before-rewind-%d", i),
+			Event: &telemetry.Event{
+				Stream:    telemetry.StreamEdge,
+				Action:    fmt.Sprintf("test%d", i),
+				Timestamp: time.Now(),
+			},
+		}
+		data, _ := json.Marshal(rec)
+		items = append(items, shipper.Item{Role: shipper.RoleBait, Data: data})
+	}
+	if _, err := q.Append(items); err != nil {
+		t.Fatal(err)
+	}
+
+	// First POST succeeds, all subsequent POSTs fail
+	var postCount atomic.Int32
+	fake := &fakeNewRelic{t: t}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := postCount.Add(1)
+		if count == 1 {
+			// First POST succeeds
+			fake.ServeHTTP(w, r)
+			return
+		}
+		// All subsequent POSTs fail
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	nr, err := telemetry.NewNewRelic(telemetry.NRConfig{
+		LicenseKey: "0123456789abcdef0123456789abcdef01234567",
+		LogURL:     srv.URL,
+		MetricURL:  srv.URL,
+		QueueSize:  100,
+		Now:        time.Now,
+		Backoff:    []time.Duration{100 * time.Millisecond, 100 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nr.Close(context.Background())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- drain(ctx, q, nr, false, 0)
+	}()
+
+	// Wait for retries to complete (~300ms total)
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+	<-done
+
+	// Record 1 should be delivered and Ack'd, record 2 should replay
+	fake.mu.Lock()
+	delivered := len(fake.logs)
+	fake.mu.Unlock()
+
+	if delivered != 1 {
+		t.Fatalf("got %d delivered logs, want 1 (only first record)", delivered)
+	}
+
+	q2, rec2, err := shipper.OpenQueue(qcfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q2.Close()
+
+	if rec2.Uncertain {
+		t.Fatal("unexpected uncertain recovery")
+	}
+
+	entries, err := q2.Read(10, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("got %d unacknowledged entries, want 1 (record 2 should replay, not record 1)", len(entries))
+	}
+
+	// Verify the replayed record is 2, not 1
+	var rec telemetry.Record
+	json.Unmarshal(entries[0].Data, &rec)
+	if rec.Event == nil || rec.Event.Action != "test2" {
+		t.Fatalf("replayed record action %q, want test2", rec.Event.Action)
 	}
 }
 
@@ -808,8 +918,12 @@ func TestSixStreams(t *testing.T) {
 		Dir:          filepath.Join(dir, "queue"),
 		SegmentBytes: 1 << 20,
 		MaxBytes:     10 << 20,
-		RoleBytes:    map[shipper.Role]int64{shipper.RoleBait: 10 << 20},
-		MaxPayload:   telemetry.MinPayloadBytes - shipper.FrameHeader,
+		RoleBytes: map[shipper.Role]int64{
+			shipper.RoleBait:    10 << 20,
+			shipper.RoleRuntime: 10 << 20,
+			shipper.RoleEgress:  10 << 20,
+		},
+		MaxPayload: telemetry.MinPayloadBytes - shipper.FrameHeader,
 	}
 	q, _, err := shipper.OpenQueue(qcfg)
 	if err != nil {
@@ -817,31 +931,38 @@ func TestSixStreams(t *testing.T) {
 	}
 	defer q.Close()
 
-	// Enqueue one event for each of the six streams
-	streams := []string{
-		telemetry.StreamEdge,
-		telemetry.StreamTranscript,
-		telemetry.StreamProbe,
-		telemetry.StreamEgress,
-		telemetry.StreamRuntime,
-		telemetry.StreamHeartbeat,
-	}
-	var items []shipper.Item
-	for _, stream := range streams {
-		rec := telemetry.Record{
-			ID: fmt.Sprintf("six-stream-%s", stream),
-			Event: &telemetry.Event{
-				Stream:    stream,
-				Action:    fmt.Sprintf("test_%s", stream),
-				Timestamp: time.Now(),
-			},
-		}
-		data, _ := json.Marshal(rec)
-		items = append(items, shipper.Item{Role: shipper.RoleBait, Data: data})
+	now := time.Now()
+	// Use valid role/action combinations through shipper.Admit
+	streamTests := []struct {
+		role   shipper.Role
+		stream string
+		action string
+	}{
+		{shipper.RoleBait, telemetry.StreamEdge, "request"},
+		{shipper.RoleBait, telemetry.StreamTranscript, "transcript"},
+		{shipper.RoleBait, telemetry.StreamProbe, "probe_start"},
+		{shipper.RoleEgress, telemetry.StreamEgress, "egress_blocked"},
+		{shipper.RoleRuntime, telemetry.StreamRuntime, "falco"},
+		{shipper.RoleBait, telemetry.StreamHeartbeat, "bait_heartbeat"},
 	}
 
-	if _, err := q.Append(items); err != nil {
-		t.Fatal(err)
+	for i, st := range streamTests {
+		rec := telemetry.Record{
+			ID: fmt.Sprintf("0123456789abcdef-%d", i+1),
+			Event: &telemetry.Event{
+				Stream:    st.stream,
+				Action:    st.action,
+				Timestamp: now,
+			},
+		}
+		line, _ := json.Marshal(rec)
+		admitted, err := shipper.Admit(st.role, line, now)
+		if err != nil {
+			t.Fatalf("admit %s/%s: %v", st.stream, st.action, err)
+		}
+		if _, err := q.Append([]shipper.Item{{Role: st.role, Data: admitted.Data}}); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	fake := &fakeNewRelic{t: t}
@@ -879,7 +1000,15 @@ func TestSixStreams(t *testing.T) {
 	}
 	fake.mu.Unlock()
 
-	for _, stream := range streams {
+	expectedStreams := []string{
+		telemetry.StreamEdge,
+		telemetry.StreamTranscript,
+		telemetry.StreamProbe,
+		telemetry.StreamEgress,
+		telemetry.StreamRuntime,
+		telemetry.StreamHeartbeat,
+	}
+	for _, stream := range expectedStreams {
 		if receivedStreams[stream] != 1 {
 			t.Errorf("stream %s: got %d events, want 1", stream, receivedStreams[stream])
 		}
@@ -896,8 +1025,11 @@ func TestFullMetric(t *testing.T) {
 		Dir:          filepath.Join(dir, "queue"),
 		SegmentBytes: 1 << 20,
 		MaxBytes:     10 << 20,
-		RoleBytes:    map[shipper.Role]int64{shipper.RoleBait: 10 << 20},
-		MaxPayload:   telemetry.MinPayloadBytes - shipper.FrameHeader,
+		RoleBytes: map[shipper.Role]int64{
+			shipper.RoleBait:   10 << 20,
+			shipper.RoleEgress: 10 << 20,
+		},
+		MaxPayload: telemetry.MinPayloadBytes - shipper.FrameHeader,
 	}
 	q, _, err := shipper.OpenQueue(qcfg)
 	if err != nil {
@@ -905,34 +1037,59 @@ func TestFullMetric(t *testing.T) {
 	}
 	defer q.Close()
 
-	// Enqueue metrics covering the expected set for the shipper
-	metrics := []struct {
+	now := time.Now()
+	// 10 bait metrics through shipper.Admit with RoleBait
+	baitMetrics := []struct {
 		name string
 		kind string
 	}{
-		{"attackbox.queue.bytes", "gauge"},
-		{"attackbox.queue.entries", "gauge"},
-		{"attackbox.admitted", "count"},
-		{"attackbox.dropped", "count"},
-		{"attackbox.delivered", "count"},
-		{"attackbox.delivery_errors", "count"},
+		{"attackbox.requests", "count"},
+		{"attackbox.sessions", "count"},
+		{"attackbox.request_bytes", "count"},
+		{"attackbox.response_bytes", "count"},
+		{"attackbox.probes", "count"},
+		{"attackbox.probe_followups", "count"},
+		{"attackbox.session_duration_seconds", "gauge"},
+		{"attackbox.stream_disconnect_seconds", "gauge"},
+		{"attackbox.retry_delay_seconds", "gauge"},
+		{"attackbox.concurrent_status_requests", "gauge"},
 	}
-	var items []shipper.Item
-	for _, m := range metrics {
+	for i, m := range baitMetrics {
 		rec := telemetry.Record{
-			ID: fmt.Sprintf("metric-%s", m.name),
+			ID: fmt.Sprintf("fedcba9876543210-%d", i+1),
 			Metric: &telemetry.MetricRecord{
 				Name:  m.name,
 				Kind:  m.kind,
 				Value: 1,
-				At:    time.Now(),
+				At:    now,
 			},
 		}
-		data, _ := json.Marshal(rec)
-		items = append(items, shipper.Item{Role: shipper.RoleBait, Data: data})
+		line, _ := json.Marshal(rec)
+		admitted, err := shipper.Admit(shipper.RoleBait, line, now)
+		if err != nil {
+			t.Fatalf("admit %s: %v", m.name, err)
+		}
+		if _, err := q.Append([]shipper.Item{{Role: shipper.RoleBait, Data: admitted.Data}}); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	if _, err := q.Append(items); err != nil {
+	// 1 egress metric through shipper.Admit with RoleEgress
+	egressRec := telemetry.Record{
+		ID: "fedcba9876543210-99",
+		Metric: &telemetry.MetricRecord{
+			Name:  "attackbox.egress_blocked",
+			Kind:  "count",
+			Value: 1,
+			At:    now,
+		},
+	}
+	egressLine, _ := json.Marshal(egressRec)
+	egressAdmitted, err := shipper.Admit(shipper.RoleEgress, egressLine, now)
+	if err != nil {
+		t.Fatalf("admit egress_blocked: %v", err)
+	}
+	if _, err := q.Append([]shipper.Item{{Role: shipper.RoleEgress, Data: egressAdmitted.Data}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -951,6 +1108,11 @@ func TestFullMetric(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer nr.Close(context.Background())
+
+	// Exercise sink self metrics directly (not through queue)
+	nr.ShipMetric("attackbox.telemetry.ingest_errors_total", "count", 0, now, nil)
+	nr.ShipMetric("attackbox.telemetry.ingest_retries_total", "count", 0, now, nil)
+	nr.ShipMetric("attackbox.heartbeat", "gauge", 1, now, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -971,13 +1133,30 @@ func TestFullMetric(t *testing.T) {
 	}
 	fake.mu.Unlock()
 
-	for _, m := range metrics {
-		if receivedMetrics[m.name] != 1 {
-			t.Errorf("metric %s: got %d, want 1", m.name, receivedMetrics[m.name])
+	// Verify all 14 metrics were received
+	expectedMetrics := []string{
+		"attackbox.requests",
+		"attackbox.sessions",
+		"attackbox.request_bytes",
+		"attackbox.response_bytes",
+		"attackbox.probes",
+		"attackbox.probe_followups",
+		"attackbox.session_duration_seconds",
+		"attackbox.stream_disconnect_seconds",
+		"attackbox.retry_delay_seconds",
+		"attackbox.concurrent_status_requests",
+		"attackbox.egress_blocked",
+		"attackbox.telemetry.ingest_errors_total",
+		"attackbox.telemetry.ingest_retries_total",
+		"attackbox.heartbeat",
+	}
+	for _, name := range expectedMetrics {
+		if receivedMetrics[name] != 1 {
+			t.Errorf("metric %s: got %d, want 1", name, receivedMetrics[name])
 		}
 	}
 
-	if len(fake.metrics) != len(metrics) {
-		t.Errorf("got %d total metrics, want %d", len(fake.metrics), len(metrics))
+	if len(fake.metrics) != 14 {
+		t.Errorf("got %d total metrics, want 14", len(fake.metrics))
 	}
 }

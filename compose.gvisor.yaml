@@ -5,6 +5,19 @@
 # The bait connects to the host shipper's unix socket through a bind mount.
 # gVisor blocks host unix sockets by default: run runsc with --host-uds=open
 # (or --host-uds=create) or the spool connection fails.
+# Docker daemon configuration required:
+# /etc/docker/daemon.json must contain:
+# {
+#   "runtimes": {
+#     "runsc": {
+#       "path": "/usr/local/bin/runsc",
+#       "runtimeArgs": ["--host-uds=open"]
+#     }
+#   }
+# }
 services:
   bait:
+    runtime: runsc
+
+  proxy:
     runtime: runsc

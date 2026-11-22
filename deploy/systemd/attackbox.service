@@ -1,0 +1,22 @@
+[Unit]
+Description=Attack-box bait service
+Documentation=https://github.com/example/attack-box
+After=docker.service attackbox-shipper.service
+Requires=docker.service attackbox-shipper.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/attackbox
+
+# Start Compose project
+ExecStart=/usr/bin/docker compose -f /opt/attackbox/compose.yaml -f /opt/attackbox/compose.gvisor.yaml up -d --wait
+
+# Stop Compose project
+ExecStop=/usr/bin/docker compose -f /opt/attackbox/compose.yaml -f /opt/attackbox/compose.gvisor.yaml down
+
+# Restart policy
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

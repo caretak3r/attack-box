@@ -1,0 +1,36 @@
+[Unit]
+Description=Attack-box egress event adapter
+Documentation=https://github.com/example/attack-box
+After=systemd-journald.service attackbox-shipper.service
+Requires=attackbox-shipper.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Follow kernel log for nftables drops, convert to JSONL for shipper
+ExecStart=/bin/bash -c 'exec journalctl -kf -o json --no-pager | grep -a "OUTPUT-DROP\\|CONTAINER-EGRESS-BLOCK\\|METADATA-BLOCK" | /usr/local/bin/attackbox-shipper -stdin-stream egress'
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=attackbox-egress-adapter
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+
+# Resource limits
+MemoryMax=64M
+TasksMax=50
+
+[Install]
+WantedBy=multi-user.target
