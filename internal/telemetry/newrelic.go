@@ -217,9 +217,6 @@ func validateURL(raw, key string) error {
 	return nil
 }
 
-// maxUnescape bounds how many nested percent-encoding layers are peeled.
-const maxUnescape = 8
-
 // containsKey also catches case-folded and percent-encoded copies of the key,
 // including nested encodings such as %2530.
 func containsKey(raw, key string) bool {
@@ -251,15 +248,18 @@ func unescapeOnce(s string) string {
 	return b.String()
 }
 
+// unescapeAll peels percent-encoding until the value is stable. A capped
+// loop would accept a name nested one layer deeper than the cap, so there is
+// no cap: every changing pass shortens the string by at least two bytes, which
+// bounds the work by the length of the operator-supplied URL.
 func unescapeAll(s string) string {
-	for range maxUnescape {
+	for {
 		next := unescapeOnce(s)
 		if next == s {
-			break
+			return s
 		}
 		s = next
 	}
-	return s
 }
 
 func isHex(c byte) bool {

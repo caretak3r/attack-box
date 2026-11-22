@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	mrand "math/rand/v2"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -136,6 +138,9 @@ func (s *Server) newID(prefix string) string {
 		return prefix + randHex(24)
 	case s.persona == PersonaVLLM:
 		return prefix + randHex(16)
+	case s.persona == PersonaOllama:
+		// Ollama's OpenAI layer numbers ids: chatcmpl-<rand.Intn(999)>.
+		return prefix + strconv.Itoa(mrand.IntN(999))
 	}
 	return prefix + randBase62(29)
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -728,6 +729,8 @@ func TestNestedEncodedKeyAndCredentialQueryRejected(t *testing.T) {
 		"https://example.com/log?password=x",
 		"https://example.com/log?X-License-Key=x",
 		"https://example.com/log?api%255Fkey=x",
+		"https://example.com/log?" + nestEncode("api_key", 11) + "=x",
+		"https://example.com/log?" + nestEncode("token", 40) + "=x",
 	}
 	for _, u := range urls {
 		for _, cfg := range []NRConfig{
@@ -879,5 +882,24 @@ func TestCancelledRetryNotCounted(t *testing.T) {
 	}
 	if st := n.Stats(); st.Retries != 0 || st.Lost == 0 {
 		t.Errorf("stats %+v", st)
+	}
+}
+
+// nestEncode percent-encodes the first byte of s, then re-encodes the leading
+// '%' layers-1 more times, which gives a name nested that many layers deep.
+func nestEncode(s string, layers int) string {
+	out := fmt.Sprintf("%%%02X", s[0]) + s[1:]
+	for range layers - 1 {
+		out = "%25" + out[1:]
+	}
+	return out
+}
+
+func TestUnescapeAllStable(t *testing.T) {
+	if got := unescapeAll(nestEncode("api_key", 11)); got != "api_key" {
+		t.Fatalf("11x nested name decoded to %q", got)
+	}
+	if got := unescapeAll("a%zz%"); got != "a%zz%" {
+		t.Fatalf("invalid escapes changed: %q", got)
 	}
 }

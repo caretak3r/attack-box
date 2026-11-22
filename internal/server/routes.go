@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -235,26 +236,33 @@ func marshal(v any) []byte {
 	return b.Bytes()
 }
 
+// contentType is the type of a JSON response. gin, behind every Ollama route,
+// adds the charset.
 func (c *call) contentType() string {
-	if c.s.persona == PersonaOllama && c.style == styleOllama {
+	if c.s.persona == PersonaOllama {
 		return "application/json; charset=utf-8"
 	}
 	return "application/json"
 }
 
+// sendBody writes a fully buffered body with an explicit Content-Length, so a
+// persona whose real server does not chunk such replies does not chunk either.
+func (c *call) sendBody(status int, body []byte) {
+	c.w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	c.w.WriteHeader(status)
+	_, _ = c.w.Write(body)
+}
+
 func (c *call) jsonStatus(status int, v any) {
 	c.w.Header().Set("Content-Type", c.contentType())
-	c.w.WriteHeader(status)
-	_, _ = c.w.Write(marshal(v))
+	c.sendBody(status, marshal(v))
 }
 
 func (c *call) json(v any) { c.jsonStatus(http.StatusOK, v) }
 
 func (c *call) plain(status int, ctype, body string) {
-	h := c.w.Header()
-	h.Set("Content-Type", ctype)
-	c.w.WriteHeader(status)
-	_, _ = c.w.Write([]byte(body))
+	c.w.Header().Set("Content-Type", ctype)
+	c.sendBody(status, []byte(body))
 }
 
 func (c *call) empty(status int) {

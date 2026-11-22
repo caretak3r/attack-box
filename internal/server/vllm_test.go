@@ -82,7 +82,7 @@ func TestVLLMChatEnvelope(t *testing.T) {
 
 func TestVLLMErrors(t *testing.T) {
 	r := newRig(t, PersonaVLLM)
-	rec := r.do("POST", "/v1/chat/completions", `{"model":"nope"}`)
+	rec := r.do("POST", "/v1/chat/completions", `{"model":"nope","messages":[]}`)
 	m := decode(t, rec)
 	if rec.Code != 404 || m["object"] != "error" || m["type"] != "NotFoundError" ||
 		m["code"] != float64(404) || m["message"] != "The model `nope` does not exist." {

@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"attackbox/internal/responder"
 	"attackbox/internal/telemetry"
@@ -44,6 +45,10 @@ func (s *Server) finish(c *call) {
 	if c.tooLarge {
 		attrs["body_limit_exceeded"] = true
 	}
+	if c.panicked {
+		attrs["panic"] = true
+		attrs["panic_value"] = c.panicInfo
+	}
 	if c.model != "" {
 		attrs["model"] = truncRunes(cleanEcho(c.model, maxModelLog), maxModelLog)
 		attrs["stream"] = c.streaming
@@ -72,13 +77,8 @@ func (s *Server) finish(c *call) {
 		attrs["observations"] = obs
 	}
 
-	// Cut before scrubbing: scrub cost is linear in input, and only
-	// MaxLogBody bytes are ever kept. A value cut at the boundary is
-	// unterminated, which the scrubber redacts to end of text.
-	raw := truncBytes(string(c.body), s.cfg.MaxLogBody)
-	body := red.Text(raw)
-	if len(raw) < len(c.body) || len(body) > s.cfg.MaxLogBody {
-		body = truncBytes(body, s.cfg.MaxLogBody)
+	body, cut := s.logBody(c.body)
+	if cut {
 		attrs["body_truncated"] = true
 	}
 	resource := truncRunes(red.Text(c.r.URL.Path), maxResourceLen)
@@ -127,6 +127,31 @@ func (s *Server) finish(c *call) {
 	s.cfg.Sink.Count("attackbox.requests", 1, telemetry.SafeLabels(map[string]string{
 		"persona": s.persona, "endpoint": c.endpoint, "status_class": strconv.Itoa(status/100) + "xx",
 	}))
+}
+
+// logRedactMargin is how far past MaxLogBody the redactor still looks. Redaction
+// can shrink the text, so the cut before it keeps a little more than the cap.
+const logRedactMargin = 4 << 10
+
+// logBody returns the redacted request body for the log, at most MaxLogBody
+// bytes, and whether it was cut. The raw body is cut first so the redactor never
+// scans a megabyte for a log line that keeps a fraction of it.
+func (s *Server) logBody(b []byte) (string, bool) {
+	limit := s.cfg.MaxLogBody
+	keep := limit + logRedactMargin
+	cut := len(b) > keep
+	var raw string
+	if cut {
+		// A few spare bytes let truncBytes back off to a rune start.
+		raw = truncBytes(string(b[:min(len(b), keep+utf8.UTFMax)]), keep)
+	} else {
+		raw = string(b)
+	}
+	body := s.cfg.Redactor.Text(raw)
+	if len(body) > limit {
+		body, cut = truncBytes(body, limit), true
+	}
+	return body, cut
 }
 
 func resultFor(status int) string {

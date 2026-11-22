@@ -61,8 +61,7 @@ func (s *Server) docs(c *call) { c.plain(http.StatusOK, "text/html; charset=utf-
 
 func (s *Server) openapiJSON(c *call) {
 	c.w.Header().Set("Content-Type", "application/json")
-	c.w.WriteHeader(http.StatusOK)
-	_, _ = c.w.Write(s.openapi)
+	c.sendBody(http.StatusOK, s.openapi)
 }
 
 // buildOpenAPI renders the schema of the routes that carry a summary. Only the
