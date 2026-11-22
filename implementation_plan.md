@@ -194,9 +194,18 @@ Language: Go, standard library only. Module `attackbox`.
 
 Verification: `go vet ./...`, `gofmt -l .`, `go test -race -count=1 -cover ./...` (92.1% statement coverage of `internal/responder`).
 
+### Telemetry — `internal/telemetry` (implemented, tested)
+
+- `event.go`: `Event` with the log fields above plus `persona`, `probe_id`, `task_labels`, `status`. `Chunk` splits a body into pieces of at most 3,500 runes (never inside a UTF-8 rune). Each piece has the full-body `body_sha256`, `chunk_index` (0-based) and `chunk_count`. An empty body gives one event.
+- `redact.go`: `Redactor` with an HMAC key. Credential headers (`Authorization`, `Proxy-Authorization`, `X-Api-Key`, `Api-Key`, `Cookie`, `Set-Cookie`, `OpenAI-Api-Key`, `X-Goog-Api-Key`, `X-Auth-Token`, and any name that contains `token`, `secret`, `password`, `session` or `key`) become `[redacted]` (Authorization keeps its scheme) and a fingerprint `hmac256:<16 hex>`. Informational headers (`User-Agent`, `OpenAI-Organization`, `OpenAI-Project`, `X-Request-Id`, `X-Stainless-*` and others) are kept, max 512 characters; other headers max 256 characters; max 64 headers. `Text` replaces bearer tokens, `sk-` keys and `Cookie:` lines in bodies with fingerprints. `sk-local-` canaries stay visible so that reuse is detectable.
+- `sink.go`: `Sink` interface (`Emit`, `Count`, `Gauge`), `Multi` fan-out, `JSONLog` (one JSON object per line, chunked). `SafeLabels` keeps only `persona`, `probe_id`, `endpoint`, `status_class`, `stream`, `task`, `result`, `reason` with bounded values; other values become `other`. Source IP, session ID, nonce and declarations never become metric labels.
+- `newrelic.go`: asynchronous shipper. `Emit`, `Count` and `Gauge` never block; a full queue (default 10,000) or more than 2,000 metric series counts as `Dropped`. Batches of 200 events or every 5 seconds. Each POST is gzip JSON with headers `Api-Key`, `Content-Type: application/json` and `Content-Encoding: gzip`, max 900,000 uncompressed bytes. Defaults `https://log-api.newrelic.com/log/v1` and `https://metric-api.newrelic.com/metric/v1`; `http` is accepted for loopback only; URLs with user info or the key are rejected; redirects are not followed. 429, 5xx and transport errors are retried after 1 s and 2 s; then the items count as `Lost` and `Errors` increments. Success is counted only after a 2xx. `LastError` never contains the key. A heartbeat log event and `attackbox.heartbeat` gauge are sent every 30 seconds, and every flush sends `attackbox.telemetry.dropped_total` and `attackbox.telemetry.ingest_errors_total`. `Close(ctx)` drains the queue and flushes logs and metrics.
+
+Verification: `gofmt -l .` (no output), `go vet ./...`, `go test -race -count=1 -cover ./...` (`internal/telemetry` 95.5%). Tests use `httptest` servers only.
+
 ### Not yet implemented
 
-HTTP personas and endpoint handlers, request/response logging and redaction, New Relic forwarder, `cmd` entry point, Dockerfile/Compose, deployment script, operator documentation.
+HTTP personas and endpoint handlers, request/response logging wiring, `cmd` entry point, Dockerfile/Compose, deployment script, operator documentation.
 
 ## Decoy VPS layers
 
