@@ -210,7 +210,7 @@ func run(ctx context.Context, cfg config, stderr io.Writer) error {
 	}
 
 	go func() {
-		drainDone <- drain(ctx, q, nr, rec.Uncertain, rec.UncertainThrough, cfg.shutdownTimeout/2)
+		drainDone <- drain(ctx, q, nr, rec.Uncertain, rec.UncertainThrough)
 	}()
 	go func() {
 		ingestDone <- ing.Serve(ctx)

@@ -14,7 +14,7 @@ import (
 // checkpoints only after successful delivery, so a crash or New Relic outage
 // replays unacknowledged records. Uncertain recovery suppresses metrics up to
 // uncertainThrough to avoid double-counting.
-func drain(ctx context.Context, q *shipper.Queue, nr *telemetry.NewRelic, uncertain bool, uncertainThrough uint64, timeout time.Duration) error {
+func drain(ctx context.Context, q *shipper.Queue, nr *telemetry.NewRelic, uncertain bool, uncertainThrough uint64) error {
 	const (
 		readMax      = 200 // entries per Read
 		readMaxBytes = 512 << 10
@@ -37,10 +37,8 @@ func drain(ctx context.Context, q *shipper.Queue, nr *telemetry.NewRelic, uncert
 	if uncertain {
 		metricAt = uncertainThrough
 		// Emit metric_replay_gap to signal suppressed metrics
-		if err := nr.ShipMetric("attackbox.metric_replay_gap", "gauge", 1, time.Now(), map[string]string{
-			"uncertain_through": fmt.Sprintf("%d", uncertainThrough),
-		}); err != nil {
-			// Log but don't fail on this signal metric
+		if err := nr.ShipMetric("attackbox.metric_replay_gap", "gauge", 1, time.Now(), nil); err != nil {
+			return fmt.Errorf("failed to emit metric_replay_gap: %w", err)
 		}
 	}
 
@@ -94,10 +92,11 @@ func drain(ctx context.Context, q *shipper.Queue, nr *telemetry.NewRelic, uncert
 					break
 				}
 			}
-			// If context was cancelled during ShipEvent/ShipMetric, Rewind and exit
+			// If context was cancelled after successful delivery, mark this record
+			// delivered and stop before the next one to allow its Ack
 			if ctx.Err() != nil {
-				q.Rewind()
-				return ctx.Err()
+				delivered = i + 1
+				break
 			}
 			delivered = i + 1
 		}

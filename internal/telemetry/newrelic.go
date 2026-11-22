@@ -451,7 +451,7 @@ func (n *NewRelic) ShipEvent(e Event) error {
 // accepts it or the error is permanent.
 func (n *NewRelic) ShipMetric(name string, kind string, value float64, at time.Time, attrs map[string]string) error {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
-		return nil // silently drop invalid values like record() does
+		return fmt.Errorf("invalid metric value: %v", value)
 	}
 	labels := SafeLabels(attrs)
 	var typ string
