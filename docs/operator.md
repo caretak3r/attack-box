@@ -1,6 +1,6 @@
 # Attack Box Operator Guide
 
-**Version:** 1.0  
+**Version:** 1.0
 **Status:** Deployment design only — not validated on live Ubuntu, New Relic or gVisor
 
 ## Purpose
@@ -74,9 +74,11 @@ Enable one or more persona listeners. Each persona is one bind address.
 
 | Variable | Example | Meaning |
 |----------|---------|---------|
-| `ATTACKBOX_OPENAI_ADDR` | `:443` | OpenAI-compatible `/v1/chat/completions` and `/v1/embeddings` |
-| `ATTACKBOX_VLLM_ADDR` | `:8000` | vLLM-compatible `/v1/chat/completions` and `/health` |
-| `ATTACKBOX_OLLAMA_ADDR` | `:11434` | Ollama-native `/api/chat` and `/api/embed` |
+| `ATTACKBOX_OPENAI_ADDR` | `0.0.0.0:8080` | OpenAI-compatible `/v1/chat/completions` and `/v1/embeddings` |
+| `ATTACKBOX_VLLM_ADDR` | `0.0.0.0:8000` | vLLM-compatible `/v1/chat/completions` and `/health` |
+| `ATTACKBOX_OLLAMA_ADDR` | `0.0.0.0:11434` | Ollama-native `/api/chat` and `/api/embed` |
+
+The bait listens inside the container. A reverse proxy terminates TLS and forwards to these internal addresses. Public port 443 belongs to the proxy, not the bait.
 
 If you do not set any listener, the bait exits with an error.
 
@@ -113,7 +115,7 @@ The shipper runs on the host as user `abx-ship`. It reads telemetry from the bai
 |------|-------------|------|---------|
 | `/etc/attackbox/shipper.env` | `root:root` | `0600` | Shipper configuration file. Only root and systemd can read it. |
 | `/run/attackbox/` | `abx-ship:abx-bait` | `0710` | Socket directory. The bait group can traverse but not list. |
-| `/run/attackbox/spool.sock` | `abx-ship:abx-bait` | `0220` | Unix socket. The bait group can write only. |
+| `/run/attackbox/spool.sock` | `abx-ship:abx-bait` | `0220` | Unix socket. Mode `0220` authorizes connection. The shipper application protocol disables writes and sends no responses, making it one-way. |
 | `/var/lib/attackbox-shipper/` | `abx-ship:abx-ship` | `0700` | Queue directory. Never mount this into the container. |
 
 Create the host group `abx-bait` with GID `65532`. The container uses UID/GID `65532`. This GID match authorizes the bait to write to the socket.
@@ -147,198 +149,51 @@ Mount the socket directory read-only into the container:
 --mount type=bind,source=/run/attackbox,target=/run/attackbox,readonly
 ```
 
-A read-only mount still permits `connect()` to a socket inside it. The socket mode `0220` enforces write-only access.
+A read-only mount still permits `connect()` to a socket inside it.
 
-## Deployment Steps
+## Deployment
 
 **Warning:** These steps are not validated on live Ubuntu, New Relic or gVisor. Deployment-only validation is required.
 
-### 1. Prepare the VPS
+### Automated Deployment
 
-1. Create a new VPS in a separate cloud project.
-2. Use Ubuntu 24.04 LTS.
-3. Disable SSH with `--apply --disable-ssh --console-confirmed`.
-4. Verify provider console access before you lock SSH.
-
-### 2. Install Runtime
+Use the reviewed deployment script:
 
 ```bash
-# Install Docker
-curl -fsSL https://get.docker.com | sh
+# Dry-run (shows changes, makes no modifications)
+sudo ./scripts/deploy-ubuntu.sh --dry-run
 
-# Install gVisor runsc
-curl -fsSL https://gvisor.dev/archive.key | gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" > /etc/apt/sources.list.d/gvisor.list
-apt-get update && apt-get install -y runsc
-
-# Configure Docker to use gVisor
-runsc install
-systemctl restart docker
-docker run --rm --runtime=runsc hello-world
+# Apply (after reviewing dry-run output)
+sudo ./scripts/deploy-ubuntu.sh --apply
 ```
 
-### 3. Create Users and Groups
+The script installs Docker, gVisor, creates users/groups, configures the firewall, and deploys systemd units from `deploy/` artifacts.
+
+### SSH Disablement (Optional Final Step)
+
+After all deployment checks pass and you verify provider console access, you may optionally disable SSH:
 
 ```bash
-# Create shipper user
-useradd --system --no-create-home --shell /usr/sbin/nologin abx-ship
-
-# Create bait group with GID 65532
-groupadd --gid 65532 abx-bait
+sudo ./scripts/deploy-ubuntu.sh --apply --disable-ssh --console-confirmed
 ```
 
-### 4. Configure Firewall
+This is a final hardening step. Test provider console recovery first.
 
-Host firewall rules enforce outbound restrictions. Only the shipper user can reach New Relic.
+### Deployment Verification
+
+The deployment script includes healthcheck helpers for inside-gVisor validation. The Chainguard static bait image has no shell, curl, getent, or test utilities. Use the script's test mode:
 
 ```bash
-# Example nftables rules (verify before applying)
-table inet attackbox {
-    chain output {
-        type filter hook output priority 0; policy drop;
-        
-        # Allow DNS and NTP for all
-        udp dport { 53, 123 } accept
-        
-        # Allow New Relic for shipper only
-        skuid abx-ship tcp dport 443 ip daddr { <New Relic IP ranges> } accept
-        
-        # Drop and log other traffic
-        log prefix "attackbox-egress-drop: " drop
-    }
-}
+# Verify deployment (runs checks from inside gVisor)
+sudo ./scripts/deploy-ubuntu.sh --verify
 ```
 
-Provider firewall (applied outside the VPS):
-- Inbound: port 443 only by default
-- Outbound: port 443 (HTTPS) and 53 (DNS) only
-
-### 5. Deploy Shipper
-
-```bash
-# Create directories
-mkdir -p /etc/attackbox /var/lib/attackbox-shipper/queue /run/attackbox
-chown abx-ship:abx-ship /var/lib/attackbox-shipper/queue
-chmod 0700 /var/lib/attackbox-shipper/queue
-chown abx-ship:abx-bait /run/attackbox
-chmod 0710 /run/attackbox
-
-# Write configuration
-cat > /etc/attackbox/shipper.env <<EOF
-ATTACKBOX_NR_LICENSE_KEY=<your-key>
-EOF
-chown root:root /etc/attackbox/shipper.env
-chmod 0600 /etc/attackbox/shipper.env
-
-# Create systemd unit
-cat > /etc/systemd/system/attackbox-shipper.service <<EOF
-[Unit]
-Description=Attack Box Shipper
-Before=attackbox.service
-
-[Service]
-Type=simple
-User=abx-ship
-ExecStart=/usr/local/bin/attackbox-shipper
-EnvironmentFile=/etc/attackbox/shipper.env
-RuntimeDirectory=attackbox
-RuntimeDirectoryMode=0710
-StateDirectory=attackbox-shipper
-StateDirectoryMode=0700
-Restart=always
-RestartSec=1
-TimeoutStopSec=20
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-PrivateDevices=yes
-CapabilityBoundingSet=
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-SystemCallArchitectures=native
-MemoryMax=256M
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable attackbox-shipper
-systemctl start attackbox-shipper
-```
-
-### 6. Deploy Bait
-
-```bash
-# Generate secret
-head -c 64 /dev/urandom > /run/secrets/attackbox
-chmod 0400 /run/secrets/attackbox
-
-# Run container
-docker run -d \
-  --name=attackbox \
-  --runtime=runsc \
-  --user=65532:65532 \
-  --read-only \
-  --security-opt=no-new-privileges \
-  --cap-drop=ALL \
-  --network=attackbox-net \
-  --pids-limit=100 \
-  --memory=512m \
-  --cpus=2 \
-  --mount type=bind,source=/run/attackbox,target=/run/attackbox,readonly \
-  --mount type=bind,source=/run/secrets/attackbox,target=/run/secrets/attackbox,readonly \
-  -e ATTACKBOX_SECRET_FILE=/run/secrets/attackbox \
-  -e ATTACKBOX_SPOOL_SOCKET=/run/attackbox/spool.sock \
-  -e ATTACKBOX_OPENAI_ADDR=:8080 \
-  -e ATTACKBOX_INSTANCE=attackbox-01 \
-  attackbox:latest
-
-# Create systemd unit
-cat > /etc/systemd/system/attackbox.service <<EOF
-[Unit]
-Description=Attack Box Bait
-Requires=attackbox-shipper.service
-After=attackbox-shipper.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/docker start -a attackbox
-ExecStop=/usr/bin/docker stop -t 15 attackbox
-Restart=always
-RestartSec=1
-TimeoutStopSec=20
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable attackbox
-systemctl start attackbox
-```
-
-### 7. Verify Deployment
-
-**Inside the container (gVisor):**
-
-```bash
-# Verify no internet route
-docker exec attackbox curl -m 5 https://example.com
-# Expected: connection timeout or error
-
-# Verify no metadata access
-docker exec attackbox curl -m 5 http://169.254.169.254/
-# Expected: connection timeout or error
-
-# Verify DNS works
-docker exec attackbox getent hosts example.com
-# Expected: IP address
-
-# Verify socket access
-docker exec attackbox test -S /run/attackbox/spool.sock && echo "socket exists"
-# Expected: socket exists
-```
+The verification checks:
+- Internet access is blocked (connection timeout)
+- Cloud metadata `169.254.169.254` is unreachable
+- DNS resolution works
+- Socket is accessible
+- New Relic ingest URLs are reachable from the shipper
 
 **On the host:**
 
@@ -368,11 +223,11 @@ journalctl -u attackbox -n 50
 
 ## Operations
 
-### Dry-Run Mode
+### Local-Only Mode (Bait Direct)
 
-To test without sending to New Relic, set `ATTACKBOX_NR_DISABLED=true` on the bait (direct mode) or omit `ATTACKBOX_NR_LICENSE_KEY` on the shipper. The bait writes logs to stdout. The shipper writes to its local queue only.
+To test the bait without a shipper or New Relic, set `ATTACKBOX_NR_DISABLED=true` on the bait. The bait writes logs to stdout only. This is for local development, not deployment preflight.
 
-**Warning:** Dry-run mode on the shipper still runs the queue and checkpoint logic. The queue can grow to `ATTACKBOX_SHIP_QUEUE_BYTES`. Monitor disk usage.
+The shipper does not support a dry-run queue mode. Deployment preflight uses the reviewed script's `--dry-run` flag, which shows changes without applying them.
 
 ### Monitor Deployment
 
@@ -386,8 +241,15 @@ SINCE 2 minutes ago
 ```
 
 **Alert conditions:**
-- No `source='shipper'` heartbeat for 2 minutes → host or shipper is down → power off the VPS
-- `bait_connected=false` or `last_bait_record_age_ms > 90000` for 2 minutes → bait is down, host is fine → rebuild the container
+- No `source='shipper'` heartbeat for 2 minutes → shipper or egress is down → power off the VPS
+- `bait_connected=false` or `last_bait_record_age_ms > 90000` for 2 minutes → bait process is down or hung → rebuild on a fresh instance
+
+A shipper-owned heartbeat with `bait_connected=true` and recent `last_bait_record_age_ms` proves:
+- The shipper process is running
+- The shipper can reach New Relic
+- A verified bait-role socket is connected and recently sent a record
+
+It does not prove the host is uncompromised. Under host-root compromise, telemetry integrity is lost.
 
 ### View Logs
 
@@ -439,16 +301,27 @@ SELECT sum(attackbox.probes) FROM Metric SINCE 1 hour ago FACET probe_id
 
 ### Rebuild
 
-Stop the services, delete the container, and redeploy:
+After compromise or anomalous behavior, rebuild on a fresh provider instance.
 
-```bash
-systemctl stop attackbox
-systemctl stop attackbox-shipper
-docker rm attackbox
-# Delete queue to start fresh
-rm -rf /var/lib/attackbox-shipper/queue/*
-# Redeploy (steps 5-6)
-```
+**Before rebuild:**
+1. Deactivate the ingest key in New Relic.
+2. Power off the compromised VPS through the provider console.
+3. Snapshot the VPS disk for forensic analysis (optional).
+4. Download `/var/lib/attackbox-shipper/queue/` for offline investigation (optional).
+
+**Queue preservation decision:**
+- **Preserve:** Keep the queue directory to analyze the attack timeline and unshipped events.
+- **Discard:** Delete the queue directory if you verified all events reached New Relic and you do not need forensic replay.
+
+Destroying the queue before investigation loses forensic evidence. Make this an explicit decision.
+
+**Fresh instance:**
+1. Create a new VPS with a new Ingest-License key.
+2. Deploy with `sudo ./scripts/deploy-ubuntu.sh --apply`.
+3. Verify all deployment checks pass.
+4. Update DNS if the IP changed.
+
+Do not reuse the compromised instance. Cloud-init rebuilds from scratch ensure no persistent attacker code.
 
 ### Power Off
 
@@ -555,4 +428,4 @@ You must validate:
 - Falco least-privileged mode (Modern eBPF) detects escapes
 - Provider console access survives SSH disablement
 
-Test from inside the gVisor container. Host-only curl checks are not sufficient.
+Test from inside the gVisor container. Host-only checks are not sufficient.

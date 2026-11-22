@@ -1,6 +1,6 @@
 # Attack Box Architecture
 
-**Version:** 1.0  
+**Version:** 1.0
 **Status:** Deployment design only — not validated on live Ubuntu, New Relic or gVisor
 
 ## Overview
@@ -24,19 +24,19 @@ flowchart TB
         NR[New Relic<br/>Dedicated Account]
         CT[Canarytokens]
     end
-    
+
     subgraph VPS[Decoy VPS - Assumed Compromised]
         subgraph Container[gVisor Sandbox<br/>UID 65532, No Egress]
             B[Bait Process<br/>attackbox]
             B --> |stdout| DL[Docker Logs<br/>Forensic Backstop]
         end
-        
+
         subgraph Host[Host - User abx-ship]
             S[Shipper Process<br/>attackbox-shipper]
             F[Falco<br/>Escape Detection]
             N[nftables<br/>Egress Filter]
         end
-        
+
         A -->|HTTPS 443| RP[Reverse Proxy<br/>TLS Termination]
         RP --> B
         B -->|Unix Socket<br/>/run/attackbox/spool.sock| S
@@ -45,12 +45,12 @@ flowchart TB
         S -->|HTTPS 443<br/>Api-Key Header| NR
         B -.->|Canary Triggered| CT
     end
-    
+
     subgraph Operator
         O[Browser]
         P[Provider Console]
     end
-    
+
     O -->|View Logs/Metrics| NR
     P -.->|Power Off| VPS
     CT -.->|Alert| O
@@ -96,46 +96,46 @@ sequenceDiagram
     participant S as Spool<br/>(Unix Socket)
     participant H as Host Shipper
     participant N as New Relic
-    
+
     A->>P: POST /v1/chat/completions<br/>Authorization: Bearer sk-...
     P->>B: Proxied Request
-    
+
     Note over B: Redact Bearer token
     B->>S: edge event<br/>(request log)
-    
+
     B->>R: Classify message
     R-->>B: Task: prompt-extraction<br/>Gate: registration
-    
+
     Note over B: Hold 150s (suspicious)
-    
+
     B->>A: 200 OK<br/>SSE: Declare metadata
-    
+
     Note over B: Wait for followup
-    
+
     A->>P: POST /v1/chat/completions<br/>(followup with metadata)
     P->>B: Proxied Request
-    
+
     B->>R: Check declaration
     R-->>B: Registered, probe ready
-    
+
     B->>S: probe event<br/>(gate trigger)
-    
+
     B->>A: 200 OK<br/>SSE: Fake response<br/>with canary token
-    
+
     B->>S: transcript event<br/>(message + response)
-    
+
     Note over S,H: Non-blocking enqueue
-    
+
     H->>H: Validate record
     H->>H: Write to disk queue
-    
+
     loop Every 30s or queue empty
         H->>N: POST /log/v1<br/>Api-Key: <ingest-key><br/>Batch of events
         N-->>H: 202 Accepted
         H->>H: Checkpoint advance
         H->>H: Delete old segments
     end
-    
+
     Note over H,N: Direct heartbeat<br/>(bypass queue)
     H->>N: POST /log/v1<br/>heartbeat event<br/>source=shipper
 ```
@@ -147,49 +147,49 @@ The responder is a deterministic state machine. Each session progresses through 
 ```mermaid
 stateDiagram-v2
     [*] --> CheckTask
-    
+
     CheckTask --> RegistrationGate: Task detected<br/>(prompt-extraction, etc.)
     CheckTask --> NormalResponse: Benign message
-    
+
     RegistrationGate --> Hold150s: First gate
     Hold150s --> AskMetadata: After 150s
     AskMetadata --> AwaitDeclaration: SSE response
-    
+
     AwaitDeclaration --> AuditGate: Declared<br/>(metadata received)
     AwaitDeclaration --> Terminate: Max 3 responses<br/>without declaration
-    
+
     AuditGate --> AskDetails: Second gate
     AskDetails --> AwaitDetails: SSE response
-    
+
     AwaitDetails --> ResourceGate: Details received
     AwaitDetails --> Terminate: Max retries
-    
+
     ResourceGate --> Hold30s: Third gate
     Hold30s --> InjectProbe: After 30s
-    
+
     InjectProbe --> PayoutLimit: Probe in tools<br/>or message
-    
+
     PayoutLimit --> NormalResponse: Response 1-3
     PayoutLimit --> Terminate: After 3 responses
-    
+
     NormalResponse --> CheckTask: Continue session
     Terminate --> [*]
-    
+
     note right of RegistrationGate
         Probe: declaration-request
         Task: metadata fields
     end note
-    
+
     note right of AuditGate
         Probe: audit-followup
         Task: activity details
     end note
-    
+
     note right of ResourceGate
         Probe: resource-limit
         Task: cost/quota check
     end note
-    
+
     note right of InjectProbe
         Probes: canary tokens,
         invisible Unicode,
@@ -236,27 +236,27 @@ flowchart TB
         subgraph PF[Provider Firewall<br/>Outside Host Control]
             I[Inbound: 443 only<br/>Outbound: 443, 53 only]
         end
-        
+
         subgraph VPS[VPS Instance - Ubuntu 24.04]
             subgraph Host[Host OS]
                 NF[nftables<br/>skuid abx-ship only]
                 F[Falco<br/>Modern eBPF]
-                
+
                 subgraph Shipper[Shipper Process<br/>User: abx-ship]
                     SP[attackbox-shipper]
                     Q[Disk Queue<br/>/var/lib/attackbox-shipper]
                     E[/etc/attackbox/shipper.env<br/>root:root 0600<br/>NR License Key]
                 end
-                
+
                 subgraph Docker[Docker + gVisor Runtime]
                     subgraph Container[Container<br/>UID 65532 GID 65532]
                         BP[attackbox]
                         SC[/run/secrets/attackbox<br/>Session Key]
                     end
                 end
-                
-                SK[/run/attackbox/spool.sock<br/>abx-ship:abx-bait 0220]
-                
+
+                SK[/run/attackbox/spool.sock<br/>abx-ship:abx-bait 0220<br/>mode authorizes connection,<br/>protocol is one-way]
+
                 NF --> SP
                 F --> SP
                 BP --> SK
@@ -266,23 +266,23 @@ flowchart TB
                 SC -.->|Read by bait| BP
             end
         end
-        
+
         I --> VPS
     end
-    
+
     subgraph External[External Services]
         NR[New Relic<br/>log-api.newrelic.com<br/>metric-api.newrelic.com]
     end
-    
+
     subgraph Operator[Operator]
         B[Browser]
         C[Provider Console]
     end
-    
+
     SP -->|HTTPS 443| NR
     B -->|View| NR
     C -.->|Power Off| VPS
-    
+
     style E fill:#f99
     style SC fill:#9f9
     style SK fill:#99f
@@ -305,7 +305,7 @@ flowchart TB
 
 **Host shipper:**
 - Runs as user `abx-ship`
-- Reads from Unix socket `/run/attackbox/spool.sock` (mode `0220`)
+- Reads from Unix socket `/run/attackbox/spool.sock` (mode `0220` authorizes connection; application protocol is one-way)
 - Writes to disk queue `/var/lib/attackbox-shipper` (mode `0700`)
 - Reads ingest key from `/etc/attackbox/shipper.env` (mode `0600`, root-owned)
 - Only process with egress to New Relic (enforced by nftables `skuid`)
@@ -489,16 +489,16 @@ Use a reverse proxy (nginx, Caddy, Traefik) for TLS. The bait listens on HTTP in
 
 ```nginx
 upstream attackbox {
-    server 127.0.0.1:8080;
+    server host.docker.internal:8080;
 }
 
 server {
     listen 443 ssl http2;
     server_name api.example.com;
-    
+
     ssl_certificate /etc/letsencrypt/live/api.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/api.example.com/privkey.pem;
-    
+
     location / {
         proxy_pass http://attackbox;
         proxy_set_header Host $host;
