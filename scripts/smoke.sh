@@ -67,10 +67,8 @@ expect "openai chat sse" 'data: [DONE]' \
 ttfb=$(c -o /dev/null -w '%{time_starttransfer}' -H "$json" -d '{"model":"qwen3:8b","stream":true,"messages":[{"role":"user","content":"hello"}]}' "$o/v1/chat/completions")
 awk -v t="$ttfb" 'BEGIN { exit !(t >= 0.2 && t < 5) }' || fail "openai first byte after ${ttfb}s; want paced 0.2-5s"
 echo "smoke: ok   paced first token (${ttfb}s)"
-# Skip responses SSE test - hits behavioral probes (output-window, retry) that require
-# specific client behavior (hold tolerance, 429 retry). Responses API is tested in internal/server.
-# expect "openai responses sse" 'event: response.completed' \
-# 	"$(c -N -H "$json" -d '{"model":"qwen3:8b","stream":true,"input":"hello"}' "$o/v1/responses")"
+expect "openai responses sse" 'event: response.completed' \
+	"$(c -N -H "$json" -H 'Authorization: Bearer sk-smoke-responses-not-a-real-key' -d '{"model":"qwen3:8b","stream":true,"input":"hello"}' "$o/v1/responses")"
 expect "openai unknown model" '"code":"model_not_found"' \
 	"$(c -H "$json" -d '{"model":"nope","messages":[{"role":"user","content":"hi"}]}' "$o/v1/chat/completions")"
 expect "vllm version" '"version"' "$(c "$v/version")"
