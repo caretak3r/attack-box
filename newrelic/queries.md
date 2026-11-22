@@ -340,5 +340,8 @@ The following field names require deployment validation:
 **Probe stream (observations):**
 - Observation array structure and probe_id filtering
 - Canary-reuse detection requires observations array queries
+- A `canary-reuse` observation holds, for each canary, a comma list of states: `present_in_history`, `newly_echoed`, `destination_placed`, `credential_presented`, `presented_undelivered`. It also holds `credential_source` and `independently_observed` (always `unavailable`). `present_in_history` is not exfiltration. Each state is reported once for each canary in a session.
+- Replies that the responder does not score are observations with `probe_id` `attribution`, a `status`, and a `reason`.
+- `attackbox.probe_followups` counts attributed replies only.
 
 After deployment, verify these queries against actual emitted events and update as needed.

@@ -120,7 +120,7 @@ Ten critical alerts requiring immediate action:
 - Ingest error spike (quota exhaustion)
 - NrIntegrationError events (platform errors)
 - Queue backlog critical (ingest degraded)
-- Canary token reused (credential leakage)
+- Canary-reuse observation (read the state list; `present_in_history` is not credential leakage)
 
 ### `alerts/informational-alerts.yaml`
 
@@ -164,7 +164,7 @@ WHERE stream = 'probe' AND action = 'decision'
 FACET record_id, body_sha256, chunk_index
 ```
 
-**Note:** Canary observations require `observations.probe_id` filtering (pending array-query validation).
+**Note:** Canary observations require `observations.probe_id` filtering (pending array-query validation). A `canary-reuse` observation holds, for each canary, a comma list of states: `present_in_history`, `newly_echoed`, `destination_placed`, `credential_presented`, `presented_undelivered`. It also holds `credential_source` and `independently_observed` (always `unavailable`). `present_in_history` is not exfiltration. Each state is reported once for each canary in a session. Unscored replies are observations with `probe_id` `attribution`, a `status`, and a `reason`. `attackbox.probe_followups` counts attributed replies only.
 
 See `docs/newrelic-runbook.md` → "Chunk-Safe Deduplication" for details.
 

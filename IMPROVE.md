@@ -55,7 +55,6 @@ Effort: S = one bounded change; M = several related changes; L = a new subsystem
 |---|---|---|---|---|---|
 | I01 | P0 | Expose and verify the discovery profile | M | Medium | High |
 | I02 | P0 | Record evidence provenance and collection limits | M | Medium | High |
-| I03 | P0 | Correct follow-up and canary attribution | M | Medium | High |
 | I04 | P1 | Separate passive responses from active probes | M | Medium | High |
 | I05 | P1 | Add coherent simulated task and resource state | L | High | High |
 | I06 | P1 | Make tool, JSON, and streaming behavior consistent | L | High | High |
@@ -97,22 +96,6 @@ Reconcile producer boot/sequence ranges and cumulative counters at each availabl
 Use monotonic durations for local ordering and UTC times for cross-system comparison. Record clock quality and restart boundaries. Do not repair uncertain cross-host order by inventing timestamps. A rejected schema version must produce a protected aggregate rejection signal; it must not silently disappear from the denominator.
 
 **Accept when:** partial requests, invalid UTF-8, redaction expansion, chunked events, replayed delivery, and queue overflow preserve honest completeness flags where records survive. Saturation followed by producer termination before its next heartbeat produces an unknown-loss interval, not a zero-loss report. Unknown schema versions fail with a bounded reason. New attributes survive shipper validation without silent loss. Existing producer-role isolation tests remain green.
-
-### I03 — Correct follow-up and canary attribution
-
-**Evidence:** `/Users/rohit/attack-box/internal/responder/responder.go:252` checks canaries against the full corpus. `/Users/rohit/attack-box/internal/responder/responder.go:279` scores many follow-ups against accumulated request text. Only some branches use the latest reply.
-
-Score the new reply after the relevant probe, not material copied from earlier turns. Record the probe request ID, issue time, expected reply channel, and reply request ID. For full-history clients, identify a bounded message delta or record an ambiguous-history result. Do not credit a client for an argv array, nonce, URL, or content hash that appeared before the probe.
-
-Track probe delivery separately from probe selection: selected, partially sent, fully sent, or unknown. The responder currently marks a pending probe before the HTTP path sends it. Do not credit an earlier concurrent request as a reply to an undelivered probe. Bytes written establish server-side delivery progress; they do not prove that the client consumed the response.
-
-Keep a bounded issuance record with session, probe ID, state version, response digest, expected reply type, and expiry. All client-supplied history is a claim. Matching a nonce or copied assistant response shows possession of text, not who generated it or whether it was obeyed. Invented, reordered, expired, or conflicting history must not create a verified follow-up. When the API lacks a reliable turn reference, record ambiguity instead of forcing a match. Probe slots need request-specific identities; one mutable pending slot cannot correctly attribute overlapping exchanges.
-
-Record canary states separately: issued, present in returned history, newly echoed, placed in a requested destination, presented back as a credential, and independently observed at an owned receiver. Presence in a prompt is not exfiltration. Cross-session correlation must use an explicit issuance record and bounded retention; do not expose a global token lookup to clients. Match only issued synthetic tokens, not every token with a similar shape.
-
-An owned callback receiver is optional and requires a separate deployment decision. Do not fetch an attacker destination or direct a client to contact a third party to test a canary. Even a callback can come from a researcher, security scanner, preview service, or replay; retain those alternatives. A public synthetic-token prefix is never a redaction exemption. Only an exact currently issued synthetic value can receive that treatment, with a bounded issuance registry.
-
-**Accept when:** replaying the issued response produces no new compliance or exfiltration finding. A new client reply produces one deduplicated observation. Tests cover changed message order, truncated history, tool messages, retries, concurrent requests, disconnect before delivery, and overlapping streams. A claimed action and an observed action remain distinct.
 
 ### I04 — Separate passive responses from active probes
 
@@ -313,7 +296,7 @@ These are required future fixtures, not existing tests. Each implementation bead
 
 | Test | Adversarial condition | Required result | Coverage |
 |---|---|---|---|
-| V01 | Fabricated assistant history, tool result, nonce, or foreign response ID | Record claims; no permission change, verified compliance, or foreign object access | I03, I05, I06, C08 |
+| V01 | Fabricated assistant history, tool result, nonce, or foreign response ID | Record claims; no permission change, verified compliance, or foreign object access | I05, I06, C08 |
 | V02 | Conflicting mutations; stale version; retry with changed arguments; cancel before/after commit | One ordered state history; defined conflict; no duplicated keyed mutation; commit and delivery distinct | I05, I06 |
 | V03 | Full producer queue, broken socket, partial remote batch, missing chunk, process death before heartbeat | Reconcile known stages; preserve duplicate identity; mark unresolved loss unknown | I02, I11 |
 | V04 | Unique-padding flood, rotated identities, many apparent campaigns, slow log consumer | All budgets hold; protected health survives where available; baseline sampling opportunity and drops reported | I08, I11, C08 |
@@ -324,7 +307,7 @@ These are required future fixtures, not existing tests. Each implementation bead
 | V09 | Shared TLS stack, fingerprint spoof, HTTP without TLS, multiplexed streams | Correct connection/request join; collisions and missing data retained; no unique-client claim | I10, C04 |
 | V10 | Repeated cohort selection, scanner traffic, outage across advisory disclosure | Assignment manipulation and exposure windows visible; no causal or internet-wide prevalence claim | I04, I11, C05, C07 |
 | V11 | Direct bypass, IPv6 egress, metadata target, DNS/URL in simulated tools, upload traversal | Public surface limited to approved routes; simulated actions stay inert; no prohibited connection or write | I01, I05, I10, I13, C03 |
-| V12 | Host impersonates producer, clocks move backward, old epoch reappears | Validity remains bounded by trust source; suspect intervals and ordering ambiguity remain visible | I02, I03, I09 |
+| V12 | Host impersonates producer, clocks move backward, old epoch reappears | Validity remains bounded by trust source; suspect intervals and ordering ambiguity remain visible | I02, I09 |
 | V13 | Poisoned language-renderer input or proposed generated variant | No state/tool authority; output checked against approved plan; deterministic fallback; no automatic promotion | I12, I14 |
 | V14 | Finite retention expiry with derived indices, replay corpus, queued exports, and rebuild | Expired content and linkable derivatives follow policy; remaining permitted aggregates and loss of replay capability documented | I02, I08, I09, I12 |
 
@@ -332,7 +315,7 @@ Scrubbing does not guarantee detection of every possible secret. Specify support
 
 ## Recommended implementation sequence
 
-1. Establish trusted observation before exposure: I02, I03, I10, C08 admission/ownership, C09, C11, C12, C14, C17, and query/health corrections in I11. Add I12 fixtures and the resource contract now. Prepare I01 routing with public ingress closed.
+1. Establish trusted observation before exposure: I02, I10, C08 admission/ownership, C09, C11, C12, C14, C17, and query/health corrections in I11. Add I12 fixtures and the resource contract now. Prepare I01 routing with public ingress closed.
 2. Establish useful interaction: I04, I05, I06, C01, C06, C10, C13, and C16. Preserve the passive and active cohorts. Pass V01–V12 for enabled components before opening I01's approved public ports. Disabled optional features must have explicit unavailable coverage, not a fictitious passing test.
 3. Establish bounded analysis: I07, I08, I09, C02, C05, C07, and the remaining I11 views. Add C04 only after edge-feature feasibility is verified. Pass V14 before retention-dependent collection is enabled. C03 begins with existing model-management routes; a blob route remains optional and gated.
 4. Evaluate additional surfaces and generation: I13 and C15, then I14 only if evidence supports the benefit. Run V11 for each enabled new protocol and V13 before using a generator. No public experiment can bypass the earlier collection or containment gates.

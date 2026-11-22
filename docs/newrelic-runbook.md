@@ -172,7 +172,7 @@ SINCE 10 minutes ago
 - `attackbox.probes`: Probe count by persona, probe_id, task
 - `attackbox.request_bytes`: Request body bytes
 - `attackbox.response_bytes`: Response body bytes
-- `attackbox.probe_followups`: Follow-up probe responses
+- `attackbox.probe_followups`: Attributed replies to a probe (ambiguous, `no_new_material` and replayed requests are not counted)
 - `attackbox.session_duration_seconds`: Session age
 - `attackbox.stream_disconnect_seconds`: Disconnect timing
 - `attackbox.retry_delay_seconds`: Retry delay observations
@@ -410,12 +410,13 @@ LIMIT 100
 
 #### Canary Token Reused
 
-**Alert:** Client returned a session-unique canary credential.
+**Alert:** A `canary-reuse` observation exists. The alert matches every such observation, including `present_in_history`. It does not mean that the client returned a credential.
 
-**Cause:** Credential leakage behavior; client disclosed a fake secret.
+**Cause:** A request contains a session-unique canary. The observation holds a comma list of states for each canary. `present_in_history` means the canary was already in the client history, for example a copied conversation. `newly_echoed`, `destination_placed` and `credential_presented` show new client action. No state proves exfiltration. `independently_observed` is always `unavailable`. Each state is reported once for each canary in a session, so one copied history does not repeat the alert.
 
 **Action:**
-1. Examine the session:
+1. Read the state list of the observation before any other action. Do not treat `present_in_history` alone as credential leakage.
+2. Examine the session:
    ```nrql
    FROM Log
    SELECT timestamp, session_id, src_ip, action
@@ -423,9 +424,9 @@ LIMIT 100
    FACET record_id, body_sha256, chunk_index
    SINCE 1 hour ago
    ```
-2. Review the session timeline (see [Session Investigation](#session-investigation)).
-3. Expected behavior for some clients (credential managers, autocomplete); verify intent via other probes.
-4. If combined with shell execution or URL exfiltration, the client is actively attempting credential theft.
+3. Review the session timeline (see [Session Investigation](#session-investigation)).
+4. Some clients show this behavior without hostile intent (credential managers, autocomplete, copied history); verify intent via other probes.
+5. If a new-action state is combined with shell execution or URL exfiltration, the client can be attempting credential theft. The state list alone does not prove it.
 
 ### Informational Alerts
 
@@ -439,7 +440,7 @@ LIMIT 100
 
 #### Credential Access Attempts
 
-**Action:** Check for follow-up canary reuse. High activity may indicate a targeted attack.
+**Action:** Check for `canary-reuse` observations with a new-action state (`newly_echoed`, `destination_placed`, `credential_presented`). High activity may indicate a targeted attack.
 
 #### Shell Execution Attempts
 
@@ -499,7 +500,7 @@ SINCE 1 hour ago
 
 Each row is one unique chunk. If the event is unchunked, `chunk_index = 0` and `chunk_count = 1`.
 
-**Note:** Canary observations have `probe_id = 'canary-reuse'` within the `observations` array attribute. Array filtering syntax (`observations.probe_id`) requires account-side validation.
+**Note:** Canary observations have `probe_id = 'canary-reuse'` within the `observations` array attribute. For each canary, the observation holds a comma list of states: `present_in_history`, `newly_echoed`, `destination_placed`, `credential_presented`, `presented_undelivered`. It also holds `credential_source` and `independently_observed`, which is always `unavailable`. `present_in_history` is not exfiltration. Each state is reported once for each canary in a session. Replies that the responder does not score are observations with `probe_id` `attribution`, a `status`, and a `reason`. `attackbox.probe_followups` counts attributed replies only. Array filtering syntax (`observations.probe_id`) requires account-side validation.
 
 
 
@@ -605,7 +606,7 @@ FACET probe_id
 SINCE 1 hour ago
 ```
 
-High `probe_followups` indicates the client is acting on the responder's probes.
+High `probe_followups` indicates the client sends many attributed replies after the responder's probes. An attributed reply is a request that the server matched to one delivered probe. It is not proof that the client read or acted on the probe.
 
 ### Queue Backlog Expected Range
 
@@ -632,19 +633,24 @@ High `probe_followups` indicates the client is acting on the responder's probes.
 
 ### Canary Reuse False Positives
 
-**Observation:** Canary tokens returned by the client.
+**Observation:** A `canary-reuse` observation. The alert matches every such observation. Read the state list first.
 
 **Legitimate causes:**
+- The client sends a copied conversation history that contains the canary (`present_in_history`).
 - Credential managers or browser autocomplete suggesting fake tokens.
 - SDK retry logic echoing the previous response.
 
 **False positive if:**
-- The client returns the canary once and does not use it in follow-up requests.
+- The only state is `present_in_history`.
+- The client shows the canary once and does not use it in later requests.
 - No other high-risk tasks (`shell-execution`, `url-exfiltration`) in the session.
 
-**Genuine attack if:**
+**Stronger signal if:**
+- A state of `newly_echoed`, `destination_placed` or `credential_presented` appears. These show new client action. They do not prove exfiltration, and `independently_observed` is always `unavailable`.
 - The client uses the canary in a subsequent request (e.g., `Authorization: Bearer sk-local-<hex>`).
 - Combined with exfiltration attempts or shell commands.
+
+Each state is reported once for each canary in a session. A repeated copy of the same history does not create a new observation.
 
 **Check session timeline:**
 ```nrql
@@ -967,7 +973,7 @@ New Relic cannot query archived data. For forensic analysis of old sessions:
 | `attackbox.probes` | count | persona, probe_id, task | server, probe decision |
 | `attackbox.request_bytes` | count | persona, endpoint | server, request body |
 | `attackbox.response_bytes` | count | persona, endpoint | server, response body |
-| `attackbox.probe_followups` | count | persona, probe_id | server, follow-up response |
+| `attackbox.probe_followups` | count | persona, probe_id | server, attributed reply only |
 | `attackbox.session_duration_seconds` | gauge | persona | server, session age |
 | `attackbox.stream_disconnect_seconds` | gauge | persona, endpoint | server, disconnect timing |
 | `attackbox.retry_delay_seconds` | gauge | persona | server, retry delay |

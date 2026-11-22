@@ -47,13 +47,106 @@ Captured text is untrusted data at every boundary. Do not render it as active HT
 
 ## Current response path
 
-The HTTP layer parses bounded requests, selects the persona, derives session context, and invokes the responder. The responder scores a pending follow-up, records declarations, and classifies intent. After three issued questions it can release one fake payout. Other branches select an intent probe or the registration sequence: model question, harness question, assigned behavioral probe, then a neutral completion. Intent probes can continue after payout.
+The HTTP layer parses bounded requests, selects the persona, derives session context, and invokes the responder. The server takes an admission tick when a request arrives, before it reads the body. The responder attributes a reply only to a probe response that the server fully sent before that admission. It scores only new material. In all other cases it records an `attribution` observation and does not guess. The responder also records declarations and classifies intent. After three issued questions it can release one fake payout. Other branches select an intent probe or the registration sequence: model question, harness question, assigned behavioral probe, then a neutral completion. Intent probes can continue after payout.
 
 Probe output is assistant text. The code does not implement a real tool executor. Accepting tool definitions does not establish a coherent tool-call lifecycle. General requests can receive registration questions. The current classifier uses fixed keyword rules. These are known response-quality limits, not proof of attacker intent.
 
 Selected timeout probes use silent holds or idle frames. Ordinary suspicious requests do not all wait 150 seconds. Streaming uses simulated pacing; token counts and fake embeddings do not establish model equivalence. The current maximum-stream setting bounds selected holds, with HTTP write timeout set to that value plus 30 seconds; it is not a complete semantic response-budget contract.
 
 Source: `/Users/rohit/attack-box/internal/responder/responder.go`, `/Users/rohit/attack-box/internal/responder/probes.go`, `/Users/rohit/attack-box/internal/server/server.go`, and `/Users/rohit/attack-box/cmd/attackbox/main.go`.
+
+## Probe issuance and reply attribution
+
+Each session holds a bounded registry of issuance records. One record describes one probe response that the server chose for one request. It stores the session, probe ID, probe request ID, issue time, expiry, expected reply channel, delivery state, and at most one reply request ID. It stores digests, not text: the response digest, the digest of the exact bytes sent, a rolling digest of the probe request history, and digests of standing metadata. For a JSON-mode response of 4 KiB or less, it also keeps the wrapped text. The session keeps one bounded snapshot of the indirect-injection gate text. A newer indirect-injection gate supersedes the older one.
+
+| Delivery state | Meaning |
+|---|---|
+| `selected` | The server chose the response. No byte is written. |
+| `partially_sent` | The transport accepted some bytes but not all content. A short or failed write, or a flush error after a write, gives this state. |
+| `fully_sent` | The transport accepted every byte of the probe content. A stream needs no closing frame and no finished hold. A non-stream body needs a successful write and flush. |
+| `unknown` | The handler ended with no byte written, or the writer cannot flush. A `fully_sent` record never becomes `unknown`. |
+
+These states are server observations. They do not show that the client read the bytes. A failed closing stream frame leaves the state unchanged. The probe event then carries `terminal_frame="failed"`.
+
+A request can be the reply to a record only if the record is open, is `fully_sent`, and was fully sent before the admission tick of the request. An open record asks for something, has no reply, is not closed, and is not older than 10 minutes. Admission and delivery use one atomic counter, so the order does not depend on the clock. A request that arrives before the full send is never the reply. A stream is `fully_sent` before its hold starts, so a reply during the hold is eligible. A non-stream hold runs before any byte, so `fully_sent` comes after the body.
+
+| `basis` | When it applies |
+|---|---|
+| `assistant_anchor` | The newest assistant message equals an issued response. The new material is the text after it. |
+| `unchanged_prefix` | The chat history still starts with the probe request history. The new material is the text after that prefix. |
+| `temporal_only` | The probe and the reply have no turn history. The server removes only the probe prompt. |
+| `retry` | The reply to the retry gate. |
+| `none` | Every `attribution` observation. |
+
+An unscored reply is an observation with `probe_id` `attribution`. Its `status` is `ambiguous`, `no_new_material`, or `lost`. It carries `reason` and `reply_request_id`. When one record is known, it also carries the probe, issuance, delivery, and `basis` fields.
+
+| `reason` | Condition |
+|---|---|
+| `expired` | The reply names an issued response, and the record is older than 10 minutes. |
+| `not_fully_sent` | The reply names an issued response, and the record is not `fully_sent`. Reported once. |
+| `delivery_race` | The request was admitted before the full send. Reported once. |
+| `probe_not_fully_sent` | No eligible record exists, and an open record is not `fully_sent`. Reported once. |
+| `truncated` | The history has fewer messages than the probe request history. |
+| `reordered` | The messages match as a set, but the order differs. |
+| `changed` | The history differs, the issued response is not next to the prior history, or a chat probe gets a bare prompt. |
+| `history_depth` | The history has more than 1024 messages. |
+| `multiple_candidates` | More than one record is eligible. The server closes all of them and names no probe. |
+| `superseded` | A newer indirect-injection gate replaced an open one. |
+| `no_new_material` | The request repeats the probe request exactly and brings no new credential, or the new material is empty. The record is consumed. Nothing is scored. |
+| `evicted_open` | The registry dropped an open record. `status` is `lost`. |
+
+Special gates: the `retry` gate sends a 429 with `Retry-After`. The server scores only a request with the same identity, and only once. A request with another identity is skipped. The identity covers the history, metadata, user, and tool flags. It excludes headers. The timeout gates score once with `returned="true"`. A client that leaves a hold cuts the record: the delivery state stays, and the record takes no reply. A status hit on `/v1/edge/{A-D}/status` binds only when exactly one concurrency record is eligible and the label is new. A bound hit carries `bound="true"` and the counters. An unbound hit carries `bound="false"` and a `reason` of `no_delivered_issuance`, `multiple_candidates`, or `duplicate_label`. It carries no counters and does not feed the gauge. Other labels get a 404.
+
+A standing field is a value that the probe request already carried. A scored gate reports it as `already_present`, not `true`. The credential surfaces are `metadata.credential`, `Authorization`, and `X-Api-Key`. The responder compares them exactly in memory. It never logs the values. It ignores a value that the probe request already carried.
+
+| Canary state | Meaning |
+|---|---|
+| `present_in_history` | The canary is only in history or earlier text. |
+| `newly_echoed` | The canary is in new material after delivery. |
+| `destination_placed` | The canary is inside a URL in new material. |
+| `credential_presented` | The exact value is in a credential surface. `credential_source` names the surface. |
+| `presented_undelivered` | The client shows the canary before the server fully sent its probe. |
+
+The server reports each state once for each canary in a session. The canaries are `url_password`, `two_part`, `three_part`, and `payout`. Only exact issued values match. `independently_observed` is always `unavailable`. Presence in a prompt is not exfiltration.
+
+| Constant | Value | Behaviour at the bound |
+|---|---|---|
+| `maxIssuances` | 8 | The registry evicts the oldest record that cannot take a reply. If none exists, it evicts the oldest open record and reports `lost`. It never evicts the newest. |
+| `issuanceTTL` | 10 minutes | The record is not open. |
+| `maxSeen`, `maxIssuedSum` | 512, 64 | The oldest digest is dropped. An older replay is no longer blanked. |
+| `maxWrapped`, `maxMsgText`, `maxSnapshot` | 4 KiB, 64 KiB, 8 KiB | The server does not keep wrapped text above the bound. It clips message text and snapshot fields. |
+| `maxMessages` | 1024 | Extra messages are ignored and `history_depth` is reported. |
+| `ProbeHistory` | 64 | The oldest entry is dropped. |
+| Hold | `min(HoldSilent, MaxStreamDuration)` | Defaults: 150 s and 180 s. |
+
+```mermaid
+stateDiagram-v2
+    [*] --> Selected
+    Selected --> PartiallySent : bytes accepted
+    Selected --> FullySent : whole body flushed
+    PartiallySent --> FullySent : content complete
+    Selected --> Unknown : finalize or no flush
+    PartiallySent --> Unknown : no flush support
+    Selected --> Ambiguous : later reply attempt
+    PartiallySent --> Ambiguous : later reply attempt
+    Unknown --> Ambiguous : later reply attempt
+    FullySent --> ScoredReply : eligible request with new material
+    FullySent --> Ambiguous : history changed or raced or multiple
+    FullySent --> NoNewMaterial : resend or empty delta
+    FullySent --> Superseded : newer indirect gate
+    FullySent --> Expired : after ten minutes
+    Selected --> Lost : evicted while open
+    PartiallySent --> Lost : evicted while open
+    FullySent --> Lost : evicted while open
+    ScoredReply --> [*]
+    Ambiguous --> [*]
+    NoNewMaterial --> [*]
+    Superseded --> [*]
+    Expired --> [*]
+    Lost --> [*]
+```
+
+Source: `/Users/rohit/attack-box/internal/responder/issuance.go`, `/Users/rohit/attack-box/internal/responder/responder.go`, `/Users/rohit/attack-box/internal/server/server.go`, `/Users/rohit/attack-box/internal/server/stream.go`, and `/Users/rohit/attack-box/internal/server/routes.go`.
 
 ## Evidence flow and redaction
 
@@ -119,12 +212,12 @@ A heartbeat proves one reporting path worked at that time. It does not prove com
 
 ## Proposed Go extension contracts
 
-All entries below remain proposals. Detailed requirements, resource budgets, dependency order, and adversarial cases V01–V14 are in `/Users/rohit/attack-box/IMPROVE.md`.
+All entries below remain proposals, except the implemented part that the Response state row names. Detailed requirements, resource budgets, dependency order, and adversarial cases V01–V14 are in `/Users/rohit/attack-box/IMPROVE.md`.
 
 | Area | Required contract before implementation |
 |---|---|
 | Discovery | Explicit public persona ports, versioned catalogs, IPv4/IPv6 routing, closed-ingress rehearsal, independent reachability and containment checks |
-| Response state | Server-owned issuance records, bounded per-session state, serialized transitions, state versions and restart epochs, idempotency, delivery and cancellation semantics |
+| Response state | Implemented: probe issuance and delivery records (see Probe issuance and reply attribution). Proposed: I05 scenario state: bounded per-session state, serialized transitions, state versions and restart epochs, idempotency, commit and cancellation semantics |
 | Protocol output | Typed Go response plans, capability matrix, schema validation, bounded JSON/SSE output, deterministic fallback before bytes are sent |
 | Collection | Evidence schema versions, authenticated provenance, stage-specific loss, post-decode redaction, bounded payload admission and retention |
 | Analysis | Separate Go batch job; bounded transforms and graphs; candidate rather than actor attribution; immutable evidence references; no automatic policy updates |

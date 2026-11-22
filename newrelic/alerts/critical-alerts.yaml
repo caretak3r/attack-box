@@ -178,11 +178,13 @@ alerts:
 
   - name: "AttackBox - Canary Credential Returned (Pending Validation)"
     type: NRQL
-    description: "Client returned a session-unique canary credential. Requires observations.probe_id array filtering (pending account-side validation)."
+    description: "A canary-reuse observation exists. It holds a comma list of states for each canary (present_in_history, newly_echoed, destination_placed, credential_presented, presented_undelivered) and credential_source. present_in_history is not exfiltration. Each state is reported once for each canary in a session. independently_observed is always unavailable. Unscored replies are observations with probe_id attribution. Requires observations.probe_id array filtering (pending account-side validation)."
     enabled: true
     violation_time_limit_seconds: 3600
     nrql:
-      # Probe decisions with observations; observations.probe_id filtering requires validation
+      # Probe decisions with observations; observations.probe_id filtering requires validation.
+      # The query matches every canary-reuse observation, not only credential_presented.
+      # attackbox.probe_followups counts attributed replies only.
       query: "FROM Log SELECT count(*) AS 'Events' WHERE stream = 'probe' AND action = 'decision' AND observations.probe_id = 'canary-reuse'"
     signal:
       aggregation_window: 60

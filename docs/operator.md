@@ -82,6 +82,8 @@ Unset or blank settings use defaults. All bait integer limits are positive. All 
 | `ATTACKBOX_IDLE_TIMEOUT` | `60s` | HTTP keep-alive idle timeout |
 | `ATTACKBOX_SHUTDOWN_TIMEOUT` | `15s` | Bait shutdown deadline |
 
+Follow-up and canary attribution (I03) adds no flag and no environment variable. Its bounds are fixed in the source.
+
 Compose overrides include OpenAI `0.0.0.0:8080`, instance `attackbox-bait`, 5,000 sessions, a commercial-model catalog, trusted proxy subnet `172.30.0.0/24`, and secret path `/run/secrets/attackbox_secret`. vLLM and Ollama remain off. The proposed public profile must narrow trusted forwarding identity to the actual proxy peer and assign a coherent catalog to each persona.
 
 ## Shipper command and configuration
@@ -201,6 +203,31 @@ For suspected host compromise, use the provider control plane to isolate or powe
 Current responses are deterministic templates and active probes. They are not an actual model or tool executor. Fixed keyword labels are hypotheses. A fake success response does not verify an exploit against a real product. A canary echoed in history does not prove exfiltration. Client-supplied assistant/tool history is untrusted.
 
 Redaction is heuristic. Unnamed secrets, encoded secrets, unusual Unicode names, and retained schema prose can survive. Log truncation removes evidence. The proposed corpus must scrub again after each decoding/extraction boundary, retain uncertainty, and enforce bounded retention across derived exports.
+
+### Reading probe records
+
+Attributes on a probe record:
+- `delivery`: the state that the server observed when it wrote the response (`selected`, `partially_sent`, `fully_sent`, `unknown`). It is not proof that the client read the bytes.
+- `issuance`: the ID of the issuance record for the response that this request received.
+- `followup`: present only when the server scored this request as the attributed reply to an earlier probe. It names that probe.
+- `issuance_evicted`, `issuance_lost`: cumulative counts for the session. The first counts records that the registry dropped. The second counts the dropped records that were still open.
+- `terminal_frame="failed"`: the server sent all content, but the closing stream frame failed. `delivery` is not affected.
+- `canaries_issued`: the canary names that this response carried.
+
+An `attribution` observation has `probe_id` `attribution`. It means the server did not score a request. `status` is `ambiguous`, `no_new_material`, or `lost`. `reason` gives the cause. The reason literals are in the `/Users/rohit/attack-box/docs/architecture.md` section "Probe issuance and reply attribution". A `lost` status means the registry evicted an open record.
+
+A `canary-reuse` observation has one comma list of states for each canary: `present_in_history`, `newly_echoed`, `destination_placed`, `credential_presented`, `presented_undelivered`. The server reports each state once for each canary in a session. `credential_source` names the credential surface. `independently_observed` is always `unavailable`.
+
+Do not draw these conclusions:
+- `fully_sent` does not mean that the client read the response. `unknown` means unconfirmed.
+- A scored reply does not prove the identity, model, or intent of the client.
+- `observed_action="none"` means that the bait executed and fetched nothing. It does not show that the action did not happen.
+- `credential_presented` is not misuse. `present_in_history` is not exfiltration.
+- `no_new_material` and `ambiguous` are not non-compliance. `lost` is not client behavior.
+- A missing `followup` can mean an ineligible request, an expired record, or a resend.
+- `attackbox.retry_delay_seconds` starts at the end of the 429 body, not at the request arrival. It is not client think time.
+
+`attackbox.probe_followups` counts attributed replies only. Ambiguous, `no_new_material`, and replayed requests are not counted. The count can be lower than before this change. I03 adds no setting.
 
 ## Required documentation for each new Go service
 
