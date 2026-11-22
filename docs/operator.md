@@ -127,7 +127,9 @@ Place these in `/etc/attackbox/shipper.env`:
 | Variable | Example | Meaning |
 |----------|---------|---------|
 | `ATTACKBOX_NR_LICENSE_KEY` | `eu01xxNRAL-...` | Your Ingest-License key from New Relic. |
-
+| `ATTACKBOX_SPOOL_SOCKET` | `/run/attackbox/spool.sock` | Bait ingest socket. Required for six-stream deployment. |
+| `ATTACKBOX_RUNTIME_SOCKET` | `/run/attackbox/runtime.sock` | Falco runtime event socket. Required for six-stream deployment. |
+| `ATTACKBOX_EGRESS_SOCKET` | `/run/attackbox/egress.sock` | Egress firewall event socket. Required for six-stream deployment. |
 #### Optional Variables
 
 | Variable | Default | Meaning |
@@ -138,8 +140,7 @@ Place these in `/etc/attackbox/shipper.env`:
 | `ATTACKBOX_SHIP_QUEUE_BYTES` | `268435456` | Queue size limit in bytes (default 256 MiB, max 8 GiB). |
 | `ATTACKBOX_SHIP_SEGMENT_BYTES` | `16777216` | Segment roll size in bytes (default 16 MiB). |
 | `ATTACKBOX_SHIP_SHUTDOWN_TIMEOUT` | `15s` | Flush timeout on SIGTERM. |
-| `ATTACKBOX_SHIP_MAX_CLIENTS` | `8` | Maximum concurrent socket connections. |
-| `ATTACKBOX_SHIP_MAX_LINE` | `2097152` | Maximum line length in bytes (default 2 MiB, max 16 MiB). |
+| `HOSTNAME` | _(host)_ | Instance identifier in telemetry. Set by the host environment; do not override unless testing. |
 
 ### Container Mount
 

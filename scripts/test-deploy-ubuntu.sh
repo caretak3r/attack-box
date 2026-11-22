@@ -57,6 +57,13 @@ test_prepare_before_final_firewall() { local prep_line=$(grep -n "^[[:space:]]*p
 test_attackbox_service_in_units() { grep -q '"attackbox.service"' "$DEPLOY_SCRIPT"; }
 test_nr_exact_paths() { grep -q '/log/v1' "$DEPLOY_SCRIPT" && grep -q '/metric/v1' "$DEPLOY_SCRIPT"; }
 test_mktemp_shipper_build() { ! grep -q '/tmp/shipper-build' "$DEPLOY_SCRIPT"; }
+test_socket_env_settings() { grep -q "ATTACKBOX_SPOOL_SOCKET" "$DEPLOY_SCRIPT" && grep -q "ATTACKBOX_RUNTIME_SOCKET" "$DEPLOY_SCRIPT" && grep -q "ATTACKBOX_EGRESS_SOCKET" "$DEPLOY_SCRIPT"; }
+test_shipper_primary_group_bait() { grep -q "^Group=abx-bait$" "${SCRIPT_DIR}/../deploy/systemd/attackbox-shipper.service"; }
+test_shipper_supplementary_group() { grep -q "^SupplementaryGroups=abx-ship$" "${SCRIPT_DIR}/../deploy/systemd/attackbox-shipper.service"; }
+test_runtime_directory_mode_0710() { grep -q "^RuntimeDirectoryMode=0710$" "${SCRIPT_DIR}/../deploy/systemd/attackbox-shipper.service"; }
+test_no_chgrp_prestart() { ! grep -q "ExecStartPre.*chgrp" "${SCRIPT_DIR}/../deploy/systemd/attackbox-shipper.service"; }
+test_docs_no_max_clients() { ! grep -q "ATTACKBOX_SHIP_MAX_CLIENTS" "${SCRIPT_DIR}/../docs/operator.md"; }
+test_docs_socket_paths() { grep -q "ATTACKBOX_SPOOL_SOCKET" "${SCRIPT_DIR}/../docs/operator.md" && grep -q "ATTACKBOX_RUNTIME_SOCKET" "${SCRIPT_DIR}/../docs/operator.md" && grep -q "ATTACKBOX_EGRESS_SOCKET" "${SCRIPT_DIR}/../docs/operator.md"; }
 main() {
     echo "Attack-box deployment test suite - Full Semantic Controls"; echo "=========================================================="
     [[ ! -f "$DEPLOY_SCRIPT" ]] && { echo -e "${RED}✗${NC} Deploy script not found"; exit 1; }
@@ -112,6 +119,13 @@ main() {
     run_test "attackbox.service in units" test_attackbox_service_in_units
     run_test "NR exact paths" test_nr_exact_paths
     run_test "mktemp shipper build" test_mktemp_shipper_build
+    run_test "Socket env settings" test_socket_env_settings
+    run_test "Shipper primary group bait" test_shipper_primary_group_bait
+    run_test "Shipper supplementary group" test_shipper_supplementary_group
+    run_test "Runtime directory mode 0710" test_runtime_directory_mode_0710
+    run_test "No chgrp prestart" test_no_chgrp_prestart
+    run_test "Docs no max_clients" test_docs_no_max_clients
+    run_test "Docs socket paths" test_docs_socket_paths
     echo ""; echo "=========================================================="; echo "Test Results"; echo "=========================================================="
     echo "Tests run:    $TESTS_RUN"; echo -e "Tests passed: ${GREEN}$TESTS_PASSED${NC}"
     if [[ $TESTS_FAILED -gt 0 ]]; then echo -e "Tests failed: ${RED}$TESTS_FAILED${NC}"; exit 1; else echo -e "Tests failed: 0"; echo ""; echo -e "${GREEN}✓${NC} All tests passed"; exit 0; fi

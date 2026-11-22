@@ -8,14 +8,12 @@ Before=docker.service
 [Service]
 Type=simple
 User=abx-ship
-Group=abx-ship
-SupplementaryGroups=abx-bait
+Group=abx-bait
+SupplementaryGroups=abx-ship
 
 # Distinct ingest sockets per role. Falco and the egress converter both run
 # as root, so each needs its own socket; the bait keeps spool.sock (default).
-# Set before EnvironmentFile so shipper.env can override them.
-Environment=ATTACKBOX_RUNTIME_SOCKET=/run/attackbox/runtime.sock
-Environment=ATTACKBOX_EGRESS_SOCKET=/run/attackbox/egress.sock
+# Socket paths are set in shipper.env (required for six-stream deployment).
 
 # Environment from root-owned file (must exist before startup)
 EnvironmentFile=/etc/attackbox/shipper.env
@@ -35,15 +33,13 @@ ReadWritePaths=/run/attackbox /var/lib/attackbox-shipper
 StateDirectory=attackbox-shipper
 StateDirectoryMode=0700
 
-# Runtime directory: abx-ship:abx-bait, mode 2710. The setgid bit makes the
-# 0220 sockets inherit group abx-bait, so the bait (gid 65532) can connect.
-# systemd creates the directory as abx-ship:abx-ship; the "+" pre-step runs
-# unsandboxed and fixes the group. The shipper still sees no group/other write.
+# Runtime directory: abx-ship:abx-bait, mode 0710. Primary group abx-bait means
+# the 0220 sockets are created abx-ship:abx-bait, so the bait (gid 65532) can
+# connect. SupplementaryGroups=abx-ship gives shipper access to its queue directory.
 # Preserve keeps the inode across restarts so the bait's bind mount stays valid.
 RuntimeDirectory=attackbox
-RuntimeDirectoryMode=2710
+RuntimeDirectoryMode=0710
 RuntimeDirectoryPreserve=yes
-ExecStartPre=+/bin/chgrp abx-bait /run/attackbox
 
 # Logging to journal with bounded size
 StandardOutput=journal

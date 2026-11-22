@@ -949,6 +949,37 @@ check_shipper_env() {
         return 1
     fi
 
+    # Required socket settings for six-stream deployment
+    local required_settings=(
+        "ATTACKBOX_SPOOL_SOCKET=/run/attackbox/spool.sock"
+        "ATTACKBOX_RUNTIME_SOCKET=/run/attackbox/runtime.sock"
+        "ATTACKBOX_EGRESS_SOCKET=/run/attackbox/egress.sock"
+    )
+
+    local missing=()
+    for setting in "${required_settings[@]}"; do
+        local key="${setting%%=*}"
+        if ! grep -q "^${key}=" "$env_file"; then
+            missing+=("$setting")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        if [[ "$MODE" == "apply" ]]; then
+            # Append missing settings idempotently
+            for setting in "${missing[@]}"; do
+                echo "$setting" >> "$env_file"
+            done
+            ok "Appended missing socket settings to $env_file"
+        else
+            warn "Missing socket settings in $env_file:"
+            for setting in "${missing[@]}"; do
+                warn "  $setting"
+            done
+            return 1
+        fi
+    fi
+
     ok "Shipper env file correct"
 }
 
