@@ -106,6 +106,7 @@ class ServerFixture:
             "ATTACKBOX_VLLM_ADDR": "off",
             "ATTACKBOX_OLLAMA_ADDR": f"127.0.0.1:{self.ollama_port}",
             "ATTACKBOX_TIMING": "false",
+            "ATTACKBOX_HOLD_SILENT": "1s",
             "ATTACKBOX_MAX_STREAM": "10s",
         })
 

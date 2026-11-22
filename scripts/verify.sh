@@ -224,7 +224,7 @@ check "SECURITY_FIXES.md exists" test -f SECURITY_FIXES.md
 # Verify documented environment variables match config
 if [[ -f cmd/attackbox/config.go ]]; then
 	# Extract ATTACKBOX_* from config.go
-	config_vars=$(grep -o 'ATTACKBOX_[A-Z_]*' cmd/attackbox/config.go | sort -u)
+	config_vars=$(grep -o 'ATTACKBOX_[A-Z_]*[A-Z]' cmd/attackbox/config.go | sort -u)
 	config_count=$(echo "$config_vars" | wc -l | tr -d ' ')
 
 	# Extract ATTACKBOX_* from implementation_plan.md
