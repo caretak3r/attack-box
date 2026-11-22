@@ -930,3 +930,11 @@ func (n *NewRelic) recordErr(err error) {
 		n.cfg.OnError(err)
 	}
 }
+
+// LogItemSize returns the encoded size of e as one New Relic log item, the
+// same bytes the client posts. The host shipper uses it to bound a record's
+// expanded size before it admits the record to disk.
+func LogItemSize(e Event) (int, error) {
+	b, err := logItem(e)
+	return len(b), err
+}

@@ -1,5 +1,6 @@
 // Package shipper holds the host-side telemetry shipper parts that do not
-// depend on the process wiring: the crash-durable disk queue.
+// depend on the process wiring: the crash-durable disk queue and the
+// admission checks for records from untrusted producers.
 package shipper
 
 import (
