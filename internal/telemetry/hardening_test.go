@@ -377,3 +377,105 @@ func TestCloseTimeoutCountsQueuedEvents(t *testing.T) {
 		t.Errorf("lost = %d, want at least the 6 undelivered events", lost)
 	}
 }
+
+func TestMetricRejectionRequeueByStatus(t *testing.T) {
+	for status, requeued := range map[int]bool{
+		400: false, 401: false, 403: false, 404: false, 413: false,
+		408: true, 429: true, 500: true, 503: true,
+	} {
+		srv := newServer(t, status)
+		n := start(t, srv.cfg())
+		n.Count("attackbox.rejected", 1, nil)
+		n.flushMetrics(false)
+
+		n.mu.Lock()
+		_, queued := n.series[seriesKey("attackbox.rejected", true, nil)]
+		n.mu.Unlock()
+		if queued != requeued {
+			t.Errorf("status %d: requeued = %v, want %v", status, queued, requeued)
+		}
+		wantLost := int64(0)
+		if !requeued {
+			wantLost = 1 // the internal gauges are not counted
+		}
+		if lost := n.Stats().Lost; lost != wantLost {
+			t.Errorf("status %d: lost = %d, want %d", status, lost, wantLost)
+		}
+		closeNR(t, n)
+	}
+}
+
+func TestRejectedMetricNotResent(t *testing.T) {
+	srv := newServer(t, 400)
+	n := start(t, srv.cfg())
+	n.Count("attackbox.rejected", 1, nil)
+	n.flushMetrics(false)
+	srv.status.Store(202)
+	n.flushMetrics(false)
+	for _, p := range srv.posts("/metric/v1")[1:] {
+		if strings.Contains(string(p.Payload), "attackbox.rejected") {
+			t.Error("permanently rejected metric was sent again")
+		}
+	}
+	closeNR(t, n)
+}
+
+func TestFinalFlushLostSkipsInternalGauges(t *testing.T) {
+	srv := newServer(t, 500)
+	n := start(t, srv.cfg())
+	n.Count("attackbox.requests", 1, nil)
+	closeNR(t, n)
+	if lost := n.Stats().Lost; lost != 1 {
+		t.Errorf("lost = %d, want 1 (only the real series)", lost)
+	}
+}
+
+func TestNestedAttrValuesLimited(t *testing.T) {
+	long := strings.Repeat("é", 4500)
+	e := Event{Action: "nested", Attrs: map[string]any{
+		"headers":      map[string]string{"X-Long": long},
+		"declarations": []struct{ Name string }{{Name: long}},
+		"small":        map[string]string{"a": "b"},
+		"bad":          make(chan int),
+		"count":        7,
+		"flag":         true,
+	}}
+	a := limitAttrs(e)
+	for _, k := range []string{"headers", "declarations", "small", "bad"} {
+		if _, ok := a[k].(string); !ok {
+			t.Errorf("%s = %T, want a JSON string", k, a[k])
+		}
+	}
+	for k, v := range a {
+		if s, ok := v.(string); ok && utf8.RuneCountInString(s) > maxAttrValue {
+			t.Errorf("%s value of %d runes", k, utf8.RuneCountInString(s))
+		}
+	}
+	if a["small"] != `{"a":"b"}` {
+		t.Errorf("small = %v", a["small"])
+	}
+	if s, _ := a["bad"].(string); !strings.Contains(s, "unmarshalable") {
+		t.Errorf("bad = %v", a["bad"])
+	}
+	if a["count"] != 7 || a["flag"] != true {
+		t.Errorf("scalars changed: %v %v", a["count"], a["flag"])
+	}
+	if a["attrs_truncated"] != true {
+		t.Error("attrs_truncated not set")
+	}
+	short := limitAttrs(Event{Action: "x", Attrs: map[string]any{"h": map[string]string{"a": "b"}}})
+	if _, ok := short["attrs_truncated"]; ok {
+		t.Error("short nested value flagged attrs_truncated")
+	}
+}
+
+func TestMaxPayloadBytesFloor(t *testing.T) {
+	srv := newServer(t, 202)
+	cfg := srv.cfg()
+	cfg.MaxPayloadBytes = 10
+	n := start(t, cfg)
+	defer closeNR(t, n)
+	if n.cfg.MaxPayloadBytes != minPayloadBytes {
+		t.Errorf("MaxPayloadBytes = %d, want %d", n.cfg.MaxPayloadBytes, minPayloadBytes)
+	}
+}
