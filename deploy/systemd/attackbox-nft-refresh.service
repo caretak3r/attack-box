@@ -1,0 +1,13 @@
+[Unit]
+Description=Attack-box refresh of nftables endpoint sets
+Documentation=https://github.com/example/attack-box
+After=nftables.service systemd-resolved.service network-online.target
+Wants=network-online.target
+Requires=nftables.service
+
+[Service]
+Type=oneshot
+# Re-resolve New Relic and Ubuntu mirror IPs and repopulate shipper_uids.
+# /etc/nftables.conf restores the table with empty sets at boot.
+ExecStart=/usr/local/sbin/attackbox-deploy --refresh-sets
+TimeoutStartSec=60s
