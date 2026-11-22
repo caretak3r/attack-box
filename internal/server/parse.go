@@ -248,6 +248,12 @@ func (s *Server) parseInference(c *call, k kind) (*inferReq, error) {
 	}
 	p.unload = p.load && keepAliveZero(raw["keep_alive"])
 	p.req.Text = strings.Join(text, "\n")
+	for i := len(text) - 1; i >= 0; i-- {
+		if strings.TrimSpace(text[i]) != "" {
+			p.req.Latest = text[i]
+			break
+		}
+	}
 	p.req.Untrusted = strings.Join(untrusted, "\n")
 	p.promptWords = wordCount(p.req.Text) + wordCount(p.req.Untrusted)
 	return p, nil

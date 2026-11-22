@@ -200,8 +200,15 @@ func TestParseInference(t *testing.T) {
 	}
 	if p.req.Text != "sys\nhi" || p.req.Untrusted != "tool out" || !p.req.HasTools || !p.req.ToolForce ||
 		p.req.User != "u1" || p.req.Metadata["a"] == nil || !p.stream || !p.includeUsage ||
-		p.parallel == nil || *p.parallel || p.tools != 1 || p.promptWords != 4 {
+		p.parallel == nil || *p.parallel || p.tools != 1 || p.promptWords != 4 || p.req.Latest != "hi" {
 		t.Fatalf("chat = %+v", p)
+	}
+	// Latest is the newest non-empty operator message, so a resent history
+	// is not read as the follow-up reply.
+	p, _ = parse(kindChat, `{"messages":[{"role":"user","content":"first\nline"},{"role":"assistant","content":"gate"},
+		{"role":"user","content":"reply"},{"role":"user","content":"  "},{"role":"tool","content":"t"}]}`)
+	if p.req.Latest != "reply" {
+		t.Fatalf("chat latest = %q", p.req.Latest)
 	}
 
 	p, err = parse(kindResponses, `{"instructions":"be brief","input":[
@@ -211,7 +218,7 @@ func TestParseInference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.req.Text != "be brief\nq\nmore\nplain" || p.req.Untrusted != "result data" {
+	if p.req.Text != "be brief\nq\nmore\nplain" || p.req.Untrusted != "result data" || p.req.Latest != "plain" {
 		t.Fatalf("responses = %q / %q", p.req.Text, p.req.Untrusted)
 	}
 
@@ -233,7 +240,7 @@ func TestParseInference(t *testing.T) {
 		t.Fatalf("ollama chat load = %+v", p)
 	}
 	p, _ = parse(kindOllamaGenerate, `{"model":"m","system":"s","prompt":"p","stream":false}`)
-	if p.load || p.stream || p.req.Text != "s\np" {
+	if p.load || p.stream || p.req.Text != "s\np" || p.req.Latest != "p" {
 		t.Fatalf("ollama generate = %+v", p)
 	}
 	p, _ = parse(kindOllamaGenerate, `{"model":"m"}`)

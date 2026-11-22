@@ -77,8 +77,12 @@ var injectionTerms = []string{
 type Input struct {
 	Text      string // operator-authored text: user/system/developer messages, prompt
 	Untrusted string // tool results, function outputs and other third-party content
-	HasTools  bool   // the request declares tools or functions
-	ToolForce bool   // tool_choice forces a function
+	// Latest is the last non-empty operator-authored message. Follow-up
+	// extractors read it so earlier turns in a resent history do not count
+	// as the reply. Empty means Text has no separable last message.
+	Latest    string
+	HasTools  bool // the request declares tools or functions
+	ToolForce bool // tool_choice forces a function
 }
 
 // Classification is the primary task and every matched label.

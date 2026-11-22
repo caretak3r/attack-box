@@ -45,6 +45,10 @@ type Declaration struct {
 type pendingGate struct {
 	ID     string
 	Issued time.Time
+	// For the indirect-injection gate only: normalized, bounded copies of
+	// the triggering request's untrusted and operator text, used to say
+	// where a quoted "authoritative" instruction came from.
+	untrusted, operator string
 }
 
 // Session is per-client responder state. Mutate only while holding mu.
