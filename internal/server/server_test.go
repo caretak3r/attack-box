@@ -70,6 +70,19 @@ func TestLogBodyIsCapped(t *testing.T) {
 	}
 }
 
+// The body is cut before scrubbing; a credential split by the cut must still
+// be redacted.
+func TestLogBodyCutCredential(t *testing.T) {
+	const secret = "hunter2hunter2hunter2hunter2hunter2"
+	head := `{"model":"qwen3:8b","password":"`
+	r := newRig(t, PersonaOpenAI, func(c *Config) { c.MaxLogBody = len(head) + 10 })
+	r.do("POST", "/v1/chat/completions", head+secret+`","messages":[]}`)
+	edge := r.sink.lastEdge(t)
+	if strings.Contains(edge.Body, "hunter2") || edge.Attrs["body_truncated"] != true {
+		t.Fatalf("body %q, attrs %v", edge.Body, edge.Attrs)
+	}
+}
+
 func TestMalformedBodies(t *testing.T) {
 	for _, persona := range []string{PersonaOpenAI, PersonaVLLM, PersonaOllama} {
 		r := newRig(t, persona)

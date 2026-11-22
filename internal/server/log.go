@@ -72,8 +72,12 @@ func (s *Server) finish(c *call) {
 		attrs["observations"] = obs
 	}
 
-	body := red.Text(string(c.body))
-	if len(body) > s.cfg.MaxLogBody {
+	// Cut before scrubbing: scrub cost is linear in input, and only
+	// MaxLogBody bytes are ever kept. A value cut at the boundary is
+	// unterminated, which the scrubber redacts to end of text.
+	raw := truncBytes(string(c.body), s.cfg.MaxLogBody)
+	body := red.Text(raw)
+	if len(raw) < len(c.body) || len(body) > s.cfg.MaxLogBody {
 		body = truncBytes(body, s.cfg.MaxLogBody)
 		attrs["body_truncated"] = true
 	}

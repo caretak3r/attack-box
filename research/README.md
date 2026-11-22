@@ -1,10 +1,13 @@
 # External Reference Research
 
+`../REMAINING_WORK.md` is the authoritative full requirements-gap checklist for the remaining build and deployment work.
+
 Three read-only research agents reviewed primary documentation and public GitHub projects on 2026-11-21. They did not execute downloaded code or contact live infrastructure.
 
 ## Files
 
 - `ubuntu-hardening.md`: Ubuntu 24.04, T-Pot isolation patterns, gVisor, nftables, auditd, Falco, unattended upgrades and Chainguard images.
+- `ubuntu-validation.md`: primary-source corrections to the initial Ubuntu report, including DNS, image upgrades, Falco privilege, Docker nftables, gVisor `--net-raw` and SSH safety.
 - `honeypot-projects.md`: OpenAI/Ollama/vLLM impersonation, response timing, anti-fingerprinting, canaries and Shibboleth behavioral gates.
 - `new-relic.md`: ingest-only credentials, Logs/Metric APIs, batching, gzip, backpressure, key rotation and NRQL alerts.
 - `responder-review.md`: independent review of the first responder commit. Fix H1 Unicode bidirectional-mark normalization and H3 per-field declaration bounds before deployment; review the remaining findings.
@@ -14,6 +17,8 @@ Three read-only research agents reviewed primary documentation and public GitHub
 - `main-review.md`: executable lifecycle review covering partial-listener cleanup, unsafe configuration bounds, secret-file permissions and healthcheck userinfo. Follow the validated fixes in `SECURITY_FIXES.md`.
 - `secret-review.md`: shared scrubber audit and host-observed failing/passing test evidence. Fix priority bypasses while preserving valid JSON and all genuine canary shapes.
 - `new-relic-hardening-review.md`: second-pass telemetry review. Four remaining issues cover blocking JSONLog fan-out, nested URL encoding, recovered-error metrics and retry-cap accounting.
+- `host-shipper-design.md`: minimal Unix-socket/durable-spool architecture reusing existing telemetry, with trust boundaries, replay/dedup and the critical requirement to spool unchunked Events so full-body hashes survive.
+- `host-shipper-threat-review.md`: 13 required corrections covering acknowledged checkpoints, crash durability, authenticated roles, bounded expanded records, replay/overflow policy and honest host-root limitations.
 
 ## Required application in this repository
 

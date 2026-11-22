@@ -92,7 +92,7 @@ func TestFingerprint(t *testing.T) {
 func TestText(t *testing.T) {
 	r := NewRedactor([]byte("k"))
 	const real = "sk-proj-abcdefghijklmnop1234"
-	const canary = "sk-local-0123456789abcdefghij"
+	const canary = "sk-local-0123456789abcdef0123456789abcdef0123"
 	in := "curl -H 'Authorization: Bearer eyJhbGciOi.payload.sig' key=" + real +
 		" canary=" + canary + "\nCookie: sid=topsecretcookie\nshort sk-abc"
 	out := r.Text(in)

@@ -449,9 +449,9 @@ func TestDeclarationsSanitized(t *testing.T) {
 		t.Error("session must keep only sanitized declarations")
 	}
 
-	fpr := New(Config{Fingerprint: func(v string) string { return "fp" }}, r.store)
+	fpr := New(Config{Fingerprint: func(v string) string { return "hmac256:0123456789abcdef" }}, r.store)
 	d = fpr.Decide("k2", Request{Input: Input{Text: "x"}, User: "Bearer abc123"})
-	if d.Declarations[0].Value != "Bearer [redacted:fp]" {
+	if d.Declarations[0].Value != "Bearer [redacted:hmac256:0123456789abcdef]" {
 		t.Errorf("fingerprinted value %q", d.Declarations[0].Value)
 	}
 }

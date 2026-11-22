@@ -1,6 +1,6 @@
 # Required Security Corrections
 
-Read `research/responder-review.md` and `research/telemetry-security.md` before finalizing the build.
+Read `research/responder-review.md`, `research/telemetry-security.md`, and `REMAINING_WORK.md` before finalizing the build. The latter is the authoritative remaining-deliverables checklist beyond the security findings below.
 
 ## Responder
 
@@ -17,7 +17,7 @@ Read `research/responder-review.md` and `research/telemetry-security.md` before 
 5. DONE: Medium: make heartbeat scheduling/delivery independent of slow POST retries and attacker-filled queues.
 6. DONE: Medium: reject/account for metric intake after Close; make the Sink contract and local JSON writer behavior agree so request processing cannot stall silently.
 7. DONE: Review Low findings: strong random redactor keys, count transient failed POST attempts, and reject/scrub raw or escaped credentials in endpoint URLs.
-8. DEPLOY BLOCKER: the scrubber re-review confirmed all 11 findings in `research/secret-review.md` remain in the latest code. Fix marker-prefix and malformed-canary allowlist bypasses, camelCase/encoded credential names, non-string JSON credential handling, cookie/canary idempotence and unsafe fingerprint output. Preserve valid JSON and behavioral telemetry byte-for-byte; document the remaining free-text detection boundary rather than claiming perfection.
+8. DONE: All 11 findings in `research/secret-review.md` are closed in `internal/secret`. Only complete `[redacted]` or `[redacted:hmac256:<16 hex>]` markers and exact decoy canary shapes (including the JWT canary) are kept. Credential names are canonicalized (camelCase, acronyms, `\u` and percent escapes). JSON credential values of every type are redacted by structure, and nonsecret JSON is kept byte for byte. Cookie, PEM, quoted env/YAML, Bearer, empty-user Basic and URL userinfo shapes are covered. Fingerprints that do not match `hmac256:<16 hex>` are discarded. Fuzzing found two more defects, and both are fixed with regression tests: a JSON quote desync hid a later credential key, and a cookie name inside a cookie value broke idempotence. Each regex pass now runs once per input. The server cuts the body to `MaxLogBody` before it scrubs it, which removes a 1 MiB CPU-amplification path. A linear-scaling test runs in the default gate (`-race` on `internal/secret`: 6 s, was 116.617 s). Free-text limits are listed in `implementation_plan.md`.
 9. `research/new-relic-hardening-review.md`: keep blocking JSONLog writers off the request path (or use bounded async/drop behavior), reject nested-escaped and arbitrary credential query parameters, scrub escaped keys in errors, expose recovered failed attempts in shipped metrics, cap custom backoff correctly, and count retries only when a subsequent POST actually runs.
 
 ## HTTP server snapshot
@@ -58,3 +58,4 @@ When writing the Ubuntu deployment, treat `research/ubuntu-hardening.md` as lead
 4. Use pinned DNS resolvers; do not force DNS-over-TLS unless the script actually configures and verifies it. Keep the initial package-bootstrap path working before locking egress.
 5. Falco must not give the bait container Docker socket access. If host Falco needs privileged access, isolate it from the bait and document that residual host-monitoring privilege and kernel/eBPF support checks.
 6. Keep writable state bounded and explicit; read-only root filesystem plus approved tmpfs/log paths only. Never mount host SSH, cloud, kube, AWS or Docker credentials.
+7. Follow `research/ubuntu-validation.md`: no `--net-raw` by default, no cron reboot loophole, no automatic image pulls, and no assumption that `DOCKER-USER` exists under Docker's native nftables backend. Validate both Docker firewall backends and test the exact Log/Metric API endpoints from inside gVisor.
