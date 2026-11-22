@@ -26,12 +26,13 @@ func drain(ctx context.Context, q *shipper.Queue, nr *telemetry.NewRelic, uncert
 	defer ticker.Stop()
 
 	var (
-		pending   []shipper.Entry
-		toAck     int
-		lastAck   time.Time
-		delivered int
-		retryAt   time.Time
-		metricAt  uint64
+		pending     []shipper.Entry
+		toAck       int
+		lastAck     time.Time
+		delivered   int
+		retryAt     time.Time
+		metricAt    uint64
+		needsRewind bool
 	)
 
 	if uncertain {
@@ -73,9 +74,8 @@ func drain(ctx context.Context, q *shipper.Queue, nr *telemetry.NewRelic, uncert
 			if rec.Event != nil {
 				// ShipEvent blocks until delivered or permanently failed
 				if err := nr.ShipEvent(*rec.Event); err != nil {
-					// Transient failure: stop, Rewind will replay from here
-					q.Rewind()
-					time.Sleep(250 * time.Millisecond)
+					// Transient failure: Ack delivered prefix first, then Rewind
+					needsRewind = true
 					break
 				}
 			} else if rec.Metric != nil {
@@ -86,9 +86,8 @@ func drain(ctx context.Context, q *shipper.Queue, nr *telemetry.NewRelic, uncert
 				}
 				// ShipMetric blocks until delivered or permanently failed
 				if err := nr.ShipMetric(rec.Metric.Name, rec.Metric.Kind, rec.Metric.Value, rec.Metric.At, rec.Metric.Attrs); err != nil {
-					// Transient failure: stop, Rewind will replay
-					q.Rewind()
-					time.Sleep(250 * time.Millisecond)
+					// Transient failure: Ack delivered prefix first, then Rewind
+					needsRewind = true
 					break
 				}
 			}
@@ -103,6 +102,26 @@ func drain(ctx context.Context, q *shipper.Queue, nr *telemetry.NewRelic, uncert
 		if delivered > 0 {
 			pending = pending[delivered:]
 			toAck += delivered
+		}
+
+		// If a delivery failed, Ack the successfully delivered prefix before Rewind
+		if needsRewind {
+			if toAck > 0 {
+				if err := q.Ack(toAck); err != nil {
+					return err
+				}
+				toAck = 0
+				lastAck = time.Now()
+			}
+			q.Rewind()
+			pending = nil // Rewind makes records available for re-reading
+			needsRewind = false
+			// Check if context was cancelled before retrying
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			time.Sleep(250 * time.Millisecond)
+			continue
 		}
 
 		// Checkpoint if we've accumulated enough or enough time has passed
