@@ -1,0 +1,49 @@
+services:
+  proxy:
+    image: nginxinc/nginx-unprivileged:1.27-alpine@sha256:a8bf22b0e7c8f7845ba4f43b1e7d471c9bfb3fbb2c1d0e7a46f2e8e7c8e8e8e8
+    pull_policy: never
+    runtime: runsc
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - bait_internal
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    tmpfs:
+      - /var/run:mode=0770,uid=101,gid=101
+      - /var/cache/nginx:mode=0770,uid=101,gid=101
+    mem_limit: 128m
+    pids_limit: 50
+
+  bait:
+    image: attackbox-bait:latest
+    pull_policy: never
+    runtime: runsc
+    read_only: true
+    user: "65532:65532"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - bait_internal
+    volumes:
+      - /run/attackbox/spool.sock:/run/attackbox/spool.sock:ro
+    environment:
+      - ATTACKBOX_SPOOL_SOCKET=/run/attackbox/spool.sock
+      - ATTACKBOX_LISTENERS=:8000,:11434
+    tmpfs:
+      - /tmp:mode=1777,size=10m
+    mem_limit: 256m
+    pids_limit: 100
+    depends_on:
+      - proxy
+
+networks:
+  bait_internal:
+    internal: true
+    driver: bridge

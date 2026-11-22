@@ -9,8 +9,8 @@ Type=simple
 User=root
 Group=root
 
-# Read Falco output and send to shipper
-ExecStart=/usr/local/bin/attackbox-shipper -stdin-stream runtime
+# Follow Falco JSONL output and pipe to shipper
+ExecStart=/bin/bash -c 'exec tail -n0 -F /var/log/falco-events.jsonl | /usr/local/bin/attackbox-shipper -stdin-stream runtime'
 
 # Hardening
 NoNewPrivileges=yes
@@ -18,9 +18,9 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadOnlyPaths=/
+ReadWritePaths=/var/log
 
 # Logging
-StandardInput=file:/var/log/falco-events.jsonl
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=attackbox-falco-adapter

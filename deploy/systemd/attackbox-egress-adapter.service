@@ -1,7 +1,7 @@
 [Unit]
 Description=Attack-box egress event adapter
 Documentation=https://github.com/example/attack-box
-After=nftables.service attackbox-shipper.service
+After=systemd-journald.service attackbox-shipper.service
 Requires=attackbox-shipper.service
 
 [Service]
@@ -9,8 +9,8 @@ Type=simple
 User=root
 Group=root
 
-# Monitor nftables log and send to shipper
-ExecStart=/usr/bin/nft monitor trace | /usr/local/bin/attackbox-shipper -stdin-stream egress
+# Follow kernel log for nftables drops, convert to JSONL for shipper
+ExecStart=/bin/bash -c 'exec journalctl -kf -o json --no-pager | grep -a "OUTPUT-DROP\\|CONTAINER-EGRESS-BLOCK\\|METADATA-BLOCK" | /usr/local/bin/attackbox-shipper -stdin-stream egress'
 
 # Hardening
 NoNewPrivileges=yes
