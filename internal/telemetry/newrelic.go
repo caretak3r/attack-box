@@ -31,9 +31,11 @@ const (
 	licenseKeyLen    = 40
 
 	defaultPayloadBytes = 900_000
-	minPayloadBytes     = 64 << 10
-	maxPayloadBytes     = 950_000 // New Relic rejects bodies over 1MB
-	closeGrace          = time.Second
+	// MinPayloadBytes is the smallest POST size MaxPayloadBytes is clamped to.
+	// The host shipper bounds admitted log items by it.
+	MinPayloadBytes = 64 << 10
+	maxPayloadBytes = 950_000 // New Relic rejects bodies over 1MB
+	closeGrace      = time.Second
 
 	// New Relic drops a record with more than 254 attributes, names over 255
 	// characters or string values over 4094 characters.
@@ -175,7 +177,7 @@ func NewNewRelic(cfg NRConfig) (*NewRelic, error) {
 	if cfg.MaxPayloadBytes <= 0 {
 		cfg.MaxPayloadBytes = defaultPayloadBytes
 	}
-	cfg.MaxPayloadBytes = min(max(cfg.MaxPayloadBytes, minPayloadBytes), maxPayloadBytes)
+	cfg.MaxPayloadBytes = min(max(cfg.MaxPayloadBytes, MinPayloadBytes), maxPayloadBytes)
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}

@@ -25,7 +25,7 @@ const (
 	MaxLine       = 2 << 20 // bytes per wire line without the newline
 	MaxBody       = 1 << 20 // Event.Body bytes, the bait's ATTACKBOX_MAX_LOG_BODY cap
 	MaxExpanded   = 16 << 20
-	MaxItem       = 256 << 10 // one chunk as a New Relic log item
+	MaxItem       = telemetry.MinPayloadBytes - itemHeadroom // one chunk as a New Relic log item; fits the smallest POST
 	maxDepth      = 6
 	maxNodes      = 4096
 	maxKeys       = 128
@@ -39,6 +39,10 @@ const (
 	maxPast       = 24 * time.Hour
 	maxFuture     = 5 * time.Minute
 )
+
+// itemHeadroom is what a POST keeps for the envelope and common attributes
+// around an item.
+const itemHeadroom = 8 << 10
 
 // Fixed-field byte caps.
 var fieldCaps = struct{ id, ip, ua, token, resource, result int }{128, 64, 2048, 64, 1024, 64}
@@ -137,6 +141,11 @@ var reservedAttrs = []string{
 	"newrelic.source", "plugin.type", "timestamp", "message",
 	"source", "record_id", "boot", "seq",
 	"timestamp_clamped", "attrs_truncated", "fields_truncated", "reserved_attrs_removed",
+	// Event.Attributes lets a fixed field win only when it is non-empty, so
+	// an attr of the same name would otherwise slip past validation.
+	"session_id", "request_id", "src_ip", "user_agent", "persona", "action",
+	"resource", "result", "probe_id", "status", "task_labels",
+	"stream", "body_sha256", "chunk_index", "chunk_count",
 }
 
 // Admit decodes and validates one wire line from a producer whose role the
@@ -202,6 +211,11 @@ func admitEvent(role Role, e telemetry.Event, key, boot string, seq uint64, now 
 	if actions != nil && !slices.Contains(actions, e.Action) {
 		return e, reject("action", nil)
 	}
+	// Adapter actions on a stream the bait may use freely would pass for
+	// host-observed events.
+	if role == RoleBait && (strings.EqualFold(e.Action, FalcoAction) || strings.EqualFold(e.Action, EgressAction)) {
+		return e, reject("action", nil)
+	}
 	// Chunk at the last hop is the only producer of chunk metadata.
 	if e.BodySHA256 != "" || e.ChunkIndex != 0 || e.ChunkCount != 0 {
 		return e, reject("chunk_fields", nil)
@@ -213,7 +227,7 @@ func admitEvent(role Role, e telemetry.Event, key, boot string, seq uint64, now 
 		return e, reject("status", nil)
 	}
 	if e.SrcIP != "" {
-		if _, err := netip.ParseAddr(e.SrcIP); err != nil || len(e.SrcIP) > fieldCaps.ip {
+		if addr, err := netip.ParseAddr(e.SrcIP); err != nil || addr.Zone() != "" || len(e.SrcIP) > fieldCaps.ip {
 			return e, reject("src_ip", nil)
 		}
 	}

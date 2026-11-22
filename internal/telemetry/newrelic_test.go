@@ -238,7 +238,7 @@ func TestMetricShape(t *testing.T) {
 func TestBatchSplitByPayloadSize(t *testing.T) {
 	srv := newServer(t, 202)
 	cfg := srv.cfg()
-	cfg.MaxPayloadBytes = minPayloadBytes
+	cfg.MaxPayloadBytes = MinPayloadBytes
 	n := start(t, cfg)
 	const events = 400
 	for i := 0; i < events; i++ {
@@ -269,7 +269,7 @@ func TestBatchSplitByPayloadSize(t *testing.T) {
 func TestOversizedItemDropped(t *testing.T) {
 	srv := newServer(t, 202)
 	cfg := srv.cfg()
-	cfg.MaxPayloadBytes = minPayloadBytes
+	cfg.MaxPayloadBytes = MinPayloadBytes
 	n := start(t, cfg)
 	big := map[string]any{}
 	for i := 0; i < 20; i++ {
