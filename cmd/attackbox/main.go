@@ -166,6 +166,7 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 			SessionKey:        sessionKey,
 			EmbedSeed:         embedSeed,
 			MaxBodyBytes:      cfg.maxBody,
+			MaxLogBody:        cfg.maxLogBody,
 			MaxConcurrent:     cfg.maxInFlight,
 			MaxPerSource:      cfg.maxPerSource,
 			MaxStreamDuration: cfg.maxStream,

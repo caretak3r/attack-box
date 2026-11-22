@@ -47,7 +47,7 @@ type Config struct {
 	MaxConcurrent     int           // in-flight requests, all sources; default 256
 	MaxPerSource      int           // in-flight requests per source; default 8
 	MaxStreamDuration time.Duration // longest hold; default 180s
-	MaxLogBody        int           // request body bytes kept in a log event; default 128 KiB
+	MaxLogBody        int           // request and response body bytes kept per log event; default 128 KiB
 	HoldSilent        time.Duration // hold length of the timeout gates; default 150s
 	IdleInterval      time.Duration // keepalive spacing in the idle hold; default 45s
 	StatusHold        time.Duration // hold of /v1/edge/{A-D}/status; default 200ms
@@ -194,7 +194,7 @@ type call struct {
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	rid := randHex(16)
-	c := &call{s: s, r: r, id: rid[:16], start: s.cfg.Now(), w: &recorder{ResponseWriter: w}}
+	c := &call{s: s, r: r, id: rid[:16], start: s.cfg.Now(), w: &recorder{ResponseWriter: w, keep: s.logRawLimit()}}
 	c.rc = http.NewResponseController(w)
 	c.src = s.source(r)
 	c.ua = r.UserAgent()
@@ -373,11 +373,14 @@ func (s *Server) sessionKey(src, ua string, h http.Header) string {
 	return hex.EncodeToString(m.Sum(nil))
 }
 
-// recorder keeps the status and size of a response.
+// recorder keeps the status and size of a response and its first keep bytes
+// for the log. Capture is bounded: a long stream costs at most keep bytes.
 type recorder struct {
 	http.ResponseWriter
 	status int
 	n      int64
+	keep   int
+	head   []byte
 }
 
 func (r *recorder) WriteHeader(code int) {
@@ -392,6 +395,9 @@ func (r *recorder) Write(p []byte) (int, error) {
 		r.status = http.StatusOK
 	}
 	n, err := r.ResponseWriter.Write(p)
+	if room := r.keep - len(r.head); room > 0 && n > 0 {
+		r.head = append(r.head, p[:min(n, room)]...)
+	}
 	r.n += int64(n)
 	return n, err
 }

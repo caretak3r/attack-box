@@ -61,11 +61,33 @@ func (m *memSink) stream(name string) []telemetry.Event {
 	return out
 }
 
+// edges returns the edge events of one direction: "request" or "response".
+func (m *memSink) edges(direction string) []telemetry.Event {
+	var out []telemetry.Event
+	for _, e := range m.stream(telemetry.StreamEdge) {
+		if e.Attrs["direction"] == direction {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// lastEdge returns the newest request edge event.
 func (m *memSink) lastEdge(t *testing.T) telemetry.Event {
 	t.Helper()
-	ev := m.stream(telemetry.StreamEdge)
+	ev := m.edges("request")
 	if len(ev) == 0 {
 		t.Fatal("no edge event")
+	}
+	return ev[len(ev)-1]
+}
+
+// lastResponse returns the newest response edge event.
+func (m *memSink) lastResponse(t *testing.T) telemetry.Event {
+	t.Helper()
+	ev := m.edges("response")
+	if len(ev) == 0 {
+		t.Fatal("no response edge event")
 	}
 	return ev[len(ev)-1]
 }

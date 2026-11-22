@@ -40,6 +40,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if c.holdSilent != 150*time.Second || c.idleInterval != 45*time.Second || c.maxStream != 180*time.Second {
 		t.Fatalf("hold defaults = %v %v %v", c.holdSilent, c.idleInterval, c.maxStream)
 	}
+	if c.maxBody != 1<<20 || c.maxLogBody != 128<<10 {
+		t.Fatalf("body defaults = %d %d", c.maxBody, c.maxLogBody)
+	}
 	if len(c.secret) != minSecret {
 		t.Fatalf("random secret len = %d", len(c.secret))
 	}
@@ -65,12 +68,16 @@ func TestLoadConfigFull(t *testing.T) {
 		"ATTACKBOX_SECRET_FILE":     secret,
 		"ATTACKBOX_HOLD_SILENT":     "2s",
 		"ATTACKBOX_MAX_STREAM":      "5s",
+		"ATTACKBOX_MAX_LOG_BODY":    "1048576",
 	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(c.listeners) != 3 || c.listeners[2].persona != "ollama" {
 		t.Fatalf("listeners = %+v", c.listeners)
+	}
+	if c.maxLogBody != 1<<20 {
+		t.Fatalf("maxLogBody = %d", c.maxLogBody)
 	}
 	if len(c.models) != 2 || c.models[1] != "llama3.1:8b" {
 		t.Fatalf("models = %q", c.models)
@@ -127,6 +134,7 @@ func TestLoadConfigErrors(t *testing.T) {
 		"huge secret":       {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SECRET_FILE": huge}, "at most 4096"},
 		"sessions cap":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_SESSIONS": "100001"}, "ATTACKBOX_MAX_SESSIONS: want an integer from 1 to 100000"},
 		"body cap":          {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_BODY_BYTES": "9223372036854775807"}, "ATTACKBOX_MAX_BODY_BYTES"},
+		"log body cap":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_LOG_BODY": "1048577"}, "ATTACKBOX_MAX_LOG_BODY"},
 		"in-flight cap":     {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_IN_FLIGHT": "10001"}, "ATTACKBOX_MAX_IN_FLIGHT"},
 		"per-source cap":    {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_PER_SOURCE": "1001"}, "ATTACKBOX_MAX_PER_SOURCE"},
 		"per-source>total":  {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_PER_SOURCE": "20", "ATTACKBOX_MAX_IN_FLIGHT": "10"}, "must not exceed ATTACKBOX_MAX_IN_FLIGHT"},

@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"attackbox/internal/responder"
@@ -80,9 +81,13 @@ func (s *Server) finish(c *call) {
 		attrs["observations"] = obs
 	}
 
-	body, cut := s.logBody(c.body)
+	attrs["direction"] = "request"
+	body, cut := s.logBody(c.body, int64(len(c.body)))
 	if cut {
 		attrs["body_truncated"] = true
+		// The keyed fingerprint of the whole body links repeats of one
+		// oversized payload without logging the part past the cap.
+		attrs["body_fingerprint"] = red.Fingerprint(string(c.body))
 	}
 	resource := truncRunes(red.Text(c.r.URL.Path), maxResourceLen)
 	ua := truncRunes(red.Text(c.ua), maxUALen)
@@ -107,6 +112,9 @@ func (s *Server) finish(c *call) {
 		Attrs:     attrs,
 		Body:      body,
 	})
+	if c.w.n > 0 {
+		s.emitResponse(c, now, sessionID, ua, resource, result, status, probeID)
+	}
 	if c.dec != nil {
 		s.cfg.Sink.Emit(telemetry.Event{
 			Timestamp:  now,
@@ -136,17 +144,58 @@ func (s *Server) finish(c *call) {
 // can shrink the text, so the cut before it keeps a little more than the cap.
 const logRedactMargin = 4 << 10
 
-// logBody returns the redacted request body for the log, at most MaxLogBody
-// bytes, and whether it was cut. The raw body is cut first so the redactor never
-// scans a megabyte for a log line that keeps a fraction of it.
-func (s *Server) logBody(b []byte) (string, bool) {
+// emitResponse writes the response body as its own edge event, so request and
+// response each get the full MaxLogBody budget and their own chunk sequence.
+func (s *Server) emitResponse(c *call, now time.Time, sessionID, ua, resource, result string, status int, probeID string) {
+	body, cut := s.logBody(c.w.head, c.w.n)
+	attrs := map[string]any{
+		"route":          c.endpoint,
+		"direction":      "response",
+		"response_bytes": c.w.n,
+	}
+	if ct := c.w.Header().Get("Content-Type"); ct != "" {
+		attrs["content_type"] = truncRunes(ct, 128)
+	}
+	if cut {
+		attrs["body_truncated"] = true
+	}
+	s.cfg.Sink.Emit(telemetry.Event{
+		Timestamp: now,
+		Stream:    telemetry.StreamEdge,
+		SessionID: sessionID,
+		RequestID: c.id,
+		SrcIP:     c.src,
+		UserAgent: ua,
+		Persona:   s.persona,
+		Action:    truncRunes(cleanEcho(c.r.Method, 16), 16),
+		Resource:  resource,
+		Result:    result,
+		Status:    status,
+		ProbeID:   probeID,
+		Attrs:     attrs,
+		Body:      body,
+	})
+}
+
+// logRawLimit is how many raw body bytes a log event needs: MaxLogBody plus
+// the redaction margin and a few spare bytes so the cut can back off to a
+// rune start.
+func (s *Server) logRawLimit() int {
+	return s.cfg.MaxLogBody + logRedactMargin + utf8.UTFMax
+}
+
+// logBody returns the redacted body for the log, at most MaxLogBody bytes, and
+// whether it was cut. b holds the first bytes of a body of total bytes; at
+// least logRawLimit of them when the body is that long. The raw body is cut
+// first so the redactor never scans a megabyte for a log line that keeps a
+// fraction of it.
+func (s *Server) logBody(b []byte, total int64) (string, bool) {
 	limit := s.cfg.MaxLogBody
 	keep := limit + logRedactMargin
-	cut := len(b) > keep
+	cut := total > int64(keep)
 	var raw string
 	if cut {
-		// A few spare bytes let truncBytes back off to a rune start.
-		raw = truncBytes(string(b[:min(len(b), keep+utf8.UTFMax)]), keep)
+		raw = truncBytes(string(b[:min(len(b), s.logRawLimit())]), keep)
 	} else {
 		raw = string(b)
 	}

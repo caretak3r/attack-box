@@ -404,8 +404,11 @@ func TestConcurrentClients(t *testing.T) {
 	for f := range fail {
 		t.Error(f)
 	}
-	if n := len(r.sink.stream(telemetry.StreamEdge)); n != clients*2 {
-		t.Errorf("edge events = %d", n)
+	if n := len(r.sink.edges("request")); n != clients*2 {
+		t.Errorf("request edge events = %d", n)
+	}
+	if n := len(r.sink.edges("response")); n != clients*2 {
+		t.Errorf("response edge events = %d", n)
 	}
 	if n := len(r.sink.stream(telemetry.StreamTranscript)); n != clients*2 {
 		t.Errorf("transcript events = %d", n)

@@ -24,6 +24,7 @@ const minSecret = 32
 const (
 	maxSessionsCap  = 100_000
 	maxBodyCap      = 16 << 20
+	maxLogBodyCap   = 1 << 20
 	maxInFlightCap  = 10_000
 	maxPerSourceCap = 1_000
 	maxDurationCap  = time.Hour
@@ -55,6 +56,7 @@ type config struct {
 
 	maxSessions  int
 	maxBody      int64
+	maxLogBody   int
 	maxPerSource int
 	maxInFlight  int
 	holdSilent   time.Duration
@@ -121,6 +123,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 		nrMetricURL:       env("NR_METRIC_URL", ""),
 		maxSessions:       num("MAX_SESSIONS", 10000, maxSessionsCap),
 		maxBody:           int64(num("MAX_BODY_BYTES", 1<<20, maxBodyCap)),
+		maxLogBody:        num("MAX_LOG_BODY", 128<<10, maxLogBodyCap),
 		maxPerSource:      num("MAX_PER_SOURCE", 8, maxPerSourceCap),
 		maxInFlight:       num("MAX_IN_FLIGHT", 256, maxInFlightCap),
 		holdSilent:        dur("HOLD_SILENT", 150*time.Second),

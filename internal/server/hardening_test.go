@@ -21,7 +21,7 @@ func TestLogBodyRedactsBeforeCut(t *testing.T) {
 	// a 14-character stub that no redactor pattern matches.
 	secret := "sk-" + strings.Repeat("A", 40)
 	body := strings.Repeat("x", 49) + " " + secret + strings.Repeat("y", 100)
-	got, cut := r.srv.logBody([]byte(body))
+	got, cut := r.srv.logBody([]byte(body), int64(len(body)))
 	if !cut || len(got) > 64 {
 		t.Fatalf("cut=%v len=%d", cut, len(got))
 	}
@@ -35,16 +35,16 @@ func TestLogBodyRuneSafe(t *testing.T) {
 	for _, unit := range []string{"世", "é", "x", "\U0001F600"} {
 		for extra := 0; extra < 4; extra++ {
 			b := strings.Repeat(unit, 1+(100+logRedactMargin+extra*len(unit))/len(unit))
-			got, cut := r.srv.logBody([]byte(b))
+			got, cut := r.srv.logBody([]byte(b), int64(len(b)))
 			if !cut || len(got) > 100 || !utf8.ValidString(got) {
 				t.Fatalf("unit %q extra %d: cut=%v len=%d valid=%v", unit, extra, cut, len(got), utf8.ValidString(got))
 			}
 		}
 	}
-	if got, cut := r.srv.logBody([]byte("short")); cut || got != "short" {
+	if got, cut := r.srv.logBody([]byte("short"), 5); cut || got != "short" {
 		t.Fatalf("short body = %q, %v", got, cut)
 	}
-	if got, cut := r.srv.logBody(nil); cut || got != "" {
+	if got, cut := r.srv.logBody(nil, 0); cut || got != "" {
 		t.Fatalf("empty body = %q, %v", got, cut)
 	}
 }
@@ -170,15 +170,15 @@ func TestReadTimeoutDoesNotCutHold(t *testing.T) {
 		b, _ := io.ReadAll(resp.Body)
 		return resp.StatusCode, string(b)
 	}
-	// finish runs after the reply; wait for the n-th edge event.
+	// finish runs after the reply; wait for the n-th request edge event.
 	holdResult := func(n int) any {
 		t.Helper()
-		for i := 0; i < 100 && len(r.sink.stream("edge")) < n; i++ {
+		for i := 0; i < 100 && len(r.sink.edges("request")) < n; i++ {
 			time.Sleep(20 * time.Millisecond)
 		}
-		ev := r.sink.stream("edge")
+		ev := r.sink.edges("request")
 		if len(ev) < n {
-			t.Fatalf("want %d edge events, have %d", n, len(ev))
+			t.Fatalf("want %d request edge events, have %d", n, len(ev))
 		}
 		return ev[n-1].Attrs["hold_result"]
 	}

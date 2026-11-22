@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"attackbox/internal/responder"
-	"attackbox/internal/telemetry"
 )
 
 func TestOpenAIModels(t *testing.T) {
@@ -435,7 +434,7 @@ func TestEdgeStatusOverlap(t *testing.T) {
 		}
 	}
 	peak := 0
-	for _, e := range r.sink.stream(telemetry.StreamEdge) {
+	for _, e := range r.sink.edges("request") {
 		obs, _ := e.Attrs["observations"].([]responder.Observation)
 		for _, o := range obs {
 			if o.ProbeID != "concurrency" {
