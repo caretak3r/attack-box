@@ -475,7 +475,7 @@ func TestMaxPayloadBytesFloor(t *testing.T) {
 	cfg.MaxPayloadBytes = 10
 	n := start(t, cfg)
 	defer closeNR(t, n)
-	if n.cfg.MaxPayloadBytes != minPayloadBytes {
-		t.Errorf("MaxPayloadBytes = %d, want %d", n.cfg.MaxPayloadBytes, minPayloadBytes)
+	if n.cfg.MaxPayloadBytes != MinPayloadBytes {
+		t.Errorf("MaxPayloadBytes = %d, want %d", n.cfg.MaxPayloadBytes, MinPayloadBytes)
 	}
 }

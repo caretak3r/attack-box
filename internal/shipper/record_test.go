@@ -49,7 +49,7 @@ func TestAdmitRoundTrip(t *testing.T) {
 		Stream: telemetry.StreamEdge, SessionID: "s1", RequestID: "r1", SrcIP: "203.0.113.9",
 		UserAgent: "curl/8", Persona: "openai", Action: "request", Resource: "/v1/chat/completions",
 		Result: "ok", Status: 200, ProbeID: "register-model", TaskLabels: []string{"code"},
-		Attrs: map[string]any{"headers": map[string]any{"User-Agent": "curl/8"}, "latency_ms": 12.0, "stream": true, "host": "decoy"},
+		Attrs: map[string]any{"headers": map[string]any{"User-Agent": "curl/8"}, "latency_ms": 12.0, "streaming": true, "host": "decoy"},
 		Body:  body,
 	}
 	a, err := Admit(RoleBait, line(t, ev(in)), admitNow)
@@ -322,10 +322,11 @@ func TestAdmitExpandedBound(t *testing.T) {
 	if _, err := Admit(RoleBait, line(t, ev(telemetry.Event{Stream: "edge", Body: body, Attrs: map[string]any{"h": strings.Repeat("v", 512)}})), admitNow); err != nil {
 		t.Fatalf("max body: %v", err)
 	}
-	// Attrs repeat in every chunk: ~120 KiB of attrs times ~300 chunks is
-	// far past the expanded ceiling though each part is within its own cap.
-	attrs := map[string]any{}
-	for i := range 30 {
+	// Attrs repeat in every chunk: ~56 KiB of attrs times ~300 chunks is
+	// past the expanded ceiling though each part is within its own cap and
+	// each chunk fits MaxItem.
+	attrs := map[string]any{"pad": strings.Repeat("v", maxString), "pad2": strings.Repeat("v", 500)}
+	for i := range 12 {
 		attrs[strings.Repeat("a", i+1)] = strings.Repeat("v", maxString)
 	}
 	small := ev(telemetry.Event{Stream: "edge", Body: "x", Attrs: attrs})
@@ -343,4 +344,77 @@ func TestAdmitItemBound(t *testing.T) {
 		attrs[strings.Repeat("a", i+1)] = strings.Repeat("<", maxString)
 	}
 	mustReject(t, RoleBait, line(t, ev(telemetry.Event{Stream: "edge", Body: "x", Attrs: attrs})), "item_size")
+}
+
+func TestAdmitStripsFixedFieldNames(t *testing.T) {
+	// Event.Attributes only overwrites a fixed field when it is non-empty,
+	// so every name it owns must be stripped from producer attrs.
+	names := []string{
+		"session_id", "request_id", "src_ip", "user_agent", "persona", "action",
+		"resource", "result", "probe_id", "status", "task_labels",
+		"stream", "body_sha256", "chunk_index", "chunk_count", "SRC_IP",
+	}
+	for _, name := range names {
+		in := ev(telemetry.Event{Stream: telemetry.StreamEdge, Attrs: map[string]any{name: "1.2.3.4", "kept": "yes"}})
+		a, err := Admit(RoleBait, line(t, in), admitNow)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		e := a.Record.Event
+		if _, ok := e.Attrs[name]; ok || e.Attrs["kept"] != "yes" || e.Attrs["reserved_attrs_removed"] != true {
+			t.Errorf("%s: attrs = %v", name, e.Attrs)
+		}
+		if _, ok := e.Attributes()["src_ip"]; ok {
+			t.Errorf("%s: src_ip reaches the shipped attributes with an empty SrcIP", name)
+		}
+	}
+}
+
+func TestAdmitSrcIPZone(t *testing.T) {
+	mustReject(t, RoleBait, line(t, ev(telemetry.Event{Stream: "edge", SrcIP: "fe80::1%eth0"})), "src_ip")
+	for _, ip := range []string{"fe80::1", "203.0.113.9", "2001:db8::1"} {
+		if _, err := Admit(RoleBait, line(t, ev(telemetry.Event{Stream: "edge", SrcIP: ip})), admitNow); err != nil {
+			t.Fatalf("%s: %v", ip, err)
+		}
+	}
+}
+
+func TestAdmitBaitCannotForgeAdapterActions(t *testing.T) {
+	for _, stream := range []string{
+		telemetry.StreamEdge, telemetry.StreamTranscript, telemetry.StreamProbe,
+		telemetry.StreamHeartbeat, telemetry.StreamRuntime,
+	} {
+		for _, act := range []string{FalcoAction, EgressAction, "FALCO", "Egress_Blocked"} {
+			mustReject(t, RoleBait, line(t, ev(telemetry.Event{Stream: stream, Action: act})), "action")
+		}
+	}
+}
+
+func TestMaxItemFitsMinimumPayload(t *testing.T) {
+	// The smallest POST the telemetry client sends must hold an admitted
+	// item plus its envelope.
+	if MaxItem+itemHeadroom > telemetry.MinPayloadBytes {
+		t.Fatalf("MaxItem %d + headroom %d exceeds min payload %d", MaxItem, itemHeadroom, telemetry.MinPayloadBytes)
+	}
+	// 20 x 4096 bytes of attrs is ~82 KiB: inside every attr cap and the old
+	// 256 KiB item bound, but too big for a 64 KiB POST.
+	attrs := map[string]any{}
+	for i := range 20 {
+		attrs[strings.Repeat("a", i+1)] = strings.Repeat("v", maxString)
+	}
+	mustReject(t, RoleBait, line(t, ev(telemetry.Event{Stream: "edge", Body: "x", Attrs: attrs})), "item_size")
+	// Just under the bound is admitted, and the item really fits.
+	attrs = map[string]any{}
+	for i := range 12 {
+		attrs[strings.Repeat("a", i+1)] = strings.Repeat("v", maxString)
+	}
+	a, err := Admit(RoleBait, line(t, ev(telemetry.Event{Stream: "edge", Body: "x", Attrs: attrs})), admitNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range telemetry.Chunk(*a.Record.Event, telemetry.MaxChunk) {
+		if n, _ := telemetry.LogItemSize(c); n > MaxItem {
+			t.Fatalf("item %d > MaxItem %d", n, MaxItem)
+		}
+	}
 }
