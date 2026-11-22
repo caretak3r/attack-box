@@ -13,6 +13,7 @@ Three read-only research agents reviewed primary documentation and public GitHub
 - `protocol-review.md`: official-client contract mismatches in streaming usage, prompt arrays, Responses fields/cancellation, token embeddings and Ollama management responses. Fix all ten before claiming client compatibility.
 - `main-review.md`: executable lifecycle review covering partial-listener cleanup, unsafe configuration bounds, secret-file permissions and healthcheck userinfo. Follow the validated fixes in `SECURITY_FIXES.md`.
 - `secret-review.md`: shared scrubber audit and host-observed failing/passing test evidence. Fix priority bypasses while preserving valid JSON and all genuine canary shapes.
+- `new-relic-hardening-review.md`: second-pass telemetry review. Four remaining issues cover blocking JSONLog fan-out, nested URL encoding, recovered-error metrics and retry-cap accounting.
 
 ## Required application in this repository
 

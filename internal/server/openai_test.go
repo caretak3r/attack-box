@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"strconv"
 	"strings"
@@ -334,6 +335,30 @@ func TestHoldClientDisconnect(t *testing.T) {
 		if !stream && (edge.Status != 499 || edge.Result != "client_closed") {
 			t.Fatalf("status = %d result = %q", edge.Status, edge.Result)
 		}
+	}
+}
+
+// TestHoldServerShutdown checks that a hold cut by process shutdown is not
+// blamed on the client.
+func TestHoldServerShutdown(t *testing.T) {
+	r := newRig(t, PersonaOpenAI)
+	r.pin("timeout-silent")
+	r.warm()
+	r.clk.setGate(make(chan time.Time))
+	base, cut := context.WithCancelCause(context.Background())
+	req := request("POST", "/v1/chat/completions", chatBody).WithContext(base)
+	done := make(chan struct{})
+	go func() { r.serve(req); close(done) }()
+	r.clk.waitEntered(t, 1)
+	cut(ErrShutdown)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler ignored shutdown")
+	}
+	edge := r.sink.lastEdge(t)
+	if edge.Attrs["hold_result"] != "server_shutdown" || edge.Result != "server_shutdown" {
+		t.Fatalf("result = %q attrs = %v", edge.Result, edge.Attrs)
 	}
 }
 

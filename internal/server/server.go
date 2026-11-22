@@ -6,6 +6,7 @@
 package server
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -371,6 +372,9 @@ func (c *call) wait(total, every time.Duration, idle func() bool) bool {
 		case <-s.cfg.After(step):
 		case <-ctx.Done():
 			result = "client_closed"
+			if errors.Is(context.Cause(ctx), ErrShutdown) {
+				result = holdServerShutdown
+			}
 		}
 		if result != "completed" {
 			break
@@ -385,6 +389,13 @@ func (c *call) wait(total, every time.Duration, idle func() bool) bool {
 	c.holdMS = s.cfg.Now().Sub(began).Milliseconds()
 	return result == "completed"
 }
+
+// ErrShutdown is the cancel cause the process puts on the http.Server base
+// context when the shutdown grace period ends. Holds cut by it are logged as
+// server_shutdown, not client_closed, so telemetry does not blame the client.
+var ErrShutdown = errors.New("server shutdown")
+
+const holdServerShutdown = "server_shutdown"
 
 // holdFor carries out a probe hold mode before or inside a response.
 func (c *call) holdFor(mode string, idle func() bool) bool {

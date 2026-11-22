@@ -18,6 +18,7 @@ Read `research/responder-review.md` and `research/telemetry-security.md` before 
 6. DONE: Medium: reject/account for metric intake after Close; make the Sink contract and local JSON writer behavior agree so request processing cannot stall silently.
 7. DONE: Review Low findings: strong random redactor keys, count transient failed POST attempts, and reject/scrub raw or escaped credentials in endpoint URLs.
 8. Triage `research/secret-review.md`: fix marker-prefix and malformed-canary allowlist bypasses, camelCase/encoded credential names, non-string JSON credential handling, cookie/canary idempotence and unsafe fingerprint output. Preserve valid JSON and behavioral telemetry byte-for-byte; document the remaining free-text detection boundary rather than claiming perfection.
+9. `research/new-relic-hardening-review.md`: keep blocking JSONLog writers off the request path (or use bounded async/drop behavior), reject nested-escaped and arbitrary credential query parameters, scrub escaped keys in errors, expose recovered failed attempts in shipped metrics, cap custom backoff correctly, and count retries only when a subsequent POST actually runs.
 
 ## HTTP server snapshot
 
@@ -41,11 +42,11 @@ Read `research/protocol-review.md` and fix all ten client-visible mismatches wit
 
 Also address the validated findings in `research/main-review.md`:
 
-1. On partial-listener startup failure, join/report `nr.Close` errors rather than discarding them; prove cleanup with a failing listener and fake NR intake.
-2. Put safe upper bounds on `MAX_SESSIONS`, `MAX_IN_FLIGHT`, `MAX_PER_SOURCE` and `MAX_BODY_BYTES` to reject operator configurations that trivially exhaust memory.
-3. Require secret files to be private to the service account (reject group/other-readable files) and test permissive modes.
-4. Emit the final runtime stop event before closing NR with a reliable local record, and handle empty `LastError` without malformed error text.
-5. Reject userinfo in healthcheck URLs and validate/document the relationship between shutdown and stream timeouts.
+1. DONE: On partial-listener startup failure, join/report `nr.Close` errors rather than discarding them; prove cleanup with a failing listener and fake NR intake.
+2. DONE: Put safe upper bounds on `MAX_SESSIONS`, `MAX_IN_FLIGHT`, `MAX_PER_SOURCE` and `MAX_BODY_BYTES` to reject operator configurations that trivially exhaust memory.
+3. DONE: Require secret files to be private to the service account (reject group/other-readable files) and test permissive modes.
+4. DONE: Emit the final runtime stop event before closing NR with a reliable local record, and handle empty `LastError` without malformed error text.
+5. DONE: Reject userinfo in healthcheck URLs and validate/document the relationship between shutdown and stream timeouts.
 
 ## Deployment acceptance
 

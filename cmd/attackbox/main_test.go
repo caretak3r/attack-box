@@ -16,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"attackbox/internal/telemetry"
 )
 
 const testNRKey = "0123456789abcdef0123456789abcdef0123NRAL"
@@ -86,8 +88,16 @@ func TestLoadConfigFull(t *testing.T) {
 }
 
 func TestLoadConfigErrors(t *testing.T) {
-	short := filepath.Join(t.TempDir(), "short")
+	tmp := t.TempDir()
+	short := filepath.Join(tmp, "short")
 	_ = os.WriteFile(short, []byte("tiny"), 0o600)
+	key := bytes.Repeat([]byte{7}, 48)
+	open, group, huge := filepath.Join(tmp, "open"), filepath.Join(tmp, "group"), filepath.Join(tmp, "huge")
+	_ = os.WriteFile(open, key, 0o644)
+	_ = os.WriteFile(group, key, 0o640)
+	_ = os.WriteFile(huge, bytes.Repeat([]byte{7}, 5000), 0o600)
+	dir := filepath.Join(tmp, "dir")
+	_ = os.Mkdir(dir, 0o700)
 	cases := map[string]struct {
 		env  map[string]string
 		want string
@@ -111,6 +121,16 @@ func TestLoadConfigErrors(t *testing.T) {
 		"bad instance":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_INSTANCE": "has space"}, "ATTACKBOX_INSTANCE"},
 		"short secret":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SECRET_FILE": short}, "at least 32 bytes"},
 		"missing secret":    {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SECRET_FILE": "/nonexistent/secret"}, "ATTACKBOX_SECRET_FILE"},
+		"open secret":       {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SECRET_FILE": open}, "readable by group or others"},
+		"group secret":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SECRET_FILE": group}, "readable by group or others"},
+		"dir secret":        {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SECRET_FILE": dir}, "not a regular file"},
+		"huge secret":       {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SECRET_FILE": huge}, "at most 4096"},
+		"sessions cap":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_SESSIONS": "100001"}, "ATTACKBOX_MAX_SESSIONS: want an integer from 1 to 100000"},
+		"body cap":          {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_BODY_BYTES": "9223372036854775807"}, "ATTACKBOX_MAX_BODY_BYTES"},
+		"in-flight cap":     {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_IN_FLIGHT": "10001"}, "ATTACKBOX_MAX_IN_FLIGHT"},
+		"per-source cap":    {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_PER_SOURCE": "1001"}, "ATTACKBOX_MAX_PER_SOURCE"},
+		"per-source>total":  {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_PER_SOURCE": "20", "ATTACKBOX_MAX_IN_FLIGHT": "10"}, "must not exceed ATTACKBOX_MAX_IN_FLIGHT"},
+		"duration cap":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SHUTDOWN_TIMEOUT": "2h"}, "ATTACKBOX_SHUTDOWN_TIMEOUT"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -156,7 +176,7 @@ func TestHealthcheck(t *testing.T) {
 	if err := healthcheck(ok.URL + "/missing"); err == nil || !strings.Contains(err.Error(), "404") {
 		t.Fatalf("404 err = %v", err)
 	}
-	for _, u := range []string{"http://192.0.2.1/health", "https://127.0.0.1/health", "::bad"} {
+	for _, u := range []string{"http://192.0.2.1/health", "https://127.0.0.1/health", "::bad", "http://user:pass@127.0.0.1/health", "http://user@localhost/health"} {
 		if err := healthcheck(u); err == nil {
 			t.Fatalf("%s: want refusal", u)
 		}
@@ -381,7 +401,7 @@ func TestLiveThreePersonas(t *testing.T) {
 		shipped.Write(p)
 	}
 	s := shipped.String()
-	if strings.Contains(s, bearer) || !strings.Contains(s, `"instance":"test-box"`) || !strings.Contains(s, `"persona":"ollama"`) {
+	if strings.Contains(s, bearer) || !strings.Contains(s, `"instance":"test-box"`) || !strings.Contains(s, `"persona":"ollama"`) || !strings.Contains(s, `"action":"stop"`) {
 		t.Fatalf("shipped logs unexpected: %.400s", s)
 	}
 }
@@ -456,5 +476,59 @@ func TestShutdownCutsHolds(t *testing.T) {
 	}
 	if d := time.Since(start); d > 3*time.Second {
 		t.Fatalf("shutdown took %v", d)
+	}
+}
+
+// TestPartialBindClosesNewRelic checks that a failed second listener closes
+// the New Relic shipper and reports its close error instead of dropping it.
+func TestPartialBindClosesNewRelic(t *testing.T) {
+	release := make(chan struct{})
+	nr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select { // hang until the test ends, so Close hits its deadline
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer nr.Close() // waits for handlers, after release below
+	defer close(release)
+
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	cfg, err := loadConfig(envOf(map[string]string{
+		"ATTACKBOX_NR_LICENSE_KEY":   testNRKey,
+		"ATTACKBOX_NR_LOG_URL":       nr.URL + "/log/v1",
+		"ATTACKBOX_NR_METRIC_URL":    nr.URL + "/metric/v1",
+		"ATTACKBOX_OPENAI_ADDR":      "127.0.0.1:0",
+		"ATTACKBOX_VLLM_ADDR":        busy.Addr().String(),
+		"ATTACKBOX_SHUTDOWN_TIMEOUT": "150ms",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err = newApp(cfg, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "vllm listener") || !strings.Contains(err.Error(), "new relic close") {
+		t.Fatalf("err = %v, want bind and new relic close errors", err)
+	}
+	if strings.Contains(err.Error(), testNRKey) {
+		t.Fatal("key in error")
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("partial-bind cleanup took %v", d)
+	}
+}
+
+func TestLossError(t *testing.T) {
+	if err := lossError(telemetry.Stats{}); err != nil {
+		t.Fatalf("clean stats: %v", err)
+	}
+	if err := lossError(telemetry.Stats{Dropped: 3}); err == nil || err.Error() != "new relic: 0 lost, 3 dropped" {
+		t.Fatalf("no last error: %v", err)
+	}
+	if err := lossError(telemetry.Stats{Lost: 2, LastError: "status 403"}); err == nil || err.Error() != "new relic: 2 lost, 0 dropped; last error: status 403" {
+		t.Fatalf("with last error: %v", err)
 	}
 }

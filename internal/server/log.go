@@ -79,6 +79,10 @@ func (s *Server) finish(c *call) {
 	}
 	resource := truncRunes(red.Text(c.r.URL.Path), maxResourceLen)
 	ua := truncRunes(red.Text(c.ua), maxUALen)
+	result := resultFor(status)
+	if c.holdResult == holdServerShutdown {
+		result = holdServerShutdown
+	}
 
 	s.cfg.Sink.Emit(telemetry.Event{
 		Timestamp: now,
@@ -90,7 +94,7 @@ func (s *Server) finish(c *call) {
 		Persona:   s.persona,
 		Action:    truncRunes(cleanEcho(c.r.Method, 16), 16),
 		Resource:  resource,
-		Result:    resultFor(status),
+		Result:    result,
 		Status:    status,
 		ProbeID:   probeID,
 		Attrs:     attrs,

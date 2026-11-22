@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
 	"os"
 	"strconv"
@@ -17,6 +18,16 @@ import (
 
 // minSecret is the shortest accepted secret file, in bytes.
 const minSecret = 32
+
+// Upper bounds for the resource settings. A larger value is an operator
+// error that would let one host exhaust memory, not a tuning choice.
+const (
+	maxSessionsCap  = 100_000
+	maxBodyCap      = 16 << 20
+	maxInFlightCap  = 10_000
+	maxPerSourceCap = 1_000
+	maxDurationCap  = time.Hour
+)
 
 // listener is one persona bound to one address.
 type listener struct {
@@ -72,20 +83,20 @@ func loadConfig(getenv func(string) string) (config, error) {
 			return def
 		}
 		d, err := time.ParseDuration(v)
-		if err != nil || d <= 0 {
-			errs = append(errs, fmt.Errorf("ATTACKBOX_%s: want a positive duration such as 30s, got %q", name, v))
+		if err != nil || d <= 0 || d > maxDurationCap {
+			errs = append(errs, fmt.Errorf("ATTACKBOX_%s: want a positive duration up to %v such as 30s, got %q", name, maxDurationCap, v))
 			return def
 		}
 		return d
 	}
-	num := func(name string, def int) int {
+	num := func(name string, def, limit int) int {
 		v := env(name, "")
 		if v == "" {
 			return def
 		}
 		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			errs = append(errs, fmt.Errorf("ATTACKBOX_%s: want a positive integer, got %q", name, v))
+		if err != nil || n <= 0 || n > limit {
+			errs = append(errs, fmt.Errorf("ATTACKBOX_%s: want an integer from 1 to %d, got %q", name, limit, v))
 			return def
 		}
 		return n
@@ -108,10 +119,10 @@ func loadConfig(getenv func(string) string) (config, error) {
 		nrKey:             strings.TrimSpace(getenv("ATTACKBOX_NR_LICENSE_KEY")),
 		nrLogURL:          env("NR_LOG_URL", ""),
 		nrMetricURL:       env("NR_METRIC_URL", ""),
-		maxSessions:       num("MAX_SESSIONS", 10000),
-		maxBody:           int64(num("MAX_BODY_BYTES", 1<<20)),
-		maxPerSource:      num("MAX_PER_SOURCE", 8),
-		maxInFlight:       num("MAX_IN_FLIGHT", 256),
+		maxSessions:       num("MAX_SESSIONS", 10000, maxSessionsCap),
+		maxBody:           int64(num("MAX_BODY_BYTES", 1<<20, maxBodyCap)),
+		maxPerSource:      num("MAX_PER_SOURCE", 8, maxPerSourceCap),
+		maxInFlight:       num("MAX_IN_FLIGHT", 256, maxInFlightCap),
 		holdSilent:        dur("HOLD_SILENT", 150*time.Second),
 		idleInterval:      dur("IDLE_INTERVAL", 45*time.Second),
 		maxStream:         dur("MAX_STREAM", 180*time.Second),
@@ -125,6 +136,9 @@ func loadConfig(getenv func(string) string) (config, error) {
 	}
 	if c.holdSilent > c.maxStream {
 		errs = append(errs, errors.New("ATTACKBOX_HOLD_SILENT must not exceed ATTACKBOX_MAX_STREAM"))
+	}
+	if c.maxPerSource > c.maxInFlight {
+		errs = append(errs, errors.New("ATTACKBOX_MAX_PER_SOURCE must not exceed ATTACKBOX_MAX_IN_FLIGHT"))
 	}
 
 	var used []boundAddr
@@ -186,15 +200,11 @@ func loadConfig(getenv func(string) string) (config, error) {
 	}
 
 	if c.secretFile != "" {
-		b, err := os.ReadFile(c.secretFile)
-		switch {
-		case err != nil:
-			errs = append(errs, fmt.Errorf("ATTACKBOX_SECRET_FILE: %v", err))
-		case len(b) < minSecret:
-			errs = append(errs, fmt.Errorf("ATTACKBOX_SECRET_FILE: need at least %d bytes, got %d", minSecret, len(b)))
-		default:
-			c.secret = b
+		b, err := readSecret(c.secretFile)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("ATTACKBOX_SECRET_FILE: %w", err))
 		}
+		c.secret = b
 	}
 	if err := errors.Join(errs...); err != nil {
 		return config{}, err
@@ -206,6 +216,38 @@ func loadConfig(getenv func(string) string) (config, error) {
 		}
 	}
 	return c, nil
+}
+
+// readSecret reads a key file that only its owner can read. A group- or
+// world-readable key would let any local process forge session IDs and
+// reverse redaction fingerprints.
+func readSecret(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("not a regular file")
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return nil, fmt.Errorf("mode %#o is readable by group or others; use 0600 or 0400", perm)
+	}
+	if info.Size() > 4096 {
+		return nil, fmt.Errorf("file is %d bytes; at most 4096 are allowed", info.Size())
+	}
+	b, err := io.ReadAll(io.LimitReader(f, 4097))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) < minSecret {
+		return nil, fmt.Errorf("need at least %d bytes, got %d", minSecret, len(b))
+	}
+	return b, nil
 }
 
 // derive returns a purpose-specific key so no two uses share key material.

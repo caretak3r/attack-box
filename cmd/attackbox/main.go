@@ -92,6 +92,9 @@ func healthcheck(raw string) error {
 	if err != nil || u.Scheme != "http" {
 		return errors.New("want an http:// loopback URL")
 	}
+	if u.User != nil {
+		return errors.New("credentials in the healthcheck URL are not allowed")
+	}
 	switch u.Hostname() {
 	case "127.0.0.1", "::1", "localhost":
 	default:
@@ -188,12 +191,17 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 		}
 		if err != nil {
 			a.closeListeners()
+			bindErr := fmt.Errorf("%s listener %s: %w", l.persona, l.addr, err)
 			if a.nr != nil {
 				ctx, cancel := context.WithTimeout(context.Background(), cfg.shutdownTimeout)
-				_ = a.nr.Close(ctx)
+				nrErr := a.nr.Close(ctx)
 				cancel()
+				if nrErr != nil {
+					nrErr = fmt.Errorf("new relic close: %w", nrErr)
+				}
+				return nil, errors.Join(bindErr, nrErr)
 			}
-			return nil, fmt.Errorf("%s listener %s: %w", l.persona, l.addr, err)
+			return nil, bindErr
 		}
 	}
 	return a, nil
@@ -219,8 +227,14 @@ func (a *app) addrs() map[string]string {
 // It returns an error if a listener failed or New Relic lost events.
 func (a *app) run(ctx context.Context) error {
 	a.runtime("start", "ok", map[string]any{"version": version, "listeners": a.addrs(), "newrelic": a.nr != nil})
+	// Request contexts derive from base. When the grace period ends it is
+	// cancelled with server.ErrShutdown, so cut holds are logged as
+	// server_shutdown rather than client_closed.
+	base, cut := context.WithCancelCause(context.Background())
+	defer cut(nil)
 	errc := make(chan error, len(a.servers))
 	for i, srv := range a.servers {
+		srv.BaseContext = func(net.Listener) context.Context { return base }
 		go func(srv *http.Server, ln net.Listener, persona string) {
 			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errc <- fmt.Errorf("%s listener: %w", persona, err)
@@ -233,6 +247,14 @@ func (a *app) run(ctx context.Context) error {
 	case serveErr = <-errc:
 	}
 
+	// Emitted before the drain so New Relic has the whole flush window for
+	// it; the local "stopped" event below is the authoritative final record.
+	reason := "signal"
+	if serveErr != nil {
+		reason = "listener_error"
+	}
+	a.runtime("stop", "ok", map[string]any{"reason": reason, "grace_ms": a.cfg.shutdownTimeout.Milliseconds()})
+
 	shutCtx, cancel := context.WithTimeout(context.Background(), a.cfg.shutdownTimeout)
 	defer cancel()
 	var wg sync.WaitGroup
@@ -241,7 +263,8 @@ func (a *app) run(ctx context.Context) error {
 		go func(srv *http.Server) {
 			defer wg.Done()
 			if err := srv.Shutdown(shutCtx); err != nil {
-				_ = srv.Close() // holds outlived the grace period
+				cut(server.ErrShutdown) // holds outlived the grace period
+				_ = srv.Close()
 			}
 		}(srv)
 	}
@@ -249,15 +272,14 @@ func (a *app) run(ctx context.Context) error {
 
 	attrs := map[string]any{}
 	var nrErr error
-	a.runtime("stop", "ok", nil)
 	if a.nr != nil {
 		flushCtx, cancelFlush := context.WithTimeout(context.Background(), a.cfg.shutdownTimeout)
 		nrErr = a.nr.Close(flushCtx)
 		cancelFlush()
 		st := a.nr.Stats()
 		attrs = map[string]any{"nr_sent": st.Sent, "nr_dropped": st.Dropped, "nr_lost": st.Lost, "nr_errors": st.Errors}
-		if nrErr == nil && (st.Lost > 0 || st.Dropped > 0) {
-			nrErr = fmt.Errorf("new relic: %d lost, %d dropped; last error: %s", st.Lost, st.Dropped, st.LastError)
+		if nrErr == nil {
+			nrErr = lossError(st)
 		}
 	}
 	result := "ok"
@@ -267,6 +289,18 @@ func (a *app) run(ctx context.Context) error {
 	// Written locally only: New Relic is closed at this point.
 	a.local.Emit(telemetry.Event{Stream: telemetry.StreamRuntime, Action: "stopped", Result: result, Attrs: attrs})
 	return errors.Join(serveErr, nrErr)
+}
+
+// lossError reports events New Relic never accepted, or nil if none.
+func lossError(st telemetry.Stats) error {
+	if st.Lost == 0 && st.Dropped == 0 {
+		return nil
+	}
+	msg := fmt.Sprintf("new relic: %d lost, %d dropped", st.Lost, st.Dropped)
+	if st.LastError != "" {
+		msg += "; last error: " + st.LastError
+	}
+	return errors.New(msg)
 }
 
 func (a *app) runtime(action, result string, attrs map[string]any) {
