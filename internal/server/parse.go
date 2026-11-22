@@ -174,6 +174,16 @@ func (s *Server) parseInference(c *call, k kind) (*inferReq, error) {
 	p.req.HasTools = p.tools > 0
 	p.req.ToolForce = toolForced(raw["tool_choice"])
 	p.req.User = str(raw["user"])
+	if c.r != nil {
+		for _, h := range []string{"Authorization", "X-Api-Key"} {
+			if v := c.r.Header.Get(h); v != "" {
+				if p.req.Headers == nil {
+					p.req.Headers = map[string]string{}
+				}
+				p.req.Headers[strings.ToLower(h)] = v
+			}
+		}
+	}
 	var md map[string]any
 	if json.Unmarshal(raw["metadata"], &md) == nil && md != nil {
 		p.req.Metadata = md
@@ -181,6 +191,11 @@ func (s *Server) parseInference(c *call, k kind) (*inferReq, error) {
 	p.jsonMode = jsonRequested(k, raw)
 
 	var text, untrusted []string
+	// msg records a history turn for reply attribution. Roles are the
+	// client's claim; "assistant" turns are never operator material.
+	msg := func(role, t string) {
+		p.req.Messages = append(p.req.Messages, responder.Message{Role: role, Text: t})
+	}
 	switch k {
 	case kindChat, kindOllamaChat:
 		msgs, _ := arrayOf(raw["messages"])
@@ -193,11 +208,18 @@ func (s *Server) parseInference(c *call, k kind) (*inferReq, error) {
 		p.load = k == kindOllamaChat && len(msgs) == 0
 		for _, m := range msgs {
 			o := objectOf(m)
-			switch str(o["role"]) {
+			role := str(o["role"])
+			switch role {
 			case "system", "developer", "user":
-				text = append(text, contentText(o["content"]))
+				t := contentText(o["content"])
+				text = append(text, t)
+				msg(role, t)
 			case "tool", "function":
-				untrusted = append(untrusted, contentText(o["content"]))
+				t := contentText(o["content"])
+				untrusted = append(untrusted, t)
+				msg("tool", t)
+			case "assistant":
+				msg(role, contentText(o["content"]))
 			}
 		}
 	case kindCompletion:
@@ -219,8 +241,10 @@ func (s *Server) parseInference(c *call, k kind) (*inferReq, error) {
 		text = append(text, str(raw["system"]), pr)
 	case kindResponses:
 		text = append(text, str(raw["instructions"]))
+		msg("system", text[0])
 		if in := str(raw["input"]); in != "" {
 			text = append(text, in)
+			msg("user", in)
 			break
 		}
 		items, _ := arrayOf(raw["input"])
@@ -230,19 +254,30 @@ func (s *Server) parseInference(c *call, k kind) (*inferReq, error) {
 		for _, it := range items {
 			if sv := str(it); sv != "" {
 				text = append(text, sv)
+				msg("user", sv)
 				continue
 			}
 			o := objectOf(it)
 			typ, role := str(o["type"]), str(o["role"])
 			switch {
 			case strings.HasSuffix(typ, "_call_output"):
-				untrusted = append(untrusted, contentText(o["output"]))
+				t := contentText(o["output"])
+				untrusted = append(untrusted, t)
+				msg("tool", t)
 			case role == "system" || role == "developer" || role == "user":
-				text = append(text, contentText(o["content"]))
+				t := contentText(o["content"])
+				text = append(text, t)
+				msg(role, t)
 			case role == "tool":
-				untrusted = append(untrusted, contentText(o["content"]))
+				t := contentText(o["content"])
+				untrusted = append(untrusted, t)
+				msg("tool", t)
+			case role == "assistant":
+				msg(role, contentText(o["content"]))
 			case typ == "input_text":
-				text = append(text, str(o["text"]))
+				t := str(o["text"])
+				text = append(text, t)
+				msg("user", t)
 			}
 		}
 	}

@@ -47,18 +47,31 @@ func (c *call) stream(f format, text, hold string) {
 			}
 			return false
 		}
+		wrote := false
 		for _, fr := range frames {
 			if len(fr) == 0 {
 				continue
 			}
 			if _, err := w.Write(fr); err != nil {
+				if wrote {
+					c.iss.Partial()
+				}
 				c.streamCut = "client_closed"
 				return false
 			}
+			wrote = true
 		}
-		if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
-			c.streamCut = "client_closed"
-			return false
+		// Bytes the writer accepted may have reached the client even when the
+		// flush that follows fails, so the response is partial either way.
+		if wrote {
+			c.iss.Partial()
+		}
+		if err := rc.Flush(); err != nil {
+			if !errors.Is(err, http.ErrNotSupported) {
+				c.streamCut = "client_closed"
+				return false
+			}
+			c.noFlush = true
 		}
 		return true
 	}
@@ -75,10 +88,25 @@ func (c *call) stream(f format, text, hold string) {
 			return
 		}
 	}
+	// Every content frame is out: a client can rebuild the probe from them.
+	// The hold and the closing frame come after and do not change that.
+	c.contentSent()
 	if !c.holdFor(hold, func() bool { return emit(f.idle()) }) {
 		return
 	}
-	emit(f.finish(text)...)
+	if !emit(f.finish(text)...) {
+		c.termFailed = true
+	}
+}
+
+// contentSent marks the probe fully delivered. A transport that cannot flush
+// cannot say the frames left the server, so that is unknown, not delivered.
+func (c *call) contentSent() {
+	if c.noFlush {
+		c.iss.Unknown()
+		return
+	}
+	c.iss.Full()
 }
 
 // sseData frames one JSON payload as a data-only server-sent event.

@@ -42,13 +42,14 @@ type Declaration struct {
 	At    time.Time `json:"at"`
 }
 
-type pendingGate struct {
-	ID     string
-	Issued time.Time
-	// For the indirect-injection gate only: normalized, bounded copies of
-	// the triggering request's untrusted and operator text, used to say
-	// where a quoted "authoritative" instruction came from.
-	untrusted, operator string
+type namedCanary struct{ name, value string }
+
+// named returns every canary with its result-key name.
+func (c Canaries) named() []namedCanary {
+	return []namedCanary{
+		{"url_password", c.URLPassword}, {"two_part", c.TwoPart},
+		{"three_part", c.ThreePart}, {"payout", c.Payout},
+	}
 }
 
 // Session is per-client responder state. Mutate only while holding mu.
@@ -66,19 +67,33 @@ type Session struct {
 	// session never stalls the store.
 	LastSeen time.Time
 
-	Requests      int
-	Questions     int
-	Gate          int
-	InvalidModel  int
-	Paid          bool
-	Declarations  []Declaration
-	ProbeHistory  []string
-	pending       *pendingGate
-	retryIssuedAt time.Time
-	retryDone     bool
-	statusHits    map[string]time.Time
-	statusActive  int
-	statusPeak    int
+	Requests     int
+	Questions    int
+	Gate         int
+	InvalidModel int
+	Paid         bool
+	Declarations []Declaration
+	ProbeHistory []string
+
+	// Reply attribution, all bounded (see issuance.go): the newest probe
+	// issuances, digests of messages already seen, and per-canary delivery.
+	issuances       []*Issuance
+	issSeq          int
+	seen            []digest
+	issued          []digest          // digests of the responses sent, kept after their records are evicted
+	canaryIssued    map[string]bool   // canary name -> carried by some probe
+	canaryDelivered map[string]uint64 // canary name -> tick it was fully sent
+	canaryLatch     map[string]uint8  // canary name -> states already reported
+	// The history of the last chat request, as a count and rolling digest: the
+	// next request that still starts with it has only its tail to inspect.
+	prefixN    int
+	prefixRoll digest
+	// The one indirect-injection snapshot a session keeps: the newest gate's
+	// triggering text. A newer gate supersedes the older issuance.
+	snap snapshot
+	// Registry losses: records dropped to stay bounded, and the open ones among
+	// them. A loss lowers confidence and never verifies anything.
+	evicted, lost int
 }
 
 // Lead returns the first valid model declaration, which is a lead, not proof.
@@ -178,9 +193,11 @@ func (s *Store) newSession(key string, now time.Time) *Session {
 				"." + base64.RawURLEncoding.EncodeToString(s.bytes(24)),
 			Payout: "sk-local-" + strings.ToLower(s.hex(18)),
 		},
-		Created:    now,
-		LastSeen:   now,
-		statusHits: make(map[string]time.Time),
+		Created:         now,
+		LastSeen:        now,
+		canaryIssued:    make(map[string]bool),
+		canaryDelivered: make(map[string]uint64),
+		canaryLatch:     make(map[string]uint8),
 	}
 }
 

@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -250,7 +251,32 @@ func (c *call) contentType() string {
 func (c *call) sendBody(status int, body []byte) {
 	c.w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	c.w.WriteHeader(status)
-	_, _ = c.w.Write(body)
+	n, err := c.w.Write(body)
+	c.markSent(n, len(body), err)
+}
+
+// markSent reports a whole-body write to the issuance of the probe this call
+// is answering, if there is one. The body counts as fully sent only when the
+// write and a flush both succeed, so a client that already left does not. A
+// writer that cannot flush cannot confirm delivery: that is unknown.
+func (c *call) markSent(n, total int, err error) {
+	if c.iss == nil {
+		return
+	}
+	if err != nil || n != total {
+		if n > 0 {
+			c.iss.Partial()
+		}
+		return
+	}
+	switch ferr := c.rc.Flush(); {
+	case ferr == nil:
+		c.iss.Full()
+	case errors.Is(ferr, http.ErrNotSupported):
+		c.iss.Unknown()
+	case n > 0:
+		c.iss.Partial()
+	}
 }
 
 func (c *call) jsonStatus(status int, v any) {

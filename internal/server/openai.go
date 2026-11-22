@@ -676,8 +676,10 @@ func (s *Server) serveInference(c *call, k kind) {
 		s.serveLoad(c, f.(*ollamaFormat), p.unload)
 		return
 	}
+	p.req.ID, p.req.Admission = c.id, c.adm
 	d := s.cfg.Responder.Decide(c.key, p.req)
 	c.dec = &d
+	c.iss = d.Issuance
 	c.probeText = d.Probe.Text
 	if d.Probe.Status >= http.StatusBadRequest {
 		if d.Probe.RetryAfter > 0 {
@@ -690,6 +692,7 @@ func (s *Server) serveInference(c *call, k kind) {
 	if p.jsonMode {
 		text = string(marshal(map[string]string{"status": "pending", "message": text}))
 		text = strings.TrimSuffix(text, "\n")
+		c.iss.Sent(text) // the client sees the wrapped text, not the probe text
 	}
 	if p.stream {
 		c.stream(f, text, d.Probe.Hold)
@@ -829,7 +832,7 @@ func (s *Server) cancelResponse(c *call) {
 
 func (s *Server) edgeStatus(c *call) {
 	label := c.params["label"]
-	obs, done, ok := s.cfg.Responder.StatusHit(c.key, label)
+	obs, done, ok := s.cfg.Responder.StatusHit(c.key, label, c.adm)
 	if !ok {
 		s.notFound(c)
 		return

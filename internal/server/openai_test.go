@@ -432,6 +432,13 @@ func TestEdgeStatus(t *testing.T) {
 
 func TestEdgeStatusOverlap(t *testing.T) {
 	r := newRig(t, PersonaOpenAI)
+	// Status hits only count against a concurrency response that was fully
+	// sent before they arrived.
+	r.pin("concurrency")
+	r.warm()
+	if rec := r.do("POST", "/v1/chat/completions", chatBody); rec.Code != 200 {
+		t.Fatalf("concurrency gate: status %d", rec.Code)
+	}
 	gate := make(chan time.Time)
 	r.clk.setGate(gate)
 	done := make(chan int, 4)
@@ -446,18 +453,23 @@ func TestEdgeStatusOverlap(t *testing.T) {
 		}
 	}
 	peak := 0
-	probes := r.sink.stream(telemetry.StreamProbe)
-	if len(probes) != 4 {
-		t.Fatalf("%d probe events, want 4", len(probes))
+	var hits []telemetry.Event
+	for _, e := range r.sink.stream(telemetry.StreamProbe) {
+		if e.Action == "status_hit" {
+			hits = append(hits, e)
+		}
 	}
-	for _, e := range probes {
-		if e.Action != "status_hit" || e.SessionID == "" {
+	if len(hits) != 4 {
+		t.Fatalf("%d status hit events, want 4", len(hits))
+	}
+	for _, e := range hits {
+		if e.SessionID == "" {
 			t.Fatalf("probe event = %+v", e)
 		}
 		obs, _ := e.Attrs["observations"].([]responder.Observation)
 		for _, o := range obs {
-			if o.ProbeID != "concurrency" {
-				t.Fatalf("probe %q", o.ProbeID)
+			if o.ProbeID != "concurrency" || o.Result["bound"] != "true" {
+				t.Fatalf("probe %q %v", o.ProbeID, o.Result)
 			}
 			p, err := strconv.Atoi(o.Result["peak"])
 			if err != nil {

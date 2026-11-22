@@ -196,16 +196,21 @@ type call struct {
 	tools      int
 	parallel   *bool
 	dec        *responder.Decision
+	adm        uint64              // admission tick, taken when the request arrived
+	iss        *responder.Issuance // the probe response this call is sending; nil otherwise
 	probeText  string
 	obs        []responder.Observation
 	holdResult string
 	holdMS     int64
 	streamCut  string // why frame emission stopped early, if it did
+	noFlush    bool   // the writer cannot flush, so acceptance is unconfirmed
+	termFailed bool   // the closing stream frame failed after the content was sent
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	rid := randHex(16)
 	c := &call{s: s, r: r, id: rid[:16], start: s.cfg.Now(), w: &recorder{ResponseWriter: w, keep: s.logRawLimit()}}
+	c.adm = s.cfg.Responder.Admit() // before any read: a probe delivered after this is not this request's
 	c.rc = http.NewResponseController(w)
 	c.src = s.source(r)
 	c.ua = r.UserAgent()
@@ -215,6 +220,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	s.personaHeaders(c, rid)
 	defer s.finish(c)
 	defer c.recoverPanic()
+	defer c.finalize()
 	c.extendWriteDeadline()
 
 	release, ok := s.acquire(c.src)
@@ -254,6 +260,14 @@ func (c *call) extendWriteDeadline() {
 	_ = c.rc.SetWriteDeadline(time.Now().Add(c.s.cfg.MaxStreamDuration + c.s.cfg.Timing.MaxTotal + 15*time.Second))
 }
 
+// finalize settles the delivery state of the issuance on every handler exit,
+// so a response nothing was written for never stays "selected".
+func (c *call) finalize() {
+	if c.dec != nil {
+		c.dec.Issuance.Finalize()
+	}
+}
+
 // recoverPanic turns a handler panic into the persona's 500. The request is
 // logged with panic=true rather than as a client that left.
 func (c *call) recoverPanic() {
@@ -266,6 +280,8 @@ func (c *call) recoverPanic() {
 	}
 	c.panicked = true
 	c.panicInfo = truncRunes(cleanEcho(fmt.Sprint(v), 256), 256)
+	c.iss.Unknown() // the 500 below is not the probe response
+	c.iss = nil
 	if c.w.status != 0 {
 		return
 	}
@@ -455,6 +471,9 @@ func (c *call) wait(total, every time.Duration, idle func() bool) bool {
 	}
 	c.holdResult = result
 	c.holdMS = s.cfg.Now().Sub(began).Milliseconds()
+	if result != "completed" {
+		c.iss.Cut() // a hold the client left is a delivery fact, not a reply
+	}
 	return result == "completed"
 }
 

@@ -161,6 +161,24 @@ func (s *Server) emitProbe(c *call, now time.Time, sessionID, ua, resource, resu
 		attrs["ticket"] = d.Ticket
 		attrs["nonce"] = d.Nonce
 		attrs["behavior"] = d.Behavior
+		if d.Issuance != nil {
+			// What the server wrote, not what the client read.
+			attrs["issuance"] = d.Issuance.ID
+			attrs["delivery"] = string(d.Issuance.State())
+		}
+		if d.IssuancesEvicted > 0 {
+			attrs["issuance_evicted"] = d.IssuancesEvicted
+		}
+		if d.IssuancesLost > 0 {
+			attrs["issuance_lost"] = d.IssuancesLost
+		}
+		if c.termFailed {
+			// The content was accepted; only the closing frame failed.
+			attrs["terminal_frame"] = "failed"
+		}
+		if len(d.CanariesIssued) > 0 {
+			attrs["canaries_issued"] = d.CanariesIssued
+		}
 		attrs["new_session"] = d.NewSession
 		attrs["session_age_ms"] = d.SessionAge.Milliseconds()
 		if d.Probe.Hold != "" {

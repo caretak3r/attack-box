@@ -80,7 +80,11 @@ type Input struct {
 	// Latest is the last non-empty operator-authored message. Follow-up
 	// extractors read it so earlier turns in a resent history do not count
 	// as the reply. Empty means Text has no separable last message.
-	Latest    string
+	Latest string
+	// Messages is the request's turn history in order, when it has one. It
+	// includes assistant turns, which are the client's claims about what the
+	// server said. Reply attribution reads it; classification does not.
+	Messages  []Message
 	HasTools  bool // the request declares tools or functions
 	ToolForce bool // tool_choice forces a function
 }

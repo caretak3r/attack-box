@@ -71,6 +71,12 @@ expect "openai responses sse" 'event: response.completed' \
 	"$(c -N -H "$json" -H 'Authorization: Bearer sk-smoke-responses-not-a-real-key' -d '{"model":"qwen3:8b","stream":true,"input":"hello"}' "$o/v1/responses")"
 expect "openai unknown model" '"code":"model_not_found"' \
 	"$(c -H "$json" -d '{"model":"nope","messages":[{"role":"user","content":"hi"}]}' "$o/v1/chat/completions")"
+# A genuine reply to the registration gate: the same history plus the field the
+# gate asked for, on its own credential so no other request shares the session.
+fu='Authorization: Bearer sk-smoke-followup-not-a-real-key'
+c -o /dev/null -H "$json" -H "$fu" -d '{"model":"qwen3:8b","messages":[{"role":"user","content":"hello"}]}' "$o/v1/chat/completions"
+expect "openai follow-up reply" '"object":"chat.completion"' \
+	"$(c -H "$json" -H "$fu" -d '{"model":"qwen3:8b","metadata":{"client_model":"acme/coder-2.1"},"messages":[{"role":"user","content":"hello"}]}' "$o/v1/chat/completions")"
 expect "vllm version" '"version"' "$(c "$v/version")"
 expect "vllm metrics" 'vllm:' "$(c "$v/metrics")"
 expect "vllm openapi" '"/invocations"' "$(c "$v/openapi.json")"
@@ -97,6 +103,7 @@ expect "log response capture" '"direction":"response"' "$log"
 expect "log sse response body" 'data: [DONE]' "$(grep '"direction":"response"' "$work/attackbox.log")"
 expect "log probe stream" '"stream":"probe"' "$log"
 expect "log probe nonce" '"nonce":"' "$(grep '"stream":"probe"' "$work/attackbox.log")"
+expect "log follow-up attribution" '"followup":"register-model"' "$(grep '"stream":"probe"' "$work/attackbox.log")"
 for m in requests probes sessions probe_followups request_bytes response_bytes session_duration_seconds; do
 	expect "metric attackbox.$m" "\"name\":\"attackbox.$m\"" "$log"
 done
