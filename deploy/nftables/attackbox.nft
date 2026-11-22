@@ -19,9 +19,6 @@ define dns_servers_ipv6 = { 2606:4700:4700::1111, 2606:4700:4700::1001 }
 # NTP servers (Cloudflare)
 define ntp_servers = { 162.159.200.123, 162.159.200.1 }
 
-# Ubuntu security update mirrors (populated at runtime)
-define ubuntu_mirrors_ipv4 = {}
-define ubuntu_mirrors_ipv6 = {}
 
 table inet attackbox {
     # New Relic destination IPs (populated at runtime via DNS)
@@ -48,9 +45,9 @@ table inet attackbox {
         # Allow established/related (Docker NAT return traffic)
         ct state established,related accept
 
-        # Allow external → TLS proxy (ports 8080, 8443)
-        # These are DNAT'd by Docker to the proxy container
-        iifname != "docker0" iifname != "br-*" tcp dport { 8080, 8443 } accept
+        # Allow external → proxy (DNAT'd to proxy container on docker0/br-*)
+        oifname "docker0" tcp dport { 8080, 8443 } accept
+        oifname "br-*" tcp dport { 8080, 8443 } accept
 
         # Drop NEW container-originated forwarding (both proxy and bait)
         # Containers need no outbound Internet

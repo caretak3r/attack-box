@@ -35,6 +35,22 @@ test_start_bait() { grep -q "start_bait" "$DEPLOY_SCRIPT"; }
 test_ubuntu_mirrors() { grep -q "resolve_ubuntu_mirrors\|ubuntu_ipv4" "$DEPLOY_SCRIPT"; }
 test_metadata_forward_blocking() { local nft="${SCRIPT_DIR}/../deploy/nftables/attackbox.nft"; grep -q "169.254.169.254" "$nft" && grep -q "forward_early" "$nft" && grep -q "priority -150" "$nft"; }
 test_private_network_blocking() { local nft="${SCRIPT_DIR}/../deploy/nftables/attackbox.nft"; grep -q "10.0.0.0/8" "$nft" && grep -q "172.16.0.0/12" "$nft" && grep -q "192.168.0.0/16" "$nft"; }
+test_no_alpine_anywhere() { ! grep -q "alpine" "$DEPLOY_SCRIPT"; }
+test_gvisor_overlay_in_service() { grep -q "compose.gvisor.yaml" "${SCRIPT_DIR}/../deploy/systemd/attackbox.service"; }
+test_runsc_host_uds_documented() { grep -q "host-uds=open" "${SCRIPT_DIR}/../compose.gvisor.yaml"; }
+test_secret_installation() { grep -q "redaction.key\|server.crt\|server.key" "$DEPLOY_SCRIPT" && grep -q "/opt/attackbox/secrets" "$DEPLOY_SCRIPT"; }
+test_shipper_export_installation() { grep -q "shipper-export" "$DEPLOY_SCRIPT" && grep -q "/usr/local/bin/attackbox-shipper" "$DEPLOY_SCRIPT"; }
+test_mirror_population_after_table() { local resolve_line=$(grep -n "resolve_ubuntu_mirrors" "$DEPLOY_SCRIPT" | grep -v "^resolve_ubuntu_mirrors()" | head -1 | cut -d: -f1); local nft_line=$(grep -n "nft -f.*nft_rules" "$DEPLOY_SCRIPT" | head -1 | cut -d: -f1); [[ -n "$resolve_line" && -n "$nft_line" && "$nft_line" -lt "$resolve_line" ]]; }
+test_no_ubuntu_mirrors_define() { ! grep -q "define ubuntu_mirrors" "${SCRIPT_DIR}/../deploy/nftables/attackbox.nft"; }
+test_proxy_oifname_restriction() { local nft="${SCRIPT_DIR}/../deploy/nftables/attackbox.nft"; grep -q 'oifname "docker0"' "$nft" && grep -q 'oifname "br-\*"' "$nft"; }
+test_verification_derives_network() { grep -q "docker network ls.*grep.*attackbox_internal" "$DEPLOY_SCRIPT"; }
+test_verification_runsc() { grep -q "docker run.*--runtime=runsc.*--network" "$DEPLOY_SCRIPT"; }
+test_verification_internal_dns() { grep -q "nslookup attackbox-proxy" "$DEPLOY_SCRIPT"; }
+test_verification_external_dns_blocked() { grep -q "External DNS blocked" "$DEPLOY_SCRIPT"; }
+test_verification_curl_nr() { grep -q "sudo.*curl" "$DEPLOY_SCRIPT" && grep -q 'url="https.*host' "$DEPLOY_SCRIPT"; }
+test_verification_before_ssh() { local ver_line=$(grep -n "run_verification_enhanced" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:run_verification_enhanced()" | tail -1 | cut -d: -f1); local ssh_line=$(grep -n "disable_ssh" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:disable_ssh()" | head -1 | cut -d: -f1); [[ -n "$ver_line" && -n "$ssh_line" && "$ver_line" -lt "$ssh_line" ]]; }
+test_no_host_attackbox_binary() { ! grep -q '"/usr/local/bin/attackbox"' "$DEPLOY_SCRIPT"; }
+test_busybox_prepull() { grep -q "docker pull busybox@sha256:" "$DEPLOY_SCRIPT"; }
 main() {
     echo "Attack-box deployment test suite - Full Semantic Controls"; echo "=========================================================="
     [[ ! -f "$DEPLOY_SCRIPT" ]] && { echo -e "${RED}✗${NC} Deploy script not found"; exit 1; }
@@ -68,6 +84,22 @@ main() {
     run_test "Ubuntu mirrors" test_ubuntu_mirrors
     run_test "Metadata forward blocking" test_metadata_forward_blocking
     run_test "Private network blocking" test_private_network_blocking
+    run_test "No alpine anywhere" test_no_alpine_anywhere
+    run_test "gVisor overlay in service" test_gvisor_overlay_in_service
+    run_test "runsc host-uds documented" test_runsc_host_uds_documented
+    run_test "Secret installation" test_secret_installation
+    run_test "Shipper export installation" test_shipper_export_installation
+    run_test "Mirror population after table load" test_mirror_population_after_table
+    run_test "No ubuntu_mirrors define" test_no_ubuntu_mirrors_define
+    run_test "Proxy oifname restriction" test_proxy_oifname_restriction
+    run_test "Verification derives network" test_verification_derives_network
+    run_test "Verification uses runsc" test_verification_runsc
+    run_test "Verification internal DNS" test_verification_internal_dns
+    run_test "Verification external DNS blocked" test_verification_external_dns_blocked
+    run_test "Verification uses curl for NR" test_verification_curl_nr
+    run_test "Verification before SSH" test_verification_before_ssh
+    run_test "No host attackbox binary" test_no_host_attackbox_binary
+    run_test "Busybox prepull" test_busybox_prepull
     echo ""; echo "=========================================================="; echo "Test Results"; echo "=========================================================="
     echo "Tests run:    $TESTS_RUN"; echo -e "Tests passed: ${GREEN}$TESTS_PASSED${NC}"
     if [[ $TESTS_FAILED -gt 0 ]]; then echo -e "Tests failed: ${RED}$TESTS_FAILED${NC}"; exit 1; else echo -e "Tests failed: 0"; echo ""; echo -e "${GREEN}✓${NC} All tests passed"; exit 0; fi
