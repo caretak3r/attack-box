@@ -476,3 +476,49 @@ func TestStreamStopsOnCancelDuringFrames(t *testing.T) {
 		})
 	}
 }
+
+// failWriter fails every body write after the Nth, as a socket does once the
+// peer is gone.
+type failWriter struct {
+	*httptest.ResponseRecorder
+	ok     int
+	writes int
+}
+
+func (w *failWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes > w.ok {
+		return 0, io.ErrClosedPipe
+	}
+	return w.ResponseRecorder.Write(p)
+}
+
+// TestStreamWriteErrorLogsCut checks that a failed frame write is logged as a
+// cut stream, not left looking like a complete one.
+func TestStreamWriteErrorLogsCut(t *testing.T) {
+	body := strings.Replace(chatBody, `"model"`, `"stream":true,"model"`, 1)
+	r := newRig(t, PersonaOpenAI)
+	r.warm()
+	w := &failWriter{ResponseRecorder: httptest.NewRecorder(), ok: 2}
+	r.h.ServeHTTP(w, request("POST", "/v1/chat/completions", body))
+	if strings.Contains(w.Body.String(), "[DONE]") {
+		t.Fatal("stream finished despite failed writes")
+	}
+	if got := r.sink.lastEdge(t).Attrs["stream_result"]; got != "client_closed" {
+		t.Fatalf("stream_result = %v", got)
+	}
+}
+
+// TestWaitCompletedBeatsShutdown checks that a hold whose full duration has
+// elapsed is reported completed even when shutdown is ready at the same time.
+func TestWaitCompletedBeatsShutdown(t *testing.T) {
+	r := newRig(t, PersonaOpenAI)
+	for i := 0; i < 200; i++ {
+		ctx, cut := context.WithCancelCause(context.Background())
+		cut(ErrShutdown)
+		c := &call{s: r.srv, r: request("GET", "/", "").WithContext(ctx)}
+		if !c.wait(time.Second, time.Second, nil) || c.holdResult != "completed" {
+			t.Fatalf("run %d: hold_result = %q", i, c.holdResult)
+		}
+	}
+}

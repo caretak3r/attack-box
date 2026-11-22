@@ -52,11 +52,15 @@ func (c *call) stream(f format, text, hold string) {
 				continue
 			}
 			if _, err := w.Write(fr); err != nil {
+				c.streamCut = "client_closed"
 				return false
 			}
 		}
-		err := rc.Flush()
-		return err == nil || errors.Is(err, http.ErrNotSupported)
+		if err := rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			c.streamCut = "client_closed"
+			return false
+		}
+		return true
 	}
 
 	if !emit(f.start()...) {

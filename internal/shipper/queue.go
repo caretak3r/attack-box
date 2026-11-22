@@ -65,7 +65,8 @@ import (
 // and checkpoint, so there is a single queue owner.
 //
 // Limit: an I/O error during Append, Ack or checkpoint leaves the on-disk
-// state unknown, so the queue fails every later call; restart to recover.
+// state unknown, so the queue fails every later call with ErrQueueBroken; the
+// shipper must exit and restart to recover.
 type Queue struct {
 	mu   sync.Mutex
 	cfg  QueueConfig
@@ -143,6 +144,12 @@ var (
 	ErrQueueFull   = errors.New("shipper queue: role or total byte bound reached")
 	ErrTooLarge    = errors.New("shipper queue: record can never fit the queue")
 	ErrQueueClosed = errors.New("shipper queue: closed")
+
+	// ErrQueueBroken marks a queue that hit an I/O error. The on-disk state
+	// is unknown, so every later call returns it (test with errors.Is) and
+	// the queue never works again in this process: the shipper must stop and
+	// be restarted, which re-runs recovery.
+	ErrQueueBroken = errors.New("shipper queue: broken")
 )
 
 // QueueConfig bounds a Queue. All byte limits count FrameHeader plus payload.
@@ -699,7 +706,7 @@ func (q *Queue) usable() error {
 }
 
 func (q *Queue) fail(err error) error {
-	q.err = fmt.Errorf("shipper queue: %w (restart to recover)", err)
+	q.err = fmt.Errorf("%w: %w (restart to recover)", ErrQueueBroken, err)
 	return q.err
 }
 

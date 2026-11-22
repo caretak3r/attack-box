@@ -439,8 +439,9 @@ func TestQueueDetectsTamperOnRead(t *testing.T) {
 	if _, err := q.Read(10, 1<<20); err == nil {
 		t.Fatal("changed frame was delivered")
 	}
-	if _, err := q.Append([]Item{{Role: RoleBait, Data: payload(9)}}); err == nil {
-		t.Fatal("queue kept working after a read failure")
+	_, err = q.Append([]Item{{Role: RoleBait, Data: payload(9)}})
+	if !errors.Is(err, ErrQueueBroken) {
+		t.Fatalf("Append after a read failure = %v, want ErrQueueBroken", err)
 	}
 }
 

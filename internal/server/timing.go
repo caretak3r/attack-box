@@ -45,7 +45,7 @@ func (t Timing) normalize() (Timing, error) {
 	if t.FirstToken < 0 || t.PerChunk < 0 || t.SentencePause < 0 || t.MaxTotal < 0 {
 		return t, errors.New("server: Timing durations must not be negative")
 	}
-	if t.Jitter < 0 || t.Jitter > 0.5 {
+	if !(t.Jitter >= 0 && t.Jitter <= 0.5) { // also rejects NaN
 		return t, fmt.Errorf("server: Timing.Jitter %v is outside 0 to 0.5", t.Jitter)
 	}
 	if t.MaxTotal > maxTimingTotal {

@@ -11,8 +11,10 @@ import (
 
 // Async moves a possibly blocking sink (JSONLog on a stalled pipe or disk) off
 // the request path. Calls enqueue into a bounded queue and never block; when
-// the queue is full the item is dropped and counted. One goroutine delivers in
-// order, so the wrapped sink needs no extra locking.
+// the queue is full the item is dropped and counted; the count is also
+// written to the wrapped sink as a local_dropped runtime event once the queue
+// drains. One goroutine delivers in order, so the wrapped sink needs no extra
+// locking.
 type Async struct {
 	next    Sink
 	queue   chan asyncItem
@@ -44,6 +46,7 @@ func NewAsync(next Sink, size int) *Async {
 
 func (a *Async) run() {
 	defer close(a.done)
+	var reported int64
 	for it := range a.queue {
 		switch {
 		case !it.metric:
@@ -52,6 +55,13 @@ func (a *Async) run() {
 			a.next.Count(it.name, it.value, it.attrs)
 		default:
 			a.next.Gauge(it.name, it.value, it.attrs)
+		}
+		// Report drops once the queue has drained: a stalled writer shows the
+		// loss as soon as it recovers, and the record cannot crowd out the
+		// backlog.
+		if d := a.dropped.Load(); d != reported && len(a.queue) == 0 {
+			reported = d
+			a.next.Emit(Event{Stream: StreamRuntime, Action: "local_dropped", Result: "error", Attrs: map[string]any{"dropped_total": d}})
 		}
 	}
 }
