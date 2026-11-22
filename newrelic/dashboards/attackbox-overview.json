@@ -22,7 +22,7 @@
             "nrqlQueries": [
               {
                 "accountId": 0,
-                "query": "FROM Metric SELECT uniqueCount(session_id) AS 'Sessions' WHERE metricName = 'attackbox.requests' SINCE 1 hour ago"
+                "query": "FROM Metric SELECT sum(attackbox.sessions) AS 'Sessions' WHERE metricName = 'attackbox.sessions' SINCE 1 hour ago"
               }
             ]
           }
@@ -42,7 +42,7 @@
             "nrqlQueries": [
               {
                 "accountId": 0,
-                "query": "FROM Metric SELECT rate(sum(attackbox.requests), 1 minute) AS 'Requests/min' WHERE metricName = 'attackbox.requests' TIMESERIES AUTO FACET persona"
+                "query": "FROM Metric SELECT rate(sum(attackbox.requests), 1 minute) AS 'Requests/min' WHERE metricName = 'attackbox.requests' FACET persona TIMESERIES AUTO"
               }
             ]
           }
@@ -118,7 +118,7 @@
           }
         },
         {
-          "title": "Canary Activity (Deduped)",
+          "title": "Probe Observations (Pending Validation)",
           "layout": {
             "column": 1,
             "row": 7,
@@ -132,7 +132,7 @@
             "nrqlQueries": [
               {
                 "accountId": 0,
-                "query": "FROM Log SELECT latest(timestamp) AS 'Time', latest(session_id) AS 'Session', latest(src_ip) AS 'Source', latest(action) AS 'Action' WHERE stream = 'probe' AND action = 'canary-reuse' AND record_id IS NOT NULL FACET record_id, body_sha256, chunk_index SINCE 1 hour ago LIMIT 50"
+                "query": "FROM Log SELECT latest(timestamp) AS 'Time', latest(session_id) AS 'Session', latest(src_ip) AS 'Source' WHERE stream = 'probe' AND action = 'decision' AND record_id IS NOT NULL FACET record_id, body_sha256, chunk_index SINCE 1 hour ago LIMIT 50"
               }
             ]
           }
@@ -172,7 +172,7 @@
             "nrqlQueries": [
               {
                 "accountId": 0,
-                "query": "FROM Metric SELECT rate(sum(attackbox.requests), 1 minute) WHERE metricName = 'attackbox.requests' TIMESERIES AUTO FACET persona"
+                "query": "FROM Metric SELECT rate(sum(attackbox.requests), 1 minute) WHERE metricName = 'attackbox.requests' FACET persona TIMESERIES AUTO"
               }
             ]
           }
@@ -184,7 +184,7 @@
       "description": "Critical security signals and blocked activity",
       "widgets": [
         {
-          "title": "Falco Critical Events (Deduped)",
+          "title": "Falco Events (Deduped, Pending Validation)",
           "layout": {
             "column": 1,
             "row": 1,
@@ -198,13 +198,13 @@
             "nrqlQueries": [
               {
                 "accountId": 0,
-                "query": "FROM Log SELECT latest(timestamp) AS 'Time', latest(action) AS 'Action', latest(resource) AS 'Details' WHERE stream = 'runtime' AND action = 'falco' AND priority IN ('Critical', 'Emergency') AND record_id IS NOT NULL FACET record_id, body_sha256, chunk_index SINCE 1 hour ago LIMIT 100"
+                "query": "FROM Log SELECT latest(timestamp) AS 'Time', latest(action) AS 'Action', latest(resource) AS 'Details' WHERE stream = 'runtime' AND action = 'falco' AND record_id IS NOT NULL FACET record_id, body_sha256, chunk_index SINCE 1 hour ago LIMIT 100"
               }
             ]
           }
         },
         {
-          "title": "Blocked Egress Attempts (Deduped)",
+          "title": "Blocked Egress (Deduped, Pending Validation)",
           "layout": {
             "column": 1,
             "row": 5,
@@ -218,7 +218,7 @@
             "nrqlQueries": [
               {
                 "accountId": 0,
-                "query": "FROM Log SELECT latest(timestamp) AS 'Time', latest(dst_ip) AS 'Destination', latest(dst_port) AS 'Port', latest(proto) AS 'Protocol' WHERE stream = 'egress' AND action = 'egress_blocked' AND record_id IS NOT NULL FACET record_id, body_sha256, chunk_index SINCE 1 hour ago LIMIT 100"
+                "query": "FROM Log SELECT latest(timestamp) AS 'Time', latest(event.dst_ip) AS 'Destination', latest(event.dst_port) AS 'Port', latest(event.proto) AS 'Protocol' WHERE stream = 'egress' AND action = 'egress_blocked' AND record_id IS NOT NULL FACET record_id, body_sha256, chunk_index SINCE 1 hour ago LIMIT 100"
               }
             ]
           }
@@ -320,7 +320,7 @@
           }
         },
         {
-          "title": "Ingest Errors",
+          "title": "Shipper Metrics",
           "layout": {
             "column": 9,
             "row": 1,
@@ -334,7 +334,7 @@
             "nrqlQueries": [
               {
                 "accountId": 0,
-                "query": "FROM Log SELECT count(*) AS 'Errors' WHERE stream = 'runtime' AND action = 'newrelic_error' SINCE 10 minutes ago"
+                "query": "FROM Metric SELECT latest(attackbox.telemetry.ingest_errors_total) AS 'Errors', latest(attackbox.heartbeat) AS 'Heartbeat' WHERE metricName IN ('attackbox.telemetry.ingest_errors_total', 'attackbox.heartbeat') SINCE 10 minutes ago"
               }
             ],
             "thresholds": [

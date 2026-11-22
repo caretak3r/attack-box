@@ -57,14 +57,14 @@ alerts:
         operator: ABOVE
         threshold: 90000
 
-  - name: "AttackBox - Falco Critical Event"
+  - name: "AttackBox - Falco Critical Event (Pending Validation)"
     type: NRQL
-    description: "Falco detected a critical host event (sandbox escape, privilege escalation)"
+    description: "Falco detected a critical host event (sandbox escape, privilege escalation). Query pending adapter field validation."
     enabled: true
     violation_time_limit_seconds: 600
     nrql:
-      # Dedup by (record_id, body_sha256, chunk_index) to avoid replay/duplicate alerts
-      query: "FROM Log SELECT uniqueCount(record_id) WHERE stream = 'runtime' AND action = 'falco' AND priority IN ('Critical', 'Emergency')"
+      # Counts all events; adapter field structure requires deployment validation
+      query: "FROM Log SELECT count(*) WHERE stream = 'runtime' AND action = 'falco'"
     signal:
       aggregation_window: 60
       evaluation_offset: 3
@@ -97,13 +97,13 @@ alerts:
         operator: ABOVE
         threshold: 50
 
-  - name: "AttackBox - Ingest Error Spike"
+  - name: "AttackBox - Ingest Error Rate (Pending Validation)"
     type: NRQL
-    description: "High rate of New Relic ingest errors (quota exhaustion, authentication failure)"
+    description: "High rate of ingest errors. Field names require deployment validation against actual sink error events."
     enabled: true
     violation_time_limit_seconds: 1800
     nrql:
-      query: "FROM Log SELECT count(*) WHERE stream = 'runtime' AND action = 'newrelic_error'"
+      query: "FROM Metric SELECT latest(attackbox.telemetry.ingest_errors_total) WHERE metricName = 'attackbox.telemetry.ingest_errors_total'"
     signal:
       aggregation_window: 60
       evaluation_offset: 3
@@ -158,14 +158,14 @@ alerts:
         operator: ABOVE
         threshold: 234881024  # 224 MB (87.5% of 256 MB)
 
-  - name: "AttackBox - Canary Token Reused"
+  - name: "AttackBox - Probe Observations (Pending Validation)"
     type: NRQL
-    description: "Client returned a session-unique canary credential (credential leakage behavior)"
+    description: "Client probe observations detected. Observation field structure requires deployment validation."
     enabled: true
     violation_time_limit_seconds: 3600
     nrql:
-      # Dedup canary events by chunk identity
-      query: "FROM Log SELECT uniqueCount(record_id) WHERE stream = 'probe' AND action = 'canary-reuse'"
+      # Counts decision events; observation array queries require deployment validation
+      query: "FROM Log SELECT count(*) WHERE stream = 'probe' AND action = 'decision'"
     signal:
       aggregation_window: 60
       evaluation_offset: 3

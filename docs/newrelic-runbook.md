@@ -115,10 +115,10 @@ Run these queries within **10 minutes** of deploying the decoy to confirm all te
 ### 1. All Six Streams Active
 
 ```nrql
-FROM Log 
-SELECT count(*) 
-WHERE stream IN ('edge', 'transcript', 'probe', 'runtime', 'egress', 'heartbeat') 
-FACET stream 
+FROM Log
+SELECT count(*)
+WHERE stream IN ('edge', 'transcript', 'probe', 'runtime', 'egress', 'heartbeat')
+FACET stream
 SINCE 10 minutes ago
 ```
 
@@ -139,10 +139,10 @@ SINCE 10 minutes ago
 ### 2. Heartbeat Sources Present
 
 ```nrql
-FROM Log 
+FROM Log
 SELECT count(*) AS 'Events', latest(timestamp) AS 'Last Event'
-WHERE stream = 'heartbeat' 
-FACET source 
+WHERE stream = 'heartbeat'
+FACET source
 SINCE 10 minutes ago
 ```
 
@@ -159,10 +159,10 @@ Both should update within the last **90 seconds**.
 ### 3. Metrics Flowing
 
 ```nrql
-FROM Metric 
-SELECT count(*) 
-WHERE metricName LIKE 'attackbox.%' 
-FACET metricName 
+FROM Metric
+SELECT count(*)
+WHERE metricName LIKE 'attackbox.%'
+FACET metricName
 SINCE 10 minutes ago
 ```
 
@@ -188,8 +188,8 @@ curl -X POST https://<decoy-ip>/v1/chat/completions \
 ### 4. Bait Liveness
 
 ```nrql
-FROM Log 
-SELECT latest(bait_connected) AS 'Connected', 
+FROM Log
+SELECT latest(bait_connected) AS 'Connected',
        latest(last_bait_record_age_ms) / 1000 AS 'Age (sec)',
        latest(spool_clients) AS 'Clients'
 WHERE stream = 'heartbeat' AND source = 'shipper'
@@ -208,7 +208,7 @@ SINCE 5 minutes ago
 ### 5. Queue Health
 
 ```nrql
-FROM Log 
+FROM Log
 SELECT latest(queue_bytes) / 1048576 AS 'Queue (MB)',
        latest(queue_backlog_bytes) / 1048576 AS 'Backlog (MB)',
        latest(ship_dropped_total) AS 'Dropped'
@@ -225,8 +225,8 @@ SINCE 5 minutes ago
 ### 6. No Integration Errors
 
 ```nrql
-FROM NrIntegrationError 
-SELECT count(*) 
+FROM NrIntegrationError
+SELECT count(*)
 SINCE 10 minutes ago
 ```
 
@@ -235,9 +235,9 @@ SINCE 10 minutes ago
 **Nonzero:** Ingest API failures, quota exhaustion, malformed payloads, or authentication errors. Check details:
 
 ```nrql
-FROM NrIntegrationError 
-SELECT timestamp, message, newRelicFeature 
-SINCE 1 hour ago 
+FROM NrIntegrationError
+SELECT timestamp, message, newRelicFeature
+SINCE 1 hour ago
 LIMIT 100
 ```
 
@@ -273,10 +273,10 @@ LIMIT 100
 **Action:**
 1. Check logs for `runtime`/`stopped` events:
    ```nrql
-   FROM Log 
-   SELECT timestamp, action, reason, nr_sent, nr_dropped 
-   WHERE stream = 'runtime' AND action = 'stopped' 
-   ORDER BY timestamp DESC 
+   FROM Log
+   SELECT timestamp, action, reason, nr_sent, nr_dropped
+   WHERE stream = 'runtime' AND action = 'stopped'
+   ORDER BY timestamp DESC
    LIMIT 10
    ```
 2. If the decoy is otherwise healthy (shipper heartbeat present), restart the container:
@@ -293,10 +293,10 @@ LIMIT 100
 1. Restart the bait container: `systemctl restart attackbox`
 2. Inspect the last records:
    ```nrql
-   FROM Log 
-   SELECT timestamp, stream, action, session_id 
-   WHERE source = 'bait' 
-   ORDER BY timestamp DESC 
+   FROM Log
+   SELECT timestamp, stream, action, session_id
+   WHERE source = 'bait'
+   ORDER BY timestamp DESC
    LIMIT 20
    ```
 3. If the issue recurs, the hung state may indicate a code bug or an attack; rebuild after inspection.
@@ -311,13 +311,13 @@ LIMIT 100
 1. **Power off immediately.**
 2. Examine the Falco event (deduped):
    ```nrql
-   FROM Log 
+   FROM Log
    SELECT latest(timestamp) AS 'Time',
           latest(resource) AS 'Resource',
           latest(priority) AS 'Priority',
           latest(rule) AS 'Rule'
-   WHERE stream = 'runtime' 
-     AND action = 'falco' 
+   WHERE stream = 'runtime'
+     AND action = 'falco'
      AND priority IN ('Critical', 'Emergency')
    FACET record_id, body_sha256, chunk_index
    SINCE 1 hour ago
@@ -337,7 +337,7 @@ LIMIT 100
 **Action:**
 1. Check blocked destinations:
    ```nrql
-   FROM Log 
+   FROM Log
    SELECT latest(timestamp) AS 'Time',
           latest(dst_ip) AS 'Destination',
           latest(dst_port) AS 'Port'
@@ -348,7 +348,7 @@ LIMIT 100
    ```
 2. Identify the session(s):
    ```nrql
-   FROM Log 
+   FROM Log
    SELECT session_id, count(*) AS 'Blocks'
    WHERE stream = 'egress' AND action = 'egress_blocked'
    SINCE 1 hour ago
@@ -368,10 +368,10 @@ LIMIT 100
 **Action:**
 1. Check error messages:
    ```nrql
-   FROM Log 
-   SELECT timestamp, error_message, retry_count 
-   WHERE stream = 'runtime' AND action = 'newrelic_error' 
-   ORDER BY timestamp DESC 
+   FROM Log
+   SELECT timestamp, error_message, retry_count
+   WHERE stream = 'runtime' AND action = 'newrelic_error'
+   ORDER BY timestamp DESC
    LIMIT 100
    ```
 2. **Quota exhausted:** Deactivate the ingest key and power off (potential telemetry flood attack).
@@ -387,9 +387,9 @@ LIMIT 100
 **Action:**
 1. Inspect errors:
    ```nrql
-   FROM NrIntegrationError 
-   SELECT timestamp, message, newRelicFeature, instrumentation.name 
-   SINCE 1 hour ago 
+   FROM NrIntegrationError
+   SELECT timestamp, message, newRelicFeature, instrumentation.name
+   SINCE 1 hour ago
    LIMIT 100
    ```
 2. **Attribute too large:** Records may exceed 4,094 characters; chunking should prevent this. Bug in chunking logic.
@@ -417,8 +417,8 @@ LIMIT 100
 **Action:**
 1. Examine the session:
    ```nrql
-   FROM Log 
-   SELECT timestamp, session_id, src_ip, action 
+   FROM Log
+   SELECT timestamp, session_id, src_ip, action
    WHERE stream = 'probe' AND action = 'canary-reuse'
    FACET record_id, body_sha256, chunk_index
    SINCE 1 hour ago
@@ -449,10 +449,10 @@ LIMIT 100
 
 **Action:** Identify the source(s):
 ```nrql
-FROM Metric 
-SELECT sum(attackbox.requests) 
+FROM Metric
+SELECT sum(attackbox.requests)
 WHERE metricName = 'attackbox.requests'
-FACET src_ip 
+FACET src_ip
 SINCE 1 hour ago
 ```
 
@@ -476,8 +476,8 @@ High rate may be:
 
 ```nrql
 -- WRONG: Loses all but one chunk
-FROM Log 
-SELECT uniqueCount(record_id) 
+FROM Log
+SELECT uniqueCount(record_id)
 WHERE stream = 'probe' AND action = 'canary-reuse'
 ```
 
@@ -487,10 +487,10 @@ This discards chunks 1, 2, 3, ... and breaks body reassembly.
 
 ```nrql
 -- CORRECT: Preserves every distinct chunk
-FROM Log 
+FROM Log
 SELECT latest(timestamp) AS 'Time',
        latest(session_id) AS 'Session'
-WHERE stream = 'probe' 
+WHERE stream = 'probe'
   AND action = 'canary-reuse'
   AND record_id IS NOT NULL
 FACET record_id, body_sha256, chunk_index
@@ -504,9 +504,9 @@ Each row is one unique chunk. If the event is unchunked, `chunk_index = 0` and `
 To recover the full body of a chunked event:
 
 ```nrql
-FROM Log 
+FROM Log
 SELECT message, body_sha256, chunk_index, chunk_count
-WHERE record_id = '<record-id-here>' 
+WHERE record_id = '<record-id-here>'
   AND body_sha256 = '<sha256-here>'
 ORDER BY chunk_index ASC
 ```
@@ -522,8 +522,8 @@ Manually concatenate the `message` fields in chunk order (0, 1, 2, ...).
 **Example alert:**
 ```nrql
 -- Count unique record_ids (may overcount by chunk_count - 1 per event)
-FROM Log 
-SELECT uniqueCount(record_id) 
+FROM Log
+SELECT uniqueCount(record_id)
 WHERE stream = 'probe' AND action = 'canary-reuse'
 ```
 
@@ -554,7 +554,7 @@ For critical alerts (Falco, canary), overcounting is acceptable; the alert fires
 
 **Check bait responsiveness:**
 ```nrql
-FROM Metric 
+FROM Metric
 SELECT rate(sum(attackbox.requests), 1 minute) AS 'Requests/min'
 WHERE metricName = 'attackbox.requests'
 TIMESERIES 1 minute
@@ -596,8 +596,8 @@ If requests are flowing and age < 90s, the bait is healthy.
 
 **Check follow-ups:**
 ```nrql
-FROM Metric 
-SELECT sum(attackbox.probe_followups) 
+FROM Metric
+SELECT sum(attackbox.probe_followups)
 WHERE metricName = 'attackbox.probe_followups'
 FACET probe_id
 SINCE 1 hour ago
@@ -607,8 +607,8 @@ High `probe_followups` indicates the client is acting on the responder's probes.
 
 ### Queue Backlog Expected Range
 
-**Normal:** 0–64 MB  
-**Warning:** 64–128 MB (temporary ingest degradation)  
+**Normal:** 0–64 MB
+**Warning:** 64–128 MB (temporary ingest degradation)
 **Critical:** > 224 MB (approaching 256 MB limit; oldest records being dropped)
 
 **Cause of backlog:**
@@ -646,7 +646,7 @@ High `probe_followups` indicates the client is acting on the responder's probes.
 
 **Check session timeline:**
 ```nrql
-FROM Log 
+FROM Log
 SELECT timestamp, stream, action, task, probe_id
 WHERE session_id = '<session-id-from-alert>'
 ORDER BY timestamp ASC
@@ -663,7 +663,7 @@ LIMIT 100
 
 **Step 1: Session Timeline**
 ```nrql
-FROM Log 
+FROM Log
 SELECT timestamp, stream, action, task, probe_id, status
 WHERE session_id = '<session-id-here>'
   AND record_id IS NOT NULL
@@ -673,7 +673,7 @@ LIMIT 1000
 
 **Step 2: Requests**
 ```nrql
-FROM Log 
+FROM Log
 SELECT timestamp, method, endpoint, status, task
 WHERE session_id = '<session-id-here>'
   AND stream = 'edge'
@@ -684,7 +684,7 @@ ORDER BY timestamp ASC
 
 **Step 3: Declarations**
 ```nrql
-FROM Log 
+FROM Log
 SELECT timestamp, action, client_model, operator_alias, harness_name
 WHERE session_id = '<session-id-here>'
   AND stream = 'probe'
@@ -695,7 +695,7 @@ ORDER BY timestamp ASC
 
 **Step 4: Probes Issued**
 ```nrql
-FROM Log 
+FROM Log
 SELECT timestamp, probe_id, task, action
 WHERE session_id = '<session-id-here>'
   AND stream = 'probe'
@@ -705,7 +705,7 @@ ORDER BY timestamp ASC
 
 **Step 5: Canary and Egress**
 ```nrql
-FROM Log 
+FROM Log
 SELECT timestamp, action, resource
 WHERE session_id = '<session-id-here>'
   AND stream IN ('probe', 'egress')
@@ -720,8 +720,8 @@ ORDER BY timestamp ASC
 
 **Step 1: Activity Summary**
 ```nrql
-FROM Log 
-SELECT count(*) AS 'Requests', 
+FROM Log
+SELECT count(*) AS 'Requests',
        uniqueCount(session_id) AS 'Sessions',
        latest(user_agent) AS 'User-Agent'
 WHERE stream = 'edge' AND direction = 'request' AND src_ip = '<ip-here>'
@@ -730,8 +730,8 @@ SINCE 1 day ago
 
 **Step 2: Attack Tasks**
 ```nrql
-FROM Metric 
-SELECT sum(attackbox.probes) 
+FROM Metric
+SELECT sum(attackbox.probes)
 WHERE metricName = 'attackbox.probes' AND src_ip = '<ip-here>'
 FACET task
 SINCE 1 day ago
@@ -739,7 +739,7 @@ SINCE 1 day ago
 
 **Step 3: Sessions**
 ```nrql
-FROM Log 
+FROM Log
 SELECT session_id, min(timestamp) AS 'Started', count(*) AS 'Events'
 WHERE src_ip = '<ip-here>'
   AND record_id IS NOT NULL
@@ -753,9 +753,9 @@ SINCE 1 day ago
 
 **Declared Models:**
 ```nrql
-FROM Log 
+FROM Log
 SELECT timestamp, session_id, src_ip, client_model
-WHERE stream = 'probe' 
+WHERE stream = 'probe'
   AND action = 'register-model'
   AND client_model IS NOT NULL
   AND record_id IS NOT NULL
@@ -765,9 +765,9 @@ LIMIT 200
 
 **Declared Harnesses:**
 ```nrql
-FROM Log 
+FROM Log
 SELECT timestamp, session_id, harness_name, harness_version, runtime
-WHERE stream = 'probe' 
+WHERE stream = 'probe'
   AND action = 'register-harness'
   AND harness_name IS NOT NULL
   AND record_id IS NOT NULL
@@ -777,7 +777,7 @@ LIMIT 200
 
 **Most Common Models:**
 ```nrql
-FROM Log 
+FROM Log
 SELECT count(*) AS 'Sessions'
 WHERE stream = 'probe' AND action = 'register-model'
 FACET client_model
@@ -831,7 +831,7 @@ LIMIT 50
 1. Verify metric flush: Metrics are batched and flushed every **5 seconds** or **200 events**.
 2. Check for metric drops:
    ```nrql
-   FROM Log 
+   FROM Log
    SELECT latest(nr_dropped), latest(nr_errors)
    WHERE stream = 'runtime' AND action IN ('stop', 'stopped')
    ORDER BY timestamp DESC
@@ -839,8 +839,8 @@ LIMIT 50
    ```
 3. Verify the metric names:
    ```nrql
-   FROM Metric 
-   SELECT count(*) 
+   FROM Metric
+   SELECT count(*)
    WHERE metricName LIKE 'attackbox.%'
    FACET metricName
    SINCE 1 hour ago
@@ -862,13 +862,13 @@ LIMIT 50
 **Checks:**
 1. Check queue backlog:
    ```nrql
-   FROM Log 
+   FROM Log
    SELECT latest(queue_backlog_bytes) / 1048576 AS 'Backlog (MB)'
    WHERE stream = 'heartbeat' AND source = 'shipper'
    ```
 2. Check for ingest errors:
    ```nrql
-   FROM Log 
+   FROM Log
    SELECT timestamp, error_message, retry_count
    WHERE stream = 'runtime' AND action = 'newrelic_error'
    ORDER BY timestamp DESC

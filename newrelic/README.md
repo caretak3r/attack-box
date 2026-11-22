@@ -17,8 +17,8 @@ Offline dashboard and alert definitions for New Relic monitoring.
 
 Follow `docs/newrelic-runbook.md` → "Key Provisioning" to create a dedicated `Ingest - License` key.
 
-**Key type:** `Ingest - License` (40 alphanumeric characters)  
-**Scope:** Logs and metrics only; no query or UI access  
+**Key type:** `Ingest - License` (40 alphanumeric characters)
+**Scope:** Logs and metrics only; no query or UI access
 **Storage:** `/etc/attackbox/shipper.env` on host (root:root, mode 0600)
 
 ### 2. Import Dashboard
@@ -59,20 +59,20 @@ resource "newrelic_nrql_alert_condition" "shipper_heartbeat_lost" {
   policy_id = newrelic_alert_policy.attackbox_critical.id
   name      = "AttackBox - Shipper Heartbeat Lost"
   type      = "static"
-  
+
   nrql {
     query = "FROM Log SELECT count(*) WHERE stream = 'heartbeat' AND source = 'shipper'"
   }
-  
+
   critical {
     operator              = "below"
     threshold             = 1
     threshold_duration    = 120
     threshold_occurrences = "at_least_once"
   }
-  
+
   violation_time_limit_seconds = 3600
-  
+
   aggregation_window = 60
   expiration_duration = 180
   open_violation_on_expiration = true
@@ -87,10 +87,10 @@ After deploying the decoy, run verification queries from `queries.md`:
 
 ```nrql
 -- All six streams active
-FROM Log 
-SELECT count(*) 
-WHERE stream IN ('edge', 'transcript', 'probe', 'runtime', 'egress', 'heartbeat') 
-FACET stream 
+FROM Log
+SELECT count(*)
+WHERE stream IN ('edge', 'transcript', 'probe', 'runtime', 'egress', 'heartbeat')
+FACET stream
 SINCE 10 minutes ago
 ```
 
@@ -159,7 +159,7 @@ SELECT uniqueCount(record_id) WHERE stream = 'probe' AND action = 'canary-reuse'
 **Correct:**
 ```nrql
 -- Preserves every distinct chunk
-SELECT latest(timestamp) 
+SELECT latest(timestamp)
 WHERE stream = 'probe' AND action = 'canary-reuse'
 FACET record_id, body_sha256, chunk_index
 ```
@@ -179,6 +179,8 @@ See `docs/newrelic-runbook.md` → "Chunk-Safe Deduplication" for details.
 
 ### Metric Reference
 
+**Total: 13 emitted metrics** (10 bait + 3 shipper)
+
 | Metric | Type | Labels |
 |---|---|---|
 | `attackbox.requests` | count | persona, endpoint, status_class |
@@ -193,6 +195,8 @@ See `docs/newrelic-runbook.md` → "Chunk-Safe Deduplication" for details.
 | `attackbox.concurrent_status_requests` | gauge | persona |
 | `attackbox.egress_blocked` | count | — |
 | `attackbox.heartbeat` | gauge | — |
+| `attackbox.telemetry.ingest_errors_total` | gauge | — |
+| `attackbox.telemetry.ingest_retries_total` | gauge | — |
 
 ## Alert Response
 
