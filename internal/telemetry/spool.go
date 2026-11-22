@@ -57,8 +57,10 @@ const (
 	spoolBatchBytes   = 1 << 20
 )
 
-// spoolBackoff is the redial schedule after a failed write. The first redial
-// is immediate because the usual cause is a shipper restart.
+// spoolBackoff is the redial schedule after a failed write or dial. The first
+// redial is immediate because the usual cause is a shipper restart. The
+// position survives successful dials and resets only after a successful write,
+// so a peer that accepts and then closes is not redialled in a tight loop.
 var spoolBackoff = []time.Duration{0, 500 * time.Millisecond, time.Second, 2 * time.Second, 5 * time.Second}
 
 // SpoolConfig configures a Spool.
@@ -75,8 +77,9 @@ type SpoolConfig struct {
 	dial func() (net.Conn, error) // tests only; nil dials Socket
 }
 
-// SpoolStats counts records. Written records were fully written to a
-// connection; Lost records were in flight when Close gave up.
+// SpoolStats counts records. Written records were handed to the kernel by a
+// successful write, which says nothing about the shipper having read them;
+// Lost records were in flight when Close gave up.
 type SpoolStats struct {
 	Written    int64
 	Dropped    int64 // queue full, over budget, oversize, unencodable or after Close
@@ -91,9 +94,11 @@ type SpoolStats struct {
 // the host shipper and never holds a New Relic key. Calls never block. One
 // writer goroutine owns the connection; a batch it has taken from the queue
 // stays in its memory budget until a write of the whole batch succeeds, and
-// is written again after a redial, so a reconnect can duplicate records but
-// does not silently lose them. The application protocol is one-way: the
-// Spool never reads from the socket.
+// is written again after a redial, so a reconnect can duplicate records. A
+// successful write only means the kernel took the bytes: records the shipper
+// had not yet read when it crashed are gone, and show as a seq gap at the
+// shipper. The application protocol is one-way: the Spool never reads from
+// the socket.
 type Spool struct {
 	cfg  SpoolConfig
 	boot string
@@ -111,7 +116,13 @@ type Spool struct {
 	done     chan struct{}
 	beatDone chan struct{}
 
-	conn net.Conn // writer goroutine only
+	connMu sync.Mutex // guards conn assignment and write deadlines against Close
+	conn   net.Conn   // assigned by the writer goroutine only
+
+	// Writer goroutine only.
+	backoff    int       // index into spoolBackoff of the next redial wait
+	lastReport time.Time // last OnError call from the I/O path
+	suppressed int64     // I/O errors counted but not reported since lastReport
 
 	written, dropped, oversize, lost, errs, reconnects, resent atomic.Int64
 }
@@ -274,6 +285,28 @@ func (s *Spool) fail(err error) {
 	}
 }
 
+// spoolReportEvery limits OnError calls from the I/O path. Every failure is
+// still counted in Errors; the next report carries the suppressed count.
+const spoolReportEvery = time.Second
+
+// failIO counts a write or redial failure and reports it at most once per
+// spoolReportEvery. Writer goroutine only.
+func (s *Spool) failIO(err error) {
+	s.errs.Add(1)
+	now := time.Now() // wall clock: Now may be a test clock
+	if !s.lastReport.IsZero() && now.Sub(s.lastReport) < spoolReportEvery {
+		s.suppressed++
+		return
+	}
+	if s.suppressed > 0 {
+		err = fmt.Errorf("%w (%d similar errors suppressed)", err, s.suppressed)
+	}
+	s.lastReport, s.suppressed = now, 0
+	if s.cfg.OnError != nil {
+		s.cfg.OnError(err)
+	}
+}
+
 func (s *Spool) run() {
 	defer close(s.done)
 	defer func() {
@@ -285,6 +318,10 @@ func (s *Spool) run() {
 	for {
 		size := 0
 		batch = batch[:0]
+		if s.stopped() {
+			s.abandon(0)
+			return
+		}
 		line, ok := <-s.queue
 		if !ok {
 			return
@@ -307,13 +344,7 @@ func (s *Spool) run() {
 		if s.flush(batch) {
 			s.written.Add(int64(len(batch)))
 		} else {
-			// Close gave up: everything still held is lost.
-			n := int64(len(batch))
-			for range s.queue {
-				n++
-			}
-			s.lost.Add(n)
-			s.bytes.Store(0)
+			s.abandon(int64(len(batch)))
 			return
 		}
 		s.bytes.Add(-int64(size))
@@ -323,38 +354,93 @@ func (s *Spool) run() {
 	}
 }
 
+// stopped reports whether Close has given up.
+func (s *Spool) stopped() bool {
+	select {
+	case <-s.stop:
+		return true
+	default:
+		return false
+	}
+}
+
+// abandon counts the held records and everything still queued as lost. Close
+// closes the queue before it can give up, so the drain ends.
+func (s *Spool) abandon(held int64) {
+	for range s.queue {
+		held++
+	}
+	s.lost.Add(held)
+	s.bytes.Store(0)
+}
+
+// giveUp wakes a write blocked in the kernel. It runs after stop is closed, so
+// a writer that arms a deadline under connMu either sees stop first or has its
+// deadline overridden here.
+func (s *Spool) giveUp() {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.conn != nil {
+		_ = s.conn.SetWriteDeadline(time.Now())
+	}
+}
+
+// arm sets the write deadline unless Close has given up.
+func (s *Spool) arm() bool {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.stopped() {
+		return false
+	}
+	_ = s.conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout)) // wall clock: Now may be a test clock
+	return true
+}
+
+// setConn replaces the connection; the writer goroutine is its only caller.
+func (s *Spool) setConn(c net.Conn) {
+	s.connMu.Lock()
+	s.conn = c
+	s.connMu.Unlock()
+}
+
 // flush writes the whole batch, redialling and rewriting it after any
 // failure. It returns false only when Close abandons the batch.
 func (s *Spool) flush(batch [][]byte) bool {
 	for attempt := 0; ; attempt++ {
+		if s.stopped() {
+			return false
+		}
 		if s.conn == nil && !s.redial() {
+			return false
+		}
+		if !s.arm() {
 			return false
 		}
 		if attempt > 0 {
 			s.resent.Add(1)
 		}
-		_ = s.conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout)) // wall clock: Now may be a test clock
 		bufs := net.Buffers(append([][]byte(nil), batch...))
 		_, err := bufs.WriteTo(s.conn)
 		if err == nil {
+			s.backoff = 0
 			return true
 		}
 		_ = s.conn.Close()
-		s.conn = nil
-		s.fail(fmt.Errorf("spool: write: %w", err))
-		select {
-		case <-s.stop:
-			return false
-		default:
+		s.setConn(nil)
+		if s.stopped() {
+			return false // the write was cut short by Close, not by the peer
 		}
+		s.failIO(fmt.Errorf("spool: write: %w", err))
 	}
 }
 
-// redial reconnects on the backoff schedule until it succeeds or Close gives
-// up.
+// redial reconnects after waiting out the current backoff step, until it
+// succeeds or Close gives up. Every wait advances the step, whether or not the
+// dial works: only a successful write resets it.
 func (s *Spool) redial() bool {
-	for i := 0; ; i++ {
-		wait := spoolBackoff[min(i, len(spoolBackoff)-1)]
+	for {
+		wait := spoolBackoff[s.backoff]
+		s.backoff = min(s.backoff+1, len(spoolBackoff)-1)
 		t := time.NewTimer(wait)
 		select {
 		case <-s.stop:
@@ -364,11 +450,11 @@ func (s *Spool) redial() bool {
 		}
 		conn, err := s.cfg.dial()
 		if err == nil {
-			s.conn = conn
+			s.setConn(conn)
 			s.reconnects.Add(1)
 			return true
 		}
-		s.fail(fmt.Errorf("spool: redial: %w", err))
+		s.failIO(fmt.Errorf("spool: redial: %w", err))
 	}
 }
 
@@ -420,6 +506,7 @@ func (s *Spool) Close(ctx context.Context) error {
 	case <-s.done:
 	case <-ctx.Done():
 		s.stopOnce.Do(func() { close(s.stop) })
+		s.giveUp()
 		<-s.done
 		err = fmt.Errorf("spool: drain: %w", ctx.Err())
 	}
