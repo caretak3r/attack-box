@@ -379,7 +379,8 @@ func TestLiveThreePersonas(t *testing.T) {
 			started = true
 		}
 		if l["stream"] == "runtime" && l["action"] == "stopped" {
-			stopped = l["result"] == "ok" && l["nr_lost"] == float64(0) && l["nr_sent"].(float64) > 0
+			stopped = l["result"] == "ok" && l["nr_lost"] == float64(0) && l["nr_sent"].(float64) > 0 &&
+				l["nr_retries"] == float64(0) && l["local_dropped"] == float64(0)
 		}
 	}
 	if !personas["openai"] || !personas["vllm"] || !personas["ollama"] || !started || !stopped {

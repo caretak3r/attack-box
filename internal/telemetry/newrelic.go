@@ -11,12 +11,15 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"attackbox/internal/secret"
 )
 
 const (
@@ -117,6 +120,7 @@ type NewRelic struct {
 	sent, dropped, lost, errs, retries atomic.Int64
 	errMu                              sync.Mutex
 	lastErr                            string
+	keyRe                              *regexp.Regexp
 }
 
 func NewNewRelic(cfg NRConfig) (*NewRelic, error) {
@@ -177,6 +181,7 @@ func NewNewRelic(cfg NRConfig) (*NewRelic, error) {
 		done:      make(chan struct{}),
 		series:    map[string]*series{},
 		lastFlush: cfg.Now(),
+		keyRe:     keyPattern(cfg.LicenseKey),
 	}
 	n.ctx, n.cancel = context.WithCancel(context.Background())
 	go n.run()
@@ -190,6 +195,13 @@ func validateURL(raw, key string) error {
 	}
 	if u.User != nil || containsKey(raw, key) {
 		return errors.New("newrelic: credentials must not be in the endpoint URL")
+	}
+	// Authentication is header-only, so any credential-named query
+	// parameter is a misconfiguration even when it is not the license key.
+	for name := range u.Query() {
+		if secret.IsCredentialName(unescapeAll(name)) {
+			return errors.New("newrelic: credential query parameters are not allowed in the endpoint URL")
+		}
 	}
 	switch u.Scheme {
 	case "https":
@@ -205,22 +217,77 @@ func validateURL(raw, key string) error {
 	return nil
 }
 
-// containsKey also catches percent-encoded and case-folded copies of the key.
+// maxUnescape bounds how many nested percent-encoding layers are peeled.
+const maxUnescape = 8
+
+// containsKey also catches case-folded and percent-encoded copies of the key,
+// including nested encodings such as %2530.
 func containsKey(raw, key string) bool {
 	key = strings.ToLower(key)
-	forms := []string{raw}
-	if p, err := url.PathUnescape(raw); err == nil {
-		forms = append(forms, p)
-	}
-	if q, err := url.QueryUnescape(raw); err == nil {
-		forms = append(forms, q)
-	}
-	for _, f := range forms {
+	for f := raw; ; {
 		if strings.Contains(strings.ToLower(f), key) {
 			return true
 		}
+		next := unescapeOnce(f)
+		if next == f {
+			return false
+		}
+		f = next
 	}
-	return false
+}
+
+// unescapeOnce decodes one percent-encoding layer. Invalid escapes are kept
+// as they are, so a stray % cannot stop the decoding of later bytes.
+func unescapeOnce(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]) {
+			b.WriteByte(unhex(s[i+1])<<4 | unhex(s[i+2]))
+			i += 2
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func unescapeAll(s string) string {
+	for range maxUnescape {
+		next := unescapeOnce(s)
+		if next == s {
+			break
+		}
+		s = next
+	}
+	return s
+}
+
+func isHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+func unhex(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	default:
+		return c - 'A' + 10
+	}
+}
+
+// keyPattern matches the license key case-insensitively, with any character
+// written literally or percent-encoded through any number of %25 layers.
+// The key is validated as alphanumeric, so QuoteMeta is not needed.
+func keyPattern(key string) *regexp.Regexp {
+	var b strings.Builder
+	b.WriteString("(?i)")
+	for i := 0; i < len(key); i++ {
+		lo, up := strings.ToLower(key[i:i+1]), strings.ToUpper(key[i:i+1])
+		fmt.Fprintf(&b, "(?:%s|%%(?:25)*(?:%02x|%02x))", lo, lo[0], up[0])
+	}
+	return regexp.MustCompile(b.String())
 }
 
 // Emit chunks the event and queues each chunk, dropping when the queue is full.
@@ -465,8 +532,9 @@ func (n *NewRelic) flushMetrics() {
 	now := n.cfg.Now()
 	n.mu.Lock()
 	for name, v := range map[string]int64{
-		"attackbox.telemetry.dropped_total":       n.dropped.Load(),
-		"attackbox.telemetry.ingest_errors_total": n.errs.Load(),
+		"attackbox.telemetry.dropped_total":        n.dropped.Load(),
+		"attackbox.telemetry.ingest_errors_total":  n.errs.Load(),
+		"attackbox.telemetry.ingest_retries_total": n.retries.Load(),
 	} {
 		n.series[seriesKey(name, false, nil)] = &series{name: name, value: float64(v), at: now}
 	}
@@ -596,17 +664,16 @@ func (n *NewRelic) post(endpoint string, payload []byte, items int) {
 		if !retry || attempt >= len(n.cfg.Backoff) {
 			break
 		}
-		n.retries.Add(1)
-		wait := n.cfg.Backoff[attempt]
-		if after > wait {
-			wait = min(after, n.cfg.MaxRetryAfter)
-		}
+		// The larger of the backoff step and Retry-After, always capped.
+		wait := min(max(n.cfg.Backoff[attempt], after), n.cfg.MaxRetryAfter)
 		select {
 		case <-time.After(wait):
 		case <-n.ctx.Done():
 			n.fail(err, items)
 			return
 		}
+		// Counted only once the next POST is certain to run.
+		n.retries.Add(1)
 	}
 	n.fail(err, items)
 }
@@ -661,7 +728,7 @@ func retryAfter(v string, now time.Time) time.Duration {
 
 // fail records a failed delivery. The license key is scrubbed from the message.
 func (n *NewRelic) fail(err error, items int) {
-	err = errors.New(strings.ReplaceAll(err.Error(), n.cfg.LicenseKey, "[redacted]"))
+	err = errors.New(n.keyRe.ReplaceAllString(err.Error(), "[redacted]"))
 	n.errs.Add(1)
 	n.lost.Add(int64(items))
 	n.errMu.Lock()

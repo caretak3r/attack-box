@@ -119,7 +119,7 @@ func healthcheck(raw string) error {
 // app is one running process: the listeners, their servers and the sinks.
 type app struct {
 	cfg       config
-	local     *telemetry.JSONLog
+	local     *telemetry.Async // JSONLog behind a bounded queue, off the request path
 	nr        *telemetry.NewRelic
 	sink      telemetry.Sink
 	servers   []*http.Server
@@ -130,7 +130,7 @@ type app struct {
 // newApp binds every listener before it returns, so a port conflict fails
 // startup instead of leaving a partial service.
 func newApp(cfg config, logOut io.Writer) (*app, error) {
-	a := &app{cfg: cfg, local: telemetry.NewJSONLog(logOut)}
+	a := &app{cfg: cfg, local: telemetry.NewAsync(telemetry.NewJSONLog(logOut), 0)}
 	a.sink = a.local
 	if !cfg.nrDisabled {
 		nr, err := telemetry.NewNewRelic(telemetry.NRConfig{
@@ -145,6 +145,7 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 			},
 		})
 		if err != nil {
+			a.closeLocal()
 			return nil, err
 		}
 		a.nr = nr
@@ -199,12 +200,19 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 				if nrErr != nil {
 					nrErr = fmt.Errorf("new relic close: %w", nrErr)
 				}
-				return nil, errors.Join(bindErr, nrErr)
+				return nil, errors.Join(bindErr, nrErr, a.closeLocal())
 			}
-			return nil, bindErr
+			return nil, errors.Join(bindErr, a.closeLocal())
 		}
 	}
 	return a, nil
+}
+
+// closeLocal drains the local log within the shutdown grace period.
+func (a *app) closeLocal() error {
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.shutdownTimeout)
+	defer cancel()
+	return a.local.Close(ctx)
 }
 
 func (a *app) closeListeners() {
@@ -277,18 +285,20 @@ func (a *app) run(ctx context.Context) error {
 		nrErr = a.nr.Close(flushCtx)
 		cancelFlush()
 		st := a.nr.Stats()
-		attrs = map[string]any{"nr_sent": st.Sent, "nr_dropped": st.Dropped, "nr_lost": st.Lost, "nr_errors": st.Errors}
+		attrs = map[string]any{"nr_sent": st.Sent, "nr_dropped": st.Dropped, "nr_lost": st.Lost, "nr_errors": st.Errors, "nr_retries": st.Retries}
 		if nrErr == nil {
 			nrErr = lossError(st)
 		}
 	}
+	localDropped := a.local.Dropped()
+	attrs["local_dropped"] = localDropped
 	result := "ok"
-	if serveErr != nil || nrErr != nil {
+	if serveErr != nil || nrErr != nil || localDropped > 0 {
 		result = "error"
 	}
 	// Written locally only: New Relic is closed at this point.
 	a.local.Emit(telemetry.Event{Stream: telemetry.StreamRuntime, Action: "stopped", Result: result, Attrs: attrs})
-	return errors.Join(serveErr, nrErr)
+	return errors.Join(serveErr, nrErr, a.closeLocal())
 }
 
 // lossError reports events New Relic never accepted, or nil if none.

@@ -716,3 +716,168 @@ func TestTransientFailuresCounted(t *testing.T) {
 		t.Errorf("stats %+v", st)
 	}
 }
+
+func TestNestedEncodedKeyAndCredentialQueryRejected(t *testing.T) {
+	double := strings.ReplaceAll(testKey, "0", "%2530")
+	triple := strings.ReplaceAll(testKey, "a", "%252561")
+	urls := []string{
+		"https://example.com/log?k=" + double,
+		"https://example.com/" + triple + "/log",
+		"https://example.com/log?api_key=another-secret",
+		"https://example.com/log?token=x",
+		"https://example.com/log?password=x",
+		"https://example.com/log?X-License-Key=x",
+		"https://example.com/log?api%255Fkey=x",
+	}
+	for _, u := range urls {
+		for _, cfg := range []NRConfig{
+			{LicenseKey: testKey, LogURL: u, Client: noNet},
+			{LicenseKey: testKey, MetricURL: u, Client: noNet},
+		} {
+			if n, err := NewNewRelic(cfg); err == nil {
+				closeNR(t, n)
+				t.Errorf("%s accepted", u)
+			}
+		}
+	}
+	// Ordinary query parameters stay allowed.
+	n, err := NewNewRelic(NRConfig{LicenseKey: testKey, LogURL: "https://example.com/log?region=eu", Client: noNet, HeartbeatInterval: -1, Backoff: []time.Duration{}})
+	if err != nil {
+		t.Fatalf("plain query rejected: %v", err)
+	}
+	closeNR(t, n)
+}
+
+func TestFailureScrubsEscapedKey(t *testing.T) {
+	var hook []string
+	var mu sync.Mutex
+	n := start(t, NRConfig{
+		LicenseKey: testKey, Client: noNet, HeartbeatInterval: -1, Backoff: []time.Duration{},
+		OnError: func(err error) { mu.Lock(); hook = append(hook, err.Error()); mu.Unlock() },
+	})
+	defer closeNR(t, n)
+	forms := []string{
+		testKey,
+		strings.ToUpper(testKey),
+		strings.ReplaceAll(testKey, "0", "%30"),
+		strings.ReplaceAll(testKey, "0", "%2530"),
+		strings.ReplaceAll(strings.ToUpper(testKey), "A", "%2541"),
+		strings.ReplaceAll(testKey, "N", "%4e"),
+	}
+	for _, f := range forms {
+		n.fail(errors.New(`Post "https://x.test/log?k=`+f+`": dial failed`), 1)
+		last := n.Stats().LastError
+		if containsKey(last, testKey) || !strings.Contains(last, "[redacted]") {
+			t.Errorf("form %q survived: %q", f, last)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(hook) != len(forms) {
+		t.Fatalf("OnError calls = %d", len(hook))
+	}
+	for _, h := range hook {
+		if containsKey(h, testKey) {
+			t.Errorf("OnError leaked key: %q", h)
+		}
+	}
+}
+
+func TestRecoveredFailureShipped(t *testing.T) {
+	var mu sync.Mutex
+	var metrics [][]byte
+	var logHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/log" && logHits.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		if r.URL.Path == "/metric" {
+			zr, _ := gzip.NewReader(r.Body)
+			b, _ := io.ReadAll(zr)
+			mu.Lock()
+			metrics = append(metrics, b)
+			mu.Unlock()
+		}
+		w.WriteHeader(202)
+	}))
+	defer srv.Close()
+	n := start(t, NRConfig{
+		LicenseKey: testKey, LogURL: srv.URL + "/log", MetricURL: srv.URL + "/metric",
+		HeartbeatInterval: -1, Backoff: []time.Duration{time.Millisecond},
+	})
+	n.Emit(Event{Action: "x"})
+	closeNR(t, n)
+	st := n.Stats()
+	if st.Sent == 0 || st.Lost != 0 || st.Retries != 1 || st.Errors != 0 {
+		t.Fatalf("stats %+v", st)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	var last metricPayload
+	if len(metrics) == 0 {
+		t.Fatal("no metric POST")
+	}
+	if err := json.Unmarshal(metrics[len(metrics)-1], &last); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, m := range last[0].Metrics {
+		if m.Name == "attackbox.telemetry.ingest_retries_total" {
+			found = true
+			if m.Value != 1 {
+				t.Errorf("ingest_retries_total = %v", m.Value)
+			}
+		}
+	}
+	if !found {
+		t.Error("ingest_retries_total not shipped")
+	}
+}
+
+func TestRetryWaitCappedForCustomBackoff(t *testing.T) {
+	srv, attempts := retryServer(t, "1")
+	n := start(t, NRConfig{
+		LicenseKey: testKey, LogURL: srv.URL + "/log", MetricURL: srv.URL + "/metric",
+		HeartbeatInterval: -1, Backoff: []time.Duration{2 * time.Second}, MaxRetryAfter: 100 * time.Millisecond,
+	})
+	n.Emit(Event{Action: "x"})
+	closeNR(t, n)
+	at := attempts()
+	if len(at) != 2 {
+		t.Fatalf("attempts = %d", len(at))
+	}
+	if gap := at[1].Sub(at[0]); gap < 100*time.Millisecond || gap > time.Second {
+		t.Errorf("gap %v, want about 100ms", gap)
+	}
+}
+
+func TestCancelledRetryNotCounted(t *testing.T) {
+	srv, attempts := retryServer(t, "60")
+	n := start(t, NRConfig{
+		LicenseKey: testKey, LogURL: srv.URL + "/log", MetricURL: srv.URL + "/metric",
+		HeartbeatInterval: -1, Backoff: []time.Duration{time.Millisecond}, MaxRetryAfter: time.Minute,
+		FlushInterval: time.Millisecond,
+	})
+	n.Emit(Event{Action: "x"})
+	deadline := time.Now().Add(2 * time.Second)
+	for len(attempts()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	began := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := n.Close(ctx); err == nil {
+		t.Fatal("Close returned nil while a 60s retry wait was pending")
+	}
+	closeNR(t, n)
+	if el := time.Since(began); el > 2*time.Second {
+		t.Errorf("close took %v", el)
+	}
+	if got := len(attempts()); got != 1 {
+		t.Errorf("log POSTs = %d, want 1", got)
+	}
+	if st := n.Stats(); st.Retries != 0 || st.Lost == 0 {
+		t.Errorf("stats %+v", st)
+	}
+}

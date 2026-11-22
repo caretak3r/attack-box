@@ -16,6 +16,7 @@ Three read-only research agents reviewed primary documentation and public GitHub
 - `protocol-review.md`: official-client contract mismatches in streaming usage, prompt arrays, Responses fields/cancellation, token embeddings and Ollama management responses. Fix all ten before claiming client compatibility.
 - `main-review.md`: executable lifecycle review covering partial-listener cleanup, unsafe configuration bounds, secret-file permissions and healthcheck userinfo. Follow the validated fixes in `SECURITY_FIXES.md`.
 - `secret-review.md`: shared scrubber audit and host-observed failing/passing test evidence. Fix priority bypasses while preserving valid JSON and all genuine canary shapes.
+- `secret-rereview.md`: second-pass review after the structure-aware rewrite. Reopens schema-exemption, folded-credential, cookie, Bearer/Digest and boolean/null issues; do not accept the earlier all-fixed claim without closing these.
 - `new-relic-hardening-review.md`: second-pass telemetry review. Four remaining issues cover blocking JSONLog fan-out, nested URL encoding, recovered-error metrics and retry-cap accounting.
 - `host-shipper-design.md`: minimal Unix-socket/durable-spool architecture reusing existing telemetry, with trust boundaries, replay/dedup and the critical requirement to spool unchunked Events so full-body hashes survive.
 - `host-shipper-threat-review.md`: 13 required corrections covering acknowledged checkpoints, crash durability, authenticated roles, bounded expanded records, replay/overflow policy and honest host-root limitations.
