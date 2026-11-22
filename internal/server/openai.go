@@ -1,10 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -378,18 +382,81 @@ func (s *Server) newFormat(c *call, p *inferReq, model string) format {
 
 // failParse maps a parse error to the persona's 400.
 func (c *call) failParse(err error) {
-	var le *limitError
-	if asLimit(err, &le) {
+	var (
+		le *limitError
+		fe *fieldError
+		je *jsonError
+	)
+	switch {
+	case errors.As(err, &le):
+		c.failLimit(le)
+	case errors.As(err, &fe):
+		c.failField(fe)
+	case errors.As(err, &je):
+		c.failJSON(je)
+	default:
+		c.fail(http.StatusBadRequest, "bad request", "", "")
+	}
+}
+
+func (c *call) failLimit(le *limitError) {
+	switch c.style {
+	case styleOllama, styleOllamaV1, styleVLLM:
+		// None of these servers caps array lengths, so the cap reads as a plain
+		// size complaint in the dialect of the persona.
+		c.fail(http.StatusBadRequest, fmt.Sprintf("too many items in '%s': at most %d allowed", le.param, le.max), "", "")
+	default:
 		c.fail(http.StatusBadRequest, fmt.Sprintf(
 			"Invalid '%s': array too long. Expected an array with maximum length %d, but got an array with length %d instead.",
 			le.param, le.max, le.got), le.param, "array_above_max_length")
-		return
 	}
+}
+
+// failField answers a required field that is absent or of the wrong type.
+func (c *call) failField(fe *fieldError) {
+	p := fe.param
 	switch c.style {
+	case styleVLLM:
+		typ, msg, in := "missing", "Field required", pyRepr(c.body)
+		if !fe.missing {
+			typ, msg, in = "string_type", "Input should be a valid string", pyRepr(fe.value)
+		}
+		c.fail(http.StatusBadRequest, fmt.Sprintf(
+			"[{'type': '%s', 'loc': ('body', '%s'), 'msg': '%s', 'input': %s}]", typ, p, msg, in), "", "")
 	case styleOllama:
-		msg := "invalid character looking for beginning of value"
-		if len(c.body) == 0 {
+		if fe.missing {
+			c.fail(http.StatusBadRequest, p+" is required", "", "")
+			return
+		}
+		c.fail(http.StatusBadRequest, "invalid "+p+" type", "", "")
+	case styleOllamaV1:
+		if fe.missing {
+			c.fail(http.StatusBadRequest, fmt.Sprintf("[] is too short - '%s'", p), "", "")
+			return
+		}
+		c.fail(http.StatusBadRequest, "invalid "+p+" type", "", "")
+	default:
+		if fe.missing {
+			c.fail(http.StatusBadRequest, fmt.Sprintf("Missing required parameter: '%s'.", p), p, "missing_required_parameter")
+			return
+		}
+		c.fail(http.StatusBadRequest, fmt.Sprintf(
+			"Invalid type for '%s': expected one of a string or array of strings or tokens, but got %s instead.",
+			p, jsonTypeName(fe.value)), p, "invalid_type")
+	}
+}
+
+// failJSON answers a body that does not parse as a JSON object.
+func (c *call) failJSON(je *jsonError) {
+	switch c.style {
+	case styleOllama, styleOllamaV1:
+		// gin binds with encoding/json and passes its error text through.
+		msg := "invalid request body"
+		switch {
+		case len(c.body) == 0:
 			msg = "missing request body"
+		case je.err != nil:
+			msg = je.err.Error()
 		}
 		c.fail(http.StatusBadRequest, msg, "", "")
 	case styleVLLM:
@@ -399,12 +466,81 @@ func (c *call) failParse(err error) {
 	}
 }
 
-func asLimit(err error, target **limitError) bool {
-	le, ok := err.(*limitError)
-	if ok {
-		*target = le
+// jsonTypeName names the JSON type of raw the way OpenAI errors do.
+func jsonTypeName(raw json.RawMessage) string {
+	t := bytes.TrimSpace(raw)
+	switch {
+	case len(t) == 0 || string(t) == "null":
+		return "null"
+	case t[0] == '{':
+		return "an object"
+	case t[0] == '[':
+		return "an array"
+	case t[0] == '"':
+		return "a string"
+	case string(t) == "true" || string(t) == "false":
+		return "a boolean"
+	case bytes.ContainsAny(t, ".eE"):
+		return "a number"
 	}
-	return ok
+	return "an integer"
+}
+
+// pyRepr renders a JSON value as Python would print the decoded object, capped
+// so that an error never echoes a large client value.
+func pyRepr(raw json.RawMessage) string {
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		return "None"
+	}
+	var b strings.Builder
+	pyWrite(&b, v, 0)
+	return truncRunes(cleanEcho(b.String(), 256), 256)
+}
+
+func pyWrite(b *strings.Builder, v any, depth int) {
+	if b.Len() > 512 || depth > 4 {
+		return
+	}
+	switch t := v.(type) {
+	case nil:
+		b.WriteString("None")
+	case bool:
+		if t {
+			b.WriteString("True")
+		} else {
+			b.WriteString("False")
+		}
+	case float64:
+		b.WriteString(strconv.FormatFloat(t, 'g', -1, 64))
+	case string:
+		b.WriteString("'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(t) + "'")
+	case []any:
+		b.WriteByte('[')
+		for i, it := range t {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			pyWrite(b, it, depth+1)
+		}
+		b.WriteByte(']')
+	case map[string]any:
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		b.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			pyWrite(b, k, depth+1)
+			b.WriteString(": ")
+			pyWrite(b, t[k], depth+1)
+		}
+		b.WriteByte('}')
+	}
 }
 
 // checkModel resolves the requested model. Only configured names are ever
@@ -437,7 +573,7 @@ func (c *call) modelNotFound(name string, lookup bool) {
 	case styleVLLM:
 		c.fail(http.StatusNotFound, fmt.Sprintf("The model `%s` does not exist.", name), "", "")
 	case styleOllama, styleOllamaV1:
-		c.fail(http.StatusNotFound, fmt.Sprintf("model %q not found, try pulling it first", name), "", "")
+		c.modelMissing(name)
 	default:
 		if lookup {
 			c.fail(http.StatusNotFound, fmt.Sprintf("The model '%s' does not exist", name), "model", "model_not_found")
@@ -452,6 +588,10 @@ func (s *Server) serveInference(c *call, k kind) {
 	p, err := s.parseInference(c, k)
 	if err != nil {
 		c.failParse(err)
+		return
+	}
+	if p.noMessages {
+		c.failParse(&fieldError{param: "messages", missing: true})
 		return
 	}
 	model, ok := c.checkModel(p.model)

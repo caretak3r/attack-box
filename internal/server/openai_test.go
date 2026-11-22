@@ -99,7 +99,7 @@ func TestOpenAIModelErrors(t *testing.T) {
 	if rec.Code != 400 || e["message"] != "you must provide a model parameter" {
 		t.Fatalf("missing model: %d %v", rec.Code, e)
 	}
-	rec = r.do("POST", "/v1/chat/completions", `{"model":"nope‮\u0007"}`)
+	rec = r.do("POST", "/v1/chat/completions", `{"model":"nope‮\u0007","messages":[]}`)
 	e = sub(t, decode(t, rec), "error")
 	if rec.Code != 404 || e["code"] != "model_not_found" ||
 		e["message"] != "The model `nope` does not exist or you do not have access to it." {

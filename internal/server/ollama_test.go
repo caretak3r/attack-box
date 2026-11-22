@@ -103,7 +103,7 @@ func TestOllamaLoadRequests(t *testing.T) {
 func TestOllamaErrors(t *testing.T) {
 	r := newRig(t, PersonaOllama)
 	rec := r.do("POST", "/api/chat", `{"model":"nope","messages":[{"role":"user","content":"x"}]}`)
-	if rec.Code != 404 || decode(t, rec)["error"] != `model "nope" not found, try pulling it first` {
+	if rec.Code != 404 || decode(t, rec)["error"] != `model 'nope' not found` {
 		t.Fatalf("unknown = %d %s", rec.Code, rec.Body)
 	}
 	rec = r.do("POST", "/api/chat", `{}`)
@@ -138,9 +138,9 @@ func TestOllamaOpenAISubset(t *testing.T) {
 	if rec.Code != 200 || m["object"] != "chat.completion" || m["system_fingerprint"] != "fp_ollama" {
 		t.Fatalf("chat = %d %v", rec.Code, m)
 	}
-	rec = r.do("POST", "/v1/chat/completions", `{"model":"nope"}`)
+	rec = r.do("POST", "/v1/chat/completions", `{"model":"nope","messages":[]}`)
 	e := sub(t, decode(t, rec), "error")
-	if rec.Code != 404 || e["type"] != "not_found_error" {
+	if rec.Code != 404 || e["type"] != "not_found_error" || e["message"] != "model 'nope' not found" {
 		t.Fatalf("unknown = %d %v", rec.Code, e)
 	}
 	if rec = r.do("GET", "/v1/nothing", ""); rec.Code != 404 || rec.Body.String() != "404 page not found" {

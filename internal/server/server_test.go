@@ -30,7 +30,7 @@ func TestNewValidation(t *testing.T) {
 	}
 	c := s.cfg
 	if s.persona != PersonaOpenAI || c.Version != "1.0.0" || len(c.Models) != 3 || c.MaxBodyBytes != 1<<20 ||
-		c.MaxMessages != 256 || c.MaxTools != 64 || c.MaxConcurrent != 256 || c.MaxPerSource != 8 ||
+		c.MaxMessages != 1024 || c.MaxTools != 128 || c.MaxConcurrent != 256 || c.MaxPerSource != 8 ||
 		c.MaxStreamDuration != 180*time.Second || c.HoldSilent != 150*time.Second ||
 		c.IdleInterval != 45*time.Second || len(c.SessionKey) == 0 || len(c.EmbedSeed) == 0 ||
 		c.Redactor == nil || c.Sink == nil || c.Now == nil || c.After == nil {

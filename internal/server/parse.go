@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"strings"
 
 	"attackbox/internal/responder"
@@ -21,7 +20,12 @@ const (
 	kindOllamaGenerate
 )
 
-var errBadJSON = errors.New("invalid JSON body")
+// jsonError reports a body that is not a JSON object. err is the decoder's own
+// error; it is nil for a literal null, which decodes without one.
+type jsonError struct{ err error }
+
+func (e *jsonError) Error() string { return "invalid JSON body" }
+func (e *jsonError) Unwrap() error { return e.err }
 
 // limitError reports an array over its cap.
 type limitError struct {
@@ -31,6 +35,21 @@ type limitError struct {
 }
 
 func (e *limitError) Error() string { return "array too long: " + e.param }
+
+// fieldError reports a required field that is absent or has the wrong type.
+// value is the offending value of a wrong-typed field.
+type fieldError struct {
+	param   string
+	missing bool
+	value   json.RawMessage
+}
+
+func (e *fieldError) Error() string {
+	if e.missing {
+		return "missing field: " + e.param
+	}
+	return "invalid field: " + e.param
+}
 
 // inferReq is one normalized inference request. It holds no request text
 // beyond what the responder needs.
@@ -45,14 +64,18 @@ type inferReq struct {
 	req          responder.Request
 	promptWords  int
 	load         bool // Ollama model-load request: no prompt at all
+	noMessages   bool // chat request without a messages array
 }
 
 // The decoders below are lenient: a field of the wrong type reads as absent.
 
 func decodeObject(b []byte) (map[string]json.RawMessage, error) {
 	var m map[string]json.RawMessage
-	if err := json.NewDecoder(bytes.NewReader(b)).Decode(&m); err != nil || m == nil {
-		return nil, errBadJSON
+	if err := json.NewDecoder(bytes.NewReader(b)).Decode(&m); err != nil {
+		return nil, &jsonError{err}
+	}
+	if m == nil {
+		return nil, &jsonError{}
 	}
 	return m, nil
 }
@@ -158,6 +181,9 @@ func (s *Server) parseInference(c *call, k kind) (*inferReq, error) {
 	switch k {
 	case kindChat, kindOllamaChat:
 		msgs, _ := arrayOf(raw["messages"])
+		if m, ok := raw["messages"]; k == kindChat && (!ok || string(m) == "null") {
+			p.noMessages = true
+		}
 		if len(msgs) > s.cfg.MaxMessages {
 			return nil, &limitError{"messages", s.cfg.MaxMessages, len(msgs)}
 		}
@@ -255,9 +281,10 @@ func jsonRequested(k kind, raw map[string]json.RawMessage) bool {
 }
 
 // embedInputs reads an embeddings input: a string, an array of strings or an
-// array of token arrays. Non-string items are hashed as their JSON text.
+// array of token arrays. Non-string items are hashed as their JSON text. An
+// absent or null input reads as none; any other type is a fieldError.
 func (s *Server) embedInputs(raw json.RawMessage) ([]string, error) {
-	if len(raw) == 0 {
+	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
 	}
 	if sv := str(raw); sv != "" || bytes.Equal(bytes.TrimSpace(raw), []byte(`""`)) {
@@ -265,7 +292,7 @@ func (s *Server) embedInputs(raw json.RawMessage) ([]string, error) {
 	}
 	items, ok := arrayOf(raw)
 	if !ok {
-		return []string{string(raw)}, nil
+		return nil, &fieldError{param: "input", value: raw}
 	}
 	if len(items) > maxEmbedInputs {
 		return nil, &limitError{"input", maxEmbedInputs, len(items)}

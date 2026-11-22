@@ -3,7 +3,6 @@ package server
 import (
 	"errors"
 	"net/http"
-	"time"
 )
 
 // wordsPerChunk is how many words one streamed delta carries.
@@ -23,8 +22,7 @@ type format interface {
 // the hold (if any) runs, then the stream ends normally.
 func (c *call) stream(f format, text, hold string) {
 	w := c.w
-	rc := http.NewResponseController(w)
-	_ = rc.SetWriteDeadline(time.Now().Add(c.s.cfg.MaxStreamDuration + 15*time.Second))
+	rc := c.rc // the write deadline was set in serve
 	h := w.Header()
 	h.Set("Content-Type", f.contentType())
 	h.Set("Cache-Control", "no-cache")

@@ -2,6 +2,9 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -90,6 +93,21 @@ func TestIDShapes(t *testing.T) {
 		a, b := s.newID(tc.prefix), s.newID(tc.prefix)
 		if !strings.HasPrefix(a, tc.prefix) || len(a)-len(tc.prefix) != tc.n || a == b {
 			t.Errorf("%s %s: %q %q", tc.persona, tc.prefix, a, b)
+		}
+	}
+	// Ollama's OpenAI layer numbers its ids: chatcmpl-<0..998>, cmpl-<n>.
+	num := regexp.MustCompile(`^(chatcmpl-|cmpl-)(0|[1-9][0-9]{0,2})$`)
+	os := newRig(t, PersonaOllama).srv
+	for _, prefix := range []string{"chatcmpl-", "cmpl-"} {
+		for i := 0; i < 50; i++ {
+			id := os.newID(prefix)
+			m := num.FindStringSubmatch(id)
+			if m == nil || m[1] != prefix {
+				t.Fatalf("ollama id %q", id)
+			}
+			if n, _ := strconv.Atoi(m[2]); n > 998 {
+				t.Fatalf("ollama id %q out of range", id)
+			}
 		}
 	}
 	if fp := newRig(t, PersonaOllama).srv.fingerprint("qwen3:8b"); fp != "fp_ollama" {
@@ -225,10 +243,10 @@ func TestParseInference(t *testing.T) {
 	if _, err = parse(kindChat, `[1]`); err == nil {
 		t.Fatal("array body accepted")
 	}
-	if _, err = parse(kindResponses, `{"input":`+manyStrings(300)+`}`); err == nil {
+	if _, err = parse(kindResponses, `{"input":`+manyStrings(1100)+`}`); err == nil {
 		t.Fatal("responses input over the cap accepted")
 	}
-	if _, err = parse(kindChat, `{"functions":`+manyObjects(65)+`}`); err == nil {
+	if _, err = parse(kindChat, `{"functions":`+manyObjects(129)+`}`); err == nil {
 		t.Fatal("functions over the cap accepted")
 	} else if le, ok := err.(*limitError); !ok || le.param != "functions" || le.Error() == "" {
 		t.Fatalf("limit error = %#v", err)
@@ -250,7 +268,7 @@ func TestEmbedInputs(t *testing.T) {
 		want []string
 	}{
 		{`"a"`, []string{"a"}}, {`""`, []string{""}}, {`["a","","b"]`, []string{"a", "", "b"}},
-		{`[[1,2],[3]]`, []string{"[1,2]", "[3]"}}, {`[1,2,3]`, []string{"1", "2", "3"}}, {`7`, []string{"7"}},
+		{`[[1,2],[3]]`, []string{"[1,2]", "[3]"}}, {`[1,2,3]`, []string{"1", "2", "3"}},
 	}
 	for _, tc := range cases {
 		got, err := s.embedInputs(raw(tc.in))
@@ -263,6 +281,12 @@ func TestEmbedInputs(t *testing.T) {
 	}
 	if _, err := s.embedInputs(raw(manyStrings(maxEmbedInputs + 1))); err == nil {
 		t.Error("input over the cap accepted")
+	}
+	for _, in := range []string{`7`, `true`, `{"a":1}`} {
+		var fe *fieldError
+		if _, err := s.embedInputs(raw(in)); !errors.As(err, &fe) || fe.param != "input" || fe.missing {
+			t.Errorf("input %s = %v, want a type fieldError", in, err)
+		}
 	}
 }
 

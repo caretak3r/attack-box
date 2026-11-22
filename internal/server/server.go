@@ -41,8 +41,8 @@ type Config struct {
 	EmbedSeed  []byte
 
 	MaxBodyBytes      int64         // request body cap; default 1 MiB
-	MaxMessages       int           // messages, input items and prompts per request; default 256
-	MaxTools          int           // tools per request; default 64
+	MaxMessages       int           // messages, input items and prompts per request; default 1024
+	MaxTools          int           // tools per request; default 128
 	MaxConcurrent     int           // in-flight requests, all sources; default 256
 	MaxPerSource      int           // in-flight requests per source; default 8
 	MaxStreamDuration time.Duration // longest hold; default 180s
@@ -107,10 +107,10 @@ func New(cfg Config) (*Server, error) {
 		cfg.MaxBodyBytes = 1 << 20
 	}
 	if cfg.MaxMessages <= 0 {
-		cfg.MaxMessages = 256
+		cfg.MaxMessages = 1024
 	}
 	if cfg.MaxTools <= 0 {
-		cfg.MaxTools = 64
+		cfg.MaxTools = 128
 	}
 	if cfg.MaxConcurrent <= 0 {
 		cfg.MaxConcurrent = 256
@@ -153,7 +153,8 @@ func New(cfg Config) (*Server, error) {
 
 // Handler returns the HTTP handler. Wrap it in an http.Server that sets
 // ReadHeaderTimeout and ReadTimeout; the handler bounds body size, not read
-// time.
+// time. Once the body is read the handler clears the read deadline, so
+// ReadTimeout never cuts a hold short, and it sets its own write deadline.
 func (s *Server) Handler() http.Handler { return http.HandlerFunc(s.serve) }
 
 // call is the state of one request.
@@ -167,6 +168,10 @@ type call struct {
 	ua    string
 	key   string
 	style errStyle
+	rc    *http.ResponseController
+
+	panicked  bool
+	panicInfo string
 
 	body      []byte
 	tooLarge  bool
@@ -186,14 +191,18 @@ type call struct {
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
-	c := &call{s: s, r: r, id: randHex(8), start: s.cfg.Now(), w: &recorder{ResponseWriter: w}}
+	rid := randHex(16)
+	c := &call{s: s, r: r, id: rid[:16], start: s.cfg.Now(), w: &recorder{ResponseWriter: w}}
+	c.rc = http.NewResponseController(w)
 	c.src = s.source(r)
 	c.ua = r.UserAgent()
 	c.key = s.sessionKey(c.src, c.ua, r.Header)
 	c.style = s.styleFor(r.URL.Path)
 	c.endpoint = "/unmatched"
-	s.personaHeaders(c)
+	s.personaHeaders(c, rid)
 	defer s.finish(c)
+	defer c.recoverPanic()
+	c.extendWriteDeadline()
 
 	release, ok := s.acquire(c.src)
 	if !ok {
@@ -208,6 +217,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	defer release()
 
 	c.readBody(w)
+	// No read-deadline reset here: net/http clears the connection's read
+	// deadline itself once the body hits EOF (startBackgroundRead), so a hold
+	// outlives ReadTimeout. TestReadTimeoutDoesNotCutHold pins that down.
+	c.extendWriteDeadline()
 	h, allowed := s.lookup(c)
 	switch {
 	case h == nil && len(allowed) == 0:
@@ -221,13 +234,42 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// personaHeaders sets the headers every response of the persona carries.
-func (s *Server) personaHeaders(c *call) {
+// extendWriteDeadline gives the response the longest hold plus slack. Without
+// it a client that stops reading pins the connection and its slot.
+func (c *call) extendWriteDeadline() {
+	_ = c.rc.SetWriteDeadline(time.Now().Add(c.s.cfg.MaxStreamDuration + 15*time.Second))
+}
+
+// recoverPanic turns a handler panic into the persona's 500. The request is
+// logged with panic=true rather than as a client that left.
+func (c *call) recoverPanic() {
+	v := recover()
+	if v == nil {
+		return
+	}
+	if v == http.ErrAbortHandler {
+		panic(v)
+	}
+	c.panicked = true
+	c.panicInfo = truncRunes(cleanEcho(fmt.Sprint(v), 256), 256)
+	if c.w.status != 0 {
+		return
+	}
+	msg := "Internal Server Error"
+	if c.style == styleOpenAI {
+		msg = "The server had an error while processing your request. Sorry about that!"
+	}
+	c.fail(http.StatusInternalServerError, msg, "", "")
+}
+
+// personaHeaders sets the headers every response of the persona carries. rid
+// is the full 32-hex request id; the log keeps its first half.
+func (s *Server) personaHeaders(c *call, rid string) {
 	h := c.w.Header()
 	switch s.persona {
 	case PersonaOpenAI:
 		// api.openai.com echoes a request id; vLLM sends none by default.
-		h.Set("X-Request-Id", c.id)
+		h.Set("X-Request-Id", "req_"+rid)
 	case PersonaVLLM:
 		h.Set("Server", "uvicorn")
 	}
