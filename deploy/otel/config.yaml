@@ -1,0 +1,194 @@
+# Raw logs remain in the Go shipper. Native Infrastructure owns host metrics.
+# No duplicate host-metric receiver or OTLP logs pipeline.
+receivers:
+  otlp/bait:
+    protocols:
+      grpc:
+        transport: unix
+        endpoint: /run/attackbox-otel/bait/otlp.sock
+        max_recv_msg_size_mib: 1
+        max_concurrent_streams: 8
+  otlp/shipper:
+    protocols:
+      grpc:
+        transport: unix
+        endpoint: /run/attackbox-otel/shipper/otlp.sock
+        max_recv_msg_size_mib: 1
+        max_concurrent_streams: 8
+  prometheus/coverage:
+    config:
+      scrape_configs:
+        - job_name: attackbox-hostcollector
+          scrape_interval: 15s
+          scrape_timeout: 5s
+          sample_limit: 2000
+          label_limit: 20
+          label_name_length_limit: 128
+          label_value_length_limit: 256
+          static_configs:
+            - targets: [127.0.0.1:9465]
+  prometheus/collector:
+    config:
+      scrape_configs:
+        - job_name: attackbox-otel
+          scrape_interval: 15s
+          scrape_timeout: 5s
+          sample_limit: 2000
+          static_configs:
+            - targets: [127.0.0.1:8888]
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 192
+    spike_limit_mib: 32
+  transform/bait:
+    error_mode: propagate
+    trace_statements:
+      - keep_keys(resource.attributes, [])
+      - set(resource.attributes["service.name"], "attackbox-bait")
+      - set(resource.attributes["service.instance.id"], "${env:ATTACKBOX_BAIT_INSTANCE_ID}")
+      - set(resource.attributes["container.id"], "${env:ATTACKBOX_BAIT_CONTAINER_ID}")
+      - set(span.kind, SPAN_KIND_INTERNAL)
+      - set(span.kind, SPAN_KIND_SERVER) where span.name == "bait.request"
+  transform/shipper:
+    error_mode: propagate
+    trace_statements:
+      - keep_keys(resource.attributes, [])
+      - set(resource.attributes["service.name"], "attackbox-shipper")
+      - set(resource.attributes["service.instance.id"], "${env:ATTACKBOX_SHIPPER_INSTANCE_ID}")
+      - set(span.kind, SPAN_KIND_CLIENT)
+  transform/traces:
+    error_mode: propagate
+    trace_statements:
+      - set(resource.attributes["host.id"], "${env:ATTACKBOX_HOST_ID}")
+      - set(resource.attributes["host.name"], "${env:ATTACKBOX_HOST_NAME}")
+      - set(resource.attributes["campaign.id"], "${env:ATTACKBOX_CAMPAIGN_ID}")
+      - set(resource.attributes["service.namespace"], "attackbox")
+      - set(resource.attributes["sensor_id"], "${env:ATTACKBOX_HOST_ID}")
+      - set(resource.attributes["deployment_id"], "${env:ATTACKBOX_CAMPAIGN_ID}")
+      - set(resource.attributes["tags.sensor_id"], "${env:ATTACKBOX_HOST_ID}")
+      - set(resource.attributes["tags.deployment_id"], "${env:ATTACKBOX_CAMPAIGN_ID}")
+      - set(resource.attributes["service.version"], "${env:ATTACKBOX_RELEASE_VERSION}")
+      - set(resource.schema_url, "")
+      - set(scope.schema_url, "")
+      - keep_keys(scope.attributes, [])
+      - set(scope.name, "attackbox")
+      - set(scope.version, "${env:ATTACKBOX_RELEASE_VERSION}")
+      - keep_keys(span.attributes, ["http.request.method", "http.route", "http.response.status_code", "attackbox.request_id", "attackbox.persona", "attackbox.hold_result", "attackbox.batch_records", "attackbox.batch_accepted", "error.type"])
+      - truncate_all(span.attributes, 128)
+      - set(span.status.message, "")
+      - set(span.trace_state, "")
+  filter/bait:
+    error_mode: propagate
+    trace_conditions:
+      - 'span.name != "bait.request" and span.name != "bait.response" and span.name != "bait.hold"'
+  filter/shipper:
+    error_mode: propagate
+    trace_conditions:
+      - 'span.name != "shipper.export"'
+  filter/traces:
+    error_mode: propagate
+    trace_conditions:
+      # Links and span events are outside this instrumentation contract.
+      - 'Len(span.links) > 0'
+      - 'spanevent.name == spanevent.name'
+      - 'span.attributes["http.request.method"] != nil and not IsString(span.attributes["http.request.method"])'
+      - 'span.attributes["http.route"] != nil and not IsString(span.attributes["http.route"])'
+      - 'span.attributes["attackbox.request_id"] != nil and not IsString(span.attributes["attackbox.request_id"])'
+      - 'span.attributes["attackbox.persona"] != nil and not IsString(span.attributes["attackbox.persona"])'
+      - 'span.attributes["attackbox.hold_result"] != nil and not IsString(span.attributes["attackbox.hold_result"])'
+      - 'span.attributes["error.type"] != nil and not IsString(span.attributes["error.type"])'
+      - 'span.attributes["http.response.status_code"] != nil and not IsInt(span.attributes["http.response.status_code"])'
+      - 'span.attributes["attackbox.batch_records"] != nil and not IsInt(span.attributes["attackbox.batch_records"])'
+      - 'span.attributes["attackbox.batch_accepted"] != nil and not IsInt(span.attributes["attackbox.batch_accepted"])'
+      - 'span.attributes["http.request.method"] != nil and not IsMatch(span.attributes["http.request.method"], "^(GET|HEAD|POST|PUT|DELETE|CONNECT|OPTIONS|TRACE|PATCH|_OTHER)$")'
+      - 'span.attributes["attackbox.request_id"] != nil and not IsMatch(span.attributes["attackbox.request_id"], "^[0-9a-f]{16}$")'
+      - 'span.attributes["attackbox.persona"] != nil and not IsMatch(span.attributes["attackbox.persona"], "^(openai|vllm|ollama)$")'
+      - 'span.attributes["attackbox.hold_result"] != nil and not IsMatch(span.attributes["attackbox.hold_result"], "^(completed|client_closed|server_shutdown)$")'
+      - 'span.attributes["error.type"] != nil and not IsMatch(span.attributes["error.type"], "^(export_failed|handler_error)$")'
+      - 'span.attributes["http.route"] != nil and (span.attributes["http.route"] != "/unmatched" and span.attributes["http.route"] != "/v1/models" and span.attributes["http.route"] != "/v1/models/{model}" and span.attributes["http.route"] != "/v1/chat/completions" and span.attributes["http.route"] != "/v1/completions" and span.attributes["http.route"] != "/v1/responses" and span.attributes["http.route"] != "/v1/responses/{response_id}" and span.attributes["http.route"] != "/v1/responses/{response_id}/cancel" and span.attributes["http.route"] != "/v1/embeddings" and span.attributes["http.route"] != "/v1/edge/{label}/status" and span.attributes["http.route"] != "/health" and span.attributes["http.route"] != "/version" and span.attributes["http.route"] != "/invocations" and span.attributes["http.route"] != "/metrics" and span.attributes["http.route"] != "/docs" and span.attributes["http.route"] != "/openapi.json" and span.attributes["http.route"] != "/" and span.attributes["http.route"] != "/api/version" and span.attributes["http.route"] != "/api/tags" and span.attributes["http.route"] != "/api/ps" and span.attributes["http.route"] != "/api/show" and span.attributes["http.route"] != "/api/generate" and span.attributes["http.route"] != "/api/chat" and span.attributes["http.route"] != "/api/embed" and span.attributes["http.route"] != "/api/embeddings" and span.attributes["http.route"] != "/api/pull" and span.attributes["http.route"] != "/api/push" and span.attributes["http.route"] != "/api/create" and span.attributes["http.route"] != "/api/copy" and span.attributes["http.route"] != "/api/delete")'
+      - 'span.attributes["http.response.status_code"] != nil and (span.attributes["http.response.status_code"] < 100 or span.attributes["http.response.status_code"] > 599)'
+      - 'span.attributes["attackbox.batch_records"] != nil and (span.attributes["attackbox.batch_records"] < 0 or span.attributes["attackbox.batch_records"] > 100000)'
+      - 'span.attributes["attackbox.batch_accepted"] != nil and (span.attributes["attackbox.batch_accepted"] < 0 or span.attributes["attackbox.batch_accepted"] > 100000)'
+  transform/host:
+    error_mode: propagate
+    metric_statements:
+      - keep_keys(resource.attributes, [])
+      - set(resource.attributes["host.id"], "${env:ATTACKBOX_HOST_ID}")
+      - set(resource.attributes["host.name"], "${env:ATTACKBOX_HOST_NAME}")
+      - set(resource.attributes["campaign.id"], "${env:ATTACKBOX_CAMPAIGN_ID}")
+      - set(resource.attributes["service.namespace"], "attackbox")
+      - set(resource.attributes["sensor_id"], "${env:ATTACKBOX_HOST_ID}")
+      - set(resource.attributes["deployment_id"], "${env:ATTACKBOX_CAMPAIGN_ID}")
+      - set(resource.attributes["tags.sensor_id"], "${env:ATTACKBOX_HOST_ID}")
+      - set(resource.attributes["tags.deployment_id"], "${env:ATTACKBOX_CAMPAIGN_ID}")
+  resource/coverage:
+    attributes:
+      - {key: service.name, value: attackbox-hostcollector, action: upsert}
+      - {key: service.instance.id, value: '${env:ATTACKBOX_MONITOR_INSTANCE_ID}', action: upsert}
+  resource/collector:
+    attributes:
+      - {key: service.name, value: attackbox-otel, action: upsert}
+      - {key: service.instance.id, value: '${env:ATTACKBOX_OTEL_INSTANCE_ID}', action: upsert}
+
+exporters:
+  otlp_http/newrelic:
+    endpoint: https://otlp.nr-data.net:443
+    headers:
+      api-key: ${file:${env:CREDENTIALS_DIRECTORY}/newrelic_license_key}
+    compression: gzip
+    timeout: 10s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 2
+      sizer: bytes
+      queue_size: 16777216
+      block_on_overflow: false
+      batch:
+        flush_timeout: 1s
+        min_size: 65536
+        max_size: 900000
+        sizer: bytes
+
+extensions:
+  # Process health only. It does not prove export or New Relic ingestion.
+  health_check:
+    endpoint: 127.0.0.1:13133
+    path: /
+
+service:
+  extensions: [health_check]
+  telemetry:
+    logs:
+      level: warn
+    metrics:
+      level: normal
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: 8888
+  pipelines:
+    traces/bait:
+      receivers: [otlp/bait]
+      processors: [memory_limiter, filter/bait, filter/traces, transform/bait, transform/traces]
+      exporters: [otlp_http/newrelic]
+    traces/shipper:
+      receivers: [otlp/shipper]
+      processors: [memory_limiter, filter/shipper, filter/traces, transform/shipper, transform/traces]
+      exporters: [otlp_http/newrelic]
+    metrics/coverage:
+      receivers: [prometheus/coverage]
+      processors: [memory_limiter, transform/host, resource/coverage]
+      exporters: [otlp_http/newrelic]
+    metrics/collector:
+      receivers: [prometheus/collector]
+      processors: [memory_limiter, transform/host, resource/collector]
+      exporters: [otlp_http/newrelic]

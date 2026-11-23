@@ -510,13 +510,13 @@ To recover the full body of a chunked event:
 
 ```nrql
 FROM Log
-SELECT message, body_sha256, chunk_index, chunk_count
+SELECT body_chunk, body_sha256, chunk_index, chunk_count
 WHERE record_id = '<record-id-here>'
   AND body_sha256 = '<sha256-here>'
 ORDER BY chunk_index ASC
 ```
 
-Manually concatenate the `message` fields in chunk order (0, 1, 2, ...).
+Manually concatenate the `body_chunk` fields in chunk order (0, 1, 2, ...).
 
 ### Deduplication in Dashboards and Alerts
 
@@ -1003,3 +1003,12 @@ For questions or issues:
 - Check `research/host-shipper-design.md` for shipper architecture.
 - Check `research/host-shipper-threat-review.md` for security corrections.
 - Check `newrelic/queries.md` for additional NRQL examples.
+
+## Live capture format
+
+Current exports store body text in `body_chunk`; `message` is an inert action label. For raw capture, reconstruct and verify all chunks, decode each base64 segment, and validate the completion manifest. Use the Go recovery tool and setup procedure in `/Users/rohit/attack-box/docs/live-evidence.md`. A redacted context log is not the raw evidence.
+
+## Native Infrastructure verification
+
+The VPS now runs native Infrastructure 2.1.1. Check `systemctl is-active newrelic-infra` and `curl -fsS http://127.0.0.1:18003/v1/status`. Check `host.cpuPercent`, `host.memoryUsedPercent` and `host.diskFreeBytes` with NRQL `average`; the account uses dimensional host metrics. Native host logs are explicit auth, syslog, dpkg, cloud-init and alternatives paths. Docker attack evidence stays on the Go shipper route. Do not use an active unit or a reporting entity as proof of complete attack capture. See `/Users/rohit/attack-box/newrelic/queries.md` and `/Users/rohit/attack-box/docs/attack-scenarios.md`.
+

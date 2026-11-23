@@ -4,6 +4,8 @@ Source baseline: `584a658`. Documentation review: 2026-11-22. No live VPS, gViso
 
 Architecture: `/Users/rohit/attack-box/docs/architecture.md`. Proposed improvements and deployment gates: `/Users/rohit/attack-box/IMPROVE.md`.
 
+Native New Relic Maps, component coverage, identity requirements and monitoring acceptance tests: `/Users/rohit/attack-box/docs/service-ecosystem.md`. That document includes a later host snapshot and a proposed instrumentation setup; it does not certify complete monitoring.
+
 ## Supported direction and current exposure
 
 Build runtime services in Go, using the version declared by `/Users/rohit/attack-box/go.mod` (currently Go 1.25). The repository supplies the bait and shipper binaries. The shipper binary also supplies stdin adapter modes. The proposed analysis job and typed response planner are not implemented services.
@@ -234,3 +236,35 @@ Do not draw these conclusions:
 A service change must update `/Users/rohit/attack-box/docs/architecture.md` and this guide in the same change. Record binary/build commands, protocol/schema version, inputs and outputs, all flags and environment defaults, validation rules, UID, secrets, network access, resource limits, storage and retention, health, shutdown, replay/loss behavior, installation, recovery, rollback, and tests.
 
 Mark future settings and binaries as proposed until implemented. The Go analysis job, typed response plans, public discovery profile, protected loss accounting, and adversarial acceptance suite in `/Users/rohit/attack-box/IMPROVE.md` remain future work. Do not substitute a successful build or static script test for the deployment checks above.
+
+## Live evidence and delivery
+
+The implemented application capture, batch export, evidence recovery CLI, shutdown ordering, dashboard setup and validation gates are documented in `/Users/rohit/attack-box/docs/live-evidence.md`. The process defaults to `ATTACKBOX_FULL_EVIDENCE=true`; Compose sets it explicitly. Raw capture preserves submitted bytes and credentials; readable summaries remain redacted. This does not extend capture to proxy-rejected traffic or remove bounded-queue loss. The host collector is still proposed.
+
+## Optional service ecosystem monitoring
+
+The approved Go tracing and host readiness profile is documented in `/Users/rohit/attack-box/docs/monitoring-setup.md`. It uses private Unix trace sockets and loopback metrics endpoints. It does not expose public OTLP ports. It is not part of the default deployment. Follow that runbook for installation, identity, restart, remote verification and rollback. The forensic host reader remains separate work.
+
+## Durable host readers and rejected records
+
+This source change requires a paired shipper and host-reader release. It is not installed on the VPS until the exact-commit deployment gate passes.
+
+Bootstrap exports `/usr/local/bin/attackbox-shipper` and `/usr/local/bin/attackbox-hostreader`. It enables `ATTACKBOX_HOST_RECEIPTS=true` in `/etc/attackbox/shipper.env`; an explicit conflicting value fails validation. The runtime and egress units use private state directories `/var/lib/attackbox-falco-reader` and `/var/lib/attackbox-egress-reader`, mode 0700. Each reader has a 128 MiB memory cap. Keep source logs and journal retention long enough to cover the maximum outage.
+
+For migration, stop both adapters, install the paired binaries and units, validate the environment, restart the shipper, then start the adapters. Confirm both role heartbeats and a synthetic source record in New Relic. First start replays retained source data; budget for that backlog. Do not run an old stdin adapter on a receipt-enabled socket.
+
+For rollback, stop the readers, restore the previous shipper and unit files, restore the previous environment, then restart in the same order. Preserve cursor directories and queue data. A legacy adapter cannot resume the new source cursor and can miss data during rollback.
+
+If a reader reports a source gap, stop source rotation and preserve the files. Restore the saved inode or journal interval from an archive before retry. Do not delete cursor state to make the service green. File rotation is limited to rename-and-reopen with the old writer closed and no intermediate rotations while the reader is behind. Copy-truncate and compressed rotated files are unsupported.
+
+If `quarantine_records` is nonzero, inspect `/var/lib/attackbox-shipper/queue/quarantine` as inert evidence. Each mode-0600 JSON file holds the source role, queue sequence, bounded rejection reason, SHA-256 and exact queue bytes encoded as base64. Copy and verify an archive before any operator removal. There is no automatic deletion or replay command. A full quarantine stops export; it must not silently discard evidence. A positive receipt from the source socket means local durability only.
+
+Validation commands for this change:
+
+```bash
+cd /Users/rohit/attack-box
+GOTOOLCHAIN=go1.25.11 go test -race ./internal/hostevidence ./internal/shipper ./internal/telemetry ./cmd/attackbox-shipper ./internal/server
+GOTOOLCHAIN=go1.25.11 go vet ./...
+shellcheck -S error /Users/rohit/attack-box/scripts/deploy-ubuntu.sh /Users/rohit/attack-box/scripts/test-deploy-ubuntu.sh
+bash /Users/rohit/attack-box/scripts/test-deploy-ubuntu.sh
+```

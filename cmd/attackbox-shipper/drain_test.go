@@ -217,3 +217,92 @@ func TestDrainReturnsFinalAckError(t *testing.T) {
 		t.Fatalf("got %v, want ErrQueueBroken from the final ack", err)
 	}
 }
+
+type batchSink struct {
+	fakeSink
+	ship func([]telemetry.Record) error
+}
+
+func (s *batchSink) ShipRecords(records []telemetry.Record) error { return s.ship(records) }
+
+func TestDeliverBatchKeepsEntireBatchOnFailure(t *testing.T) {
+	entries := []shipper.Entry{eventEntry(t, 1), metricEntry(t, 2, "count"), eventEntry(t, 3)}
+	var calls [][]telemetry.Record
+	s := &batchSink{ship: func(records []telemetry.Record) error {
+		calls = append(calls, records)
+		if len(calls) == 1 {
+			// Simulate earlier POST acceptance followed by a later failure.
+			return errors.New("second HTTP request failed")
+		}
+		return nil
+	}}
+	n, blocked, err := deliver(context.Background(), s, entries, 0)
+	if n != 0 || !blocked || err != nil {
+		t.Fatalf("partial failure: n=%d blocked=%v err=%v", n, blocked, err)
+	}
+	n, blocked, err = deliver(context.Background(), s, entries, 0)
+	if n != 3 || blocked || err != nil || len(calls) != 2 {
+		t.Fatalf("replay: n=%d blocked=%v err=%v calls=%d", n, blocked, err, len(calls))
+	}
+	for i := range calls[0] {
+		a, _ := json.Marshal(calls[0][i])
+		b, _ := json.Marshal(calls[1][i])
+		if string(a) != string(b) {
+			t.Fatalf("record %d changed on replay", i)
+		}
+	}
+}
+
+func TestDeliverBatchSuppressesUncertainMetricsAndHonorsAcceptance(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entries := []shipper.Entry{eventEntry(t, 1), metricEntry(t, 2, "count"), metricEntry(t, 3, "count")}
+	s := &batchSink{ship: func(records []telemetry.Record) error {
+		if len(records) != 2 || records[0].Event == nil || records[1].Metric == nil {
+			t.Fatalf("uncertain metrics not suppressed: %+v", records)
+		}
+		cancel() // accepted remote response races with shutdown
+		return nil
+	}}
+	n, blocked, err := deliver(ctx, s, entries, 2)
+	if n != 3 || blocked || err != nil {
+		t.Fatalf("accepted batch must count: n=%d blocked=%v err=%v", n, blocked, err)
+	}
+}
+
+func TestDeliverBatchRejectsCorruptPayloadBeforeSending(t *testing.T) {
+	s := &batchSink{ship: func([]telemetry.Record) error {
+		t.Fatal("corrupt batch must not be sent")
+		return nil
+	}}
+	for _, bad := range []string{"invalid JSON", `{}`, `{"event":{},"metric":{}}`} {
+		entries := []shipper.Entry{eventEntry(t, 1), {Seq: 2, Data: []byte(bad)}}
+		n, blocked, err := deliver(context.Background(), s, entries, 0)
+		if n != 0 || blocked || err == nil {
+			t.Fatalf("bad payload %q: n=%d blocked=%v err=%v", bad, n, blocked, err)
+		}
+	}
+}
+
+func TestDrainSingleRecordDoesNotWaitForFullBatch(t *testing.T) {
+	q := &fakeQueue{}
+	got := make(chan int, 1)
+	s := &batchSink{ship: func(records []telemetry.Record) error {
+		got <- len(records)
+		return nil
+	}}
+	stop := runDrain(t, q, s, false, 0)
+	defer stop()
+	waitFor(t, "initial idle poll", func() bool { reads, _ := q.snapshot(); return reads > 0 })
+	q.mu.Lock()
+	q.batches = append(q.batches, []shipper.Entry{eventEntry(t, 1)})
+	q.mu.Unlock()
+	select {
+	case n := <-got:
+		if n != 1 {
+			t.Fatalf("got batch size %d", n)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("quiet record waited for a batch or flush interval")
+	}
+}

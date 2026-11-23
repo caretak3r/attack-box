@@ -6,6 +6,9 @@ services:
     image: attackbox-bait:dev
     pull_policy: never
     container_name: attackbox-bait
+    # HTTP shutdown, handler completion, remote drain, and local drain each
+    # have a 15s bound. Leave margin before Docker sends SIGKILL.
+    stop_grace_period: 90s
     
     # Non-root user 65532:65532 (Chainguard nonroot, matches host abx-bait group)
     user: "65532:65532"
@@ -81,6 +84,7 @@ services:
       ATTACKBOX_MAX_SESSIONS: "5000"
       ATTACKBOX_MAX_BODY_BYTES: "1048576"
       ATTACKBOX_MAX_LOG_BODY: "131072"
+      ATTACKBOX_FULL_EVIDENCE: "true"
       ATTACKBOX_MAX_PER_SOURCE: "8"
       ATTACKBOX_MAX_IN_FLIGHT: "256"
 
@@ -209,12 +213,12 @@ services:
     # Restart policy
     restart: unless-stopped
 
-    # Logging configuration (bounded local driver)
+    # Host journald owns retention; native Infrastructure reads docker.service.
+    # Bait keeps its separate Go evidence route and local log driver above.
     logging:
-      driver: local
+      driver: journald
       options:
-        max-size: "10m"
-        max-file: "3"
+        tag: "attackbox-proxy"
     # Depends on bait
     depends_on:
       bait:

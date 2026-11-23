@@ -32,6 +32,7 @@ const (
 // record content. Give each role its own socket: Falco and the egress
 // converter both run as root, so a uid alone cannot tell them apart.
 type Endpoint struct {
+	Receipts bool // root host producers only; one record/connection, durable append receipt
 	Path     string
 	Role     Role
 	Mode     os.FileMode // socket file mode; it only authorizes connect
@@ -90,6 +91,8 @@ func (c *IngestConfig) setDefaults() error {
 	paths := map[string]bool{}
 	for _, ep := range c.Endpoints {
 		switch {
+		case ep.Receipts && (ep.Role == RoleBait || len(ep.UIDs) != 1 || ep.UIDs[0] != 0):
+			return errors.New("shipper ingest: receipts require a root-only host role")
 		case !ep.Role.valid():
 			return fmt.Errorf("shipper ingest: endpoint %q: invalid role", ep.Path)
 		case seen[ep.Role]:
@@ -135,8 +138,8 @@ type IngestStats map[Role]RoleStats
 // durably to the queue before it reads more from the connection, so socket
 // backpressure bounds what is held in memory.
 //
-// Each connection is half-closed for writing at accept: the protocol sends no
-// byte to a producer, so a producer learns nothing from the shipper. A
+// Legacy connections, including bait, are half-closed for writing at accept.
+// Root-only host endpoints return durable local receipts and retain replays. A legacy
 // connection carries one producer boot; dedup keeps a per-role high-water
 // mark for the last maxBoots boots, so a resent batch after a reconnect is
 // dropped, while a shipper restart forgets the marks and may let a resend
@@ -295,7 +298,9 @@ func (in *Ingest) accept(ln *net.UnixListener, rs *roleState) {
 }
 
 func (in *Ingest) admitConn(c *net.UnixConn, rs *roleState) {
-	c.CloseWrite()
+	if !rs.ep.Receipts {
+		c.CloseWrite()
+	}
 	uid, _, err := peerCred(c)
 	if err != nil || !slices.Contains(rs.ep.UIDs, uid) {
 		rs.count(func(s *RoleStats) { s.Refused++ })
@@ -325,7 +330,11 @@ func (in *Ingest) admitConn(c *net.UnixConn, rs *roleState) {
 	rs.count(func(s *RoleStats) { s.Accepted++; s.Conns++ })
 	go func() {
 		defer in.wg.Done()
-		in.serveConn(c, rs)
+		if rs.ep.Receipts {
+			in.serveReceipt(c, rs)
+		} else {
+			in.serveConn(c, rs)
+		}
 		in.mu.Lock()
 		delete(in.conns, c)
 		in.mu.Unlock()

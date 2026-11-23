@@ -4,9 +4,6 @@
 # Both --disable-ssh --console-confirmed required for SSH/cloud-init changes
 
 set -euo pipefail
-# Do not trace the provisioning key or inherit an environment-based key.
-if [[ $- == *x* ]]; then set +x; fi
-unset NEW_RELIC_API_KEY
 
 # Configuration
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,7 +21,7 @@ readonly NR_LOG_HOST="log-api.newrelic.com"
 readonly NR_METRIC_HOST="metric-api.newrelic.com"
 
 # Flags
-MODE=""
+MODE="preflight"
 DISABLE_SSH=false
 CONSOLE_CONFIRMED=false
 NATIVE_KEY_STDIN=false
@@ -50,7 +47,7 @@ Options:
                              (requires Linux with Docker + gVisor; reports prerequisites)
     --refresh-install-sets   Populate expiring official New Relic installation destinations
     --native-key-stdin       Read the provisioning User API key from stdin (apply only)
-    --refresh-sets           Re-resolve New Relic/Ubuntu runtime endpoints into nftables sets
+    --refresh-sets           Re-resolve NR/Ubuntu endpoints into the nftables sets
                              (run by attackbox-nft-refresh.timer; needs the table loaded)
     --disable-ssh            Mark SSH for disablement (needs --console-confirmed)
     --console-confirmed      Confirm console access verified (needs --disable-ssh)
@@ -58,8 +55,7 @@ Options:
 
 SSH disablement requires BOTH --disable-ssh AND --console-confirmed.
 Verification mode requires Linux, Docker, and gVisor runtime.
-Before a manual source transfer, run go mod vendor and stage the pinned CLI
-with scripts/bootstrap-infrastructure.sh --stage bootstrap (create bootstrap first).
+For a manual source transfer, run go mod vendor before you upload the source.
 EOF
     exit "${1:-0}"
 }
@@ -83,25 +79,20 @@ ok() {
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --apply|--dry-run|--verify|--refresh-sets|--refresh-install-sets)
-            [[ -z "$MODE" ]] || { err "Choose only one deployment mode"; exit 1; }
-            MODE="${1#--}"
-            shift
-            ;;
+        --apply) MODE="apply"; shift ;;
+        --dry-run) MODE="preflight"; shift ;;
+        --verify) MODE="verify"; shift ;;
         --native-key-stdin) NATIVE_KEY_STDIN=true; shift ;;
+        --refresh-install-sets) MODE="refresh-install"; shift ;;
+        --refresh-sets) MODE="refresh"; shift ;;
         --disable-ssh) DISABLE_SSH=true; shift ;;
         --console-confirmed) CONSOLE_CONFIRMED=true; shift ;;
         -h|--help) usage 0 ;;
         *) err "Unknown option: $1"; usage 1 ;;
     esac
 done
-if [[ -z "$MODE" || "$MODE" == dry-run ]]; then MODE=preflight; fi
 
 # Validation
-if [[ "$NATIVE_KEY_STDIN" == true && "$MODE" != apply ]]; then
-    err "--native-key-stdin requires --apply"
-    exit 1
-fi
 if [[ "$DISABLE_SSH" == true && "$CONSOLE_CONFIRMED" != true ]]; then
     err "SSH disablement requires BOTH --disable-ssh AND --console-confirmed"
     exit 1
@@ -475,6 +466,8 @@ setup_falco() {
         want=$(cat <<'EOF'
 json_output: true
 json_include_output_property: true
+webserver:
+  listen_address: 127.0.0.1
 file_output:
   enabled: true
   keep_alive: false
@@ -547,6 +540,8 @@ resolve_nr_endpoints() {
     echo "$tmpdir"  # Return tmpdir path
 }
 
+# Host DNS/NTP must match what the nftables output policy allows (Cloudflare
+# only). Install before any firewall loads, or host lookups time out.
 use_host_dns_stub() {
     local resolver="$1" stub="$2" backup="${1}.pre-attackbox"
     [[ "$(readlink "$resolver" || true)" != "$stub" ]] || return 0
@@ -564,14 +559,12 @@ use_host_dns_stub() {
         return 1
     fi
     if [[ ( -e "$resolver" || -L "$resolver" ) && ! -e "$backup" && ! -L "$backup" ]]; then
-        cp -pP -- "$resolver" "$backup" || return
+        cp -pP -- "$resolver" "$backup"
     fi
-    ln -sfn -- "$stub" "$resolver" || return
+    ln -sfn -- "$stub" "$resolver"
     ok "Host DNS uses the systemd-resolved stub"
 }
 
-# Host DNS/NTP must match what the nftables output policy allows (Cloudflare
-# only). Install before any firewall loads, or host lookups time out.
 setup_host_dns_ntp() {
     log "Checking host DNS/NTP configuration..."
 
@@ -703,53 +696,71 @@ populate_nr_sets() {
     local ship_uid
     ship_uid=$(id -u "$SHIP_USER")
     nft add element inet attackbox shipper_uids { "$ship_uid" }
+
+    populate_otlp_sets
+    populate_native_sets runtime
 }
 
-# Resolve fixed destinations before replacing both address families atomically.
+# Fixed DNS names only; never accept an endpoint or address from a request.
+# Resolve every required host before mutation. An empty/invalid answer fails closed.
 populate_native_sets() {
-    local phase="$1" prefix host address resolved
+    local phase="$1" prefix host family address
     local hosts=() v4=() v6=()
-    case "$phase" in
-        runtime)
-            prefix=nr_infra
-            hosts=(infra-api.newrelic.com identity-api.newrelic.com infrastructure-command-api.newrelic.com metric-api.newrelic.com log-api.newrelic.com)
-            ;;
-        install)
-            prefix=nr_install
-            hosts=(download.newrelic.com api.newrelic.com insights-collector.newrelic.com urly.service.newrelic.com d20hasrqv82i0q.cloudfront.net github.com api.github.com raw.githubusercontent.com objects.githubusercontent.com release-assets.githubusercontent.com download.docker.com download.falco.org storage.googleapis.com archive.ubuntu.com security.ubuntu.com)
-            ;;
-        *) return 1 ;;
-    esac
-
+    if [[ "$phase" == runtime ]]; then
+        prefix=nr_infra
+        hosts=(infra-api.newrelic.com identity-api.newrelic.com infrastructure-command-api.newrelic.com metric-api.newrelic.com log-api.newrelic.com)
+    elif [[ "$phase" == install ]]; then
+        prefix=nr_install
+        hosts=(download.newrelic.com api.newrelic.com insights-collector.newrelic.com urly.service.newrelic.com d20hasrqv82i0q.cloudfront.net github.com api.github.com raw.githubusercontent.com objects.githubusercontent.com release-assets.githubusercontent.com download.docker.com download.falco.org storage.googleapis.com archive.ubuntu.com security.ubuntu.com)
+    else
+        return 1
+    fi
     for host in "${hosts[@]}"; do
-        resolved=false
+        local resolved=0
         while IFS= read -r address; do
             [[ "$address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
-            [[ " ${v4[*]:-} " == *" $address "* ]] || v4+=("$address")
-            resolved=true
+            v4+=("$address"); resolved=1
         done < <(dig +short +time=3 +tries=1 "$host" A)
         while IFS= read -r address; do
             [[ "$address" =~ ^[a-fA-F0-9:]+$ && "$address" == *:* ]] || continue
-            [[ " ${v6[*]:-} " == *" $address "* ]] || v6+=("$address")
-            resolved=true
+            v6+=("$address"); resolved=1
         done < <(dig +short +time=3 +tries=1 "$host" AAAA)
-        [[ "$resolved" == true ]] || { err "Cannot resolve native Infrastructure destination $host"; return 1; }
+        [[ $resolved == 1 ]] || { err "Cannot resolve native New Relic endpoint $host"; return 1; }
     done
-    if [[ ${#v4[@]} -gt 128 || ${#v6[@]} -gt 128 ]]; then
-        err "Too many native Infrastructure destination addresses"
+    [[ ${#v4[@]} -le 128 && ${#v6[@]} -le 128 ]] || return 1
+    for family in ipv4 ipv6; do
+        local entries=()
+        if [[ $family == ipv4 ]]; then entries=("${v4[@]}"); else entries=("${v6[@]}"); fi
+        for address in "${entries[@]}"; do
+            nft add element inet attackbox "${prefix}_${family}" "{" "$address" "}"
+        done
+    done
+}
+
+# Optional profile: leave the collector sets empty until its user exists.
+# No new egress permission is granted to root, bait, or the evidence shipper.
+populate_otlp_sets() {
+    local collector_uid ip
+    local v4=() v6=()
+    collector_uid=$(id -u abx-otel 2>/dev/null) || return 0
+    [[ "$collector_uid" =~ ^[0-9]+$ && "$collector_uid" != 0 ]] || return 1
+    while IFS= read -r ip; do
+        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && v4+=("$ip")
+    done < <(dig +short otlp.nr-data.net A | grep -v '\.$')
+    while IFS= read -r ip; do
+        [[ "$ip" =~ : ]] && v6+=("$ip")
+    done < <(dig +short otlp.nr-data.net AAAA | grep -v '\.$')
+    if [[ ${#v4[@]} -eq 0 || ${#v4[@]} -gt 32 || ${#v6[@]} -gt 32 ]]; then
+        err "OTLP DNS returned no IPv4 addresses or too many addresses"
         return 1
     fi
-
-    local IFS=,
-    {
-        printf 'flush set inet attackbox %s_ipv4\nflush set inet attackbox %s_ipv6\n' "$prefix" "$prefix"
-        if [[ ${#v4[@]} -gt 0 ]]; then
-            printf 'add element inet attackbox %s_ipv4 { %s }\n' "$prefix" "${v4[*]}"
-        fi
-        if [[ ${#v6[@]} -gt 0 ]]; then
-            printf 'add element inet attackbox %s_ipv6 { %s }\n' "$prefix" "${v6[*]}"
-        fi
-    } | nft -f - || return
+    for ip in "${v4[@]}"; do
+        nft add element inet attackbox nr_otlp_ipv4 "{" "$ip" "}"
+    done
+    for ip in "${v6[@]}"; do
+        nft add element inet attackbox nr_otlp_ipv6 "{" "$ip" "}"
+    done
+    nft add element inet attackbox collector_uids "{" "$collector_uid" "}"
 }
 
 setup_firewall() {
@@ -793,7 +804,6 @@ setup_firewall() {
 
         # Populate NR endpoint sets and shipper UID
         populate_nr_sets "$tmpdir"
-        populate_native_sets runtime
 
         # Persist across reboot: nftables.service loads /etc/nftables.conf. The
         # sets come back empty, attackbox-nft-refresh.timer repopulates them.
@@ -896,12 +906,9 @@ setup_unattended_upgrades() {
         if [[ "$MODE" == "apply" ]]; then
             local updated
             updated=$(mktemp "${sources}.XXXXXX")
-            if ! sed -E "s|$vultr_mirror|URIs: https://archive.ubuntu.com/ubuntu/|" "$sources" > "$updated" ||
-                ! chmod --reference="$sources" "$updated" || ! mv -fT -- "$updated" "$sources"; then
-                rm -f -- "$updated"
-                err "Cannot replace the Vultr Ubuntu archive mirror"
-                return 1
-            fi
+            sed -E "s|$vultr_mirror|URIs: https://archive.ubuntu.com/ubuntu/|" "$sources" > "$updated"
+            chmod --reference="$sources" "$updated"
+            mv -fT -- "$updated" "$sources"
             ok "Set the Ubuntu archive to an allowed mirror"
         else
             warn "Would replace the Vultr Ubuntu mirror with archive.ubuntu.com"
@@ -1026,9 +1033,10 @@ setup_systemd_units() {
 check_binaries() {
     log "Checking binaries..."
 
-    # Only shipper runs on host; bait runs in container
+    # Readers and shipper run on host; bait runs in container
     local binaries=(
         "/usr/local/bin/attackbox-shipper"
+        "/usr/local/bin/attackbox-hostreader"
     )
 
     local missing=()
@@ -1080,6 +1088,7 @@ check_shipper_env() {
         "ATTACKBOX_SPOOL_SOCKET=/run/attackbox/spool.sock"
         "ATTACKBOX_RUNTIME_SOCKET=/run/attackbox/runtime.sock"
         "ATTACKBOX_EGRESS_SOCKET=/run/attackbox/egress.sock"
+        "ATTACKBOX_HOST_RECEIPTS=true"
     )
 
     local missing=()
@@ -1087,6 +1096,9 @@ check_shipper_env() {
         local key="${setting%%=*}"
         if ! grep -q "^${key}=" "$env_file"; then
             missing+=("$setting")
+        elif [[ "$key" == "ATTACKBOX_HOST_RECEIPTS" ]] && ! grep -qxF "$setting" "$env_file"; then
+            err "$env_file must set ATTACKBOX_HOST_RECEIPTS=true for durable host readers"
+            return 1
         fi
     done
 
@@ -1127,22 +1139,25 @@ start_services() {
     ok "Started Docker"
 
     # Start shipper
+    # Upgrade the receipt protocol as a pair; do not leave old tail processes
+    # running against a newly installed receipt-enabled shipper.
+    systemctl stop attackbox-falco-adapter attackbox-egress-adapter
     systemctl enable attackbox-shipper
-    systemctl start attackbox-shipper
+    systemctl restart attackbox-shipper
     ok "Started attackbox-shipper"
 
     # Start Falco with Modern eBPF
     systemctl enable falco-modern-bpf
-    systemctl start falco-modern-bpf
+    systemctl restart falco-modern-bpf
     ok "Started falco-modern-bpf"
 
     # Start adapters
     systemctl enable attackbox-falco-adapter
-    systemctl start attackbox-falco-adapter
+    systemctl restart attackbox-falco-adapter
     ok "Started attackbox-falco-adapter"
 
     systemctl enable attackbox-egress-adapter
-    systemctl start attackbox-egress-adapter
+    systemctl restart attackbox-egress-adapter
     ok "Started attackbox-egress-adapter"
 
     # Keep nftables NR/Ubuntu sets fresh (they are empty after a reboot)
@@ -1205,8 +1220,8 @@ resolve_ubuntu_mirrors() {
     fi
 }
 
-# Re-resolve endpoints into the live sets (timer entry point).
-# The existing shipper and Ubuntu sets are additive.
+# Re-resolve endpoints into the live sets (timer entry point). Sets are
+# additive: stale IPs stay until the next boot or reload of /etc/nftables.conf.
 refresh_endpoint_sets() {
     log "Refreshing nftables endpoint sets..."
 
@@ -1222,7 +1237,6 @@ refresh_endpoint_sets() {
     rmdir "$tmpdir"
 
     resolve_ubuntu_mirrors
-    populate_native_sets runtime
     ok "Endpoint sets refreshed"
 }
 
@@ -1286,7 +1300,13 @@ prepare_bait() {
     local shipper_build
     shipper_build=$(mktemp -d)
     docker build --network=none --build-arg OFFLINE_GO_BUILD=1 --target shipper-export --output type=local,dest="$shipper_build" "$repo_root"
-    install -m 0755 -o root -g root "$shipper_build/attackbox-shipper" /usr/local/bin/attackbox-shipper
+    # Atomic replacement also works while the old executable is running.
+    local binary staged_binary
+    for binary in attackbox-shipper attackbox-hostreader; do
+        staged_binary=$(mktemp "/usr/local/bin/.${binary}.XXXXXX")
+        install -m 0755 -o root -g root "$shipper_build/$binary" "$staged_binary"
+        mv -f -- "$staged_binary" "/usr/local/bin/$binary"
+    done
     rm -rf "$shipper_build"
     ok "Installed attackbox-shipper binary"
 
@@ -1309,7 +1329,7 @@ start_bait() {
     fi
 
     systemctl enable attackbox
-    systemctl start attackbox
+    systemctl restart attackbox
     ok "Bait service started (Compose --wait ensures readiness)"
 }
 
@@ -1354,8 +1374,9 @@ run_verification_enhanced() {
         return 1
     fi
 
-    # runsc does not use Docker's embedded DNS. Check the pinned gVisor
-    # proxy-to-bait route over TLS; the bootstrap certificate is self-signed.
+    # runsc cannot use Docker's embedded DNS. The gVisor overlay pins bait
+    # and supplies its hosts entry to nginx. Verify the actual forwarding
+    # path, including TLS; -k permits the bootstrap self-signed certificate.
     log "Testing HTTPS proxy to bait..."
     if curl --noproxy '*' -kfsS --max-time 10 https://127.0.0.1:8443/v1/models |
         jq -e '.object == "list" and (.data | type == "array")' >/dev/null; then
@@ -1417,16 +1438,15 @@ main() {
 
     check_root
 
-    case "$MODE" in
-        refresh-sets)
-            refresh_endpoint_sets
-            exit $?
-            ;;
-        refresh-install-sets)
-            populate_native_sets install
-            exit $?
-            ;;
-    esac
+    if [[ "$MODE" == "refresh" ]]; then
+        refresh_endpoint_sets
+        exit $?
+    fi
+
+    if [[ "$MODE" == "refresh-install" ]]; then
+        populate_native_sets install
+        exit $?
+    fi
 
     check_linux
     check_os
@@ -1436,16 +1456,14 @@ main() {
         exit $?
     fi
 
-    local native_api_key=''
-    export -n native_api_key
+    local native_api_key="${NEW_RELIC_API_KEY:-}"
+    unset NEW_RELIC_API_KEY
     if [[ "$NATIVE_KEY_STDIN" == true ]]; then
+        [[ "$MODE" == apply ]] || { err "--native-key-stdin requires --apply"; exit 1; }
         IFS= read -r native_api_key || { err "Missing native provisioning API key on stdin"; exit 1; }
-        [[ -z "$native_api_key" || "$native_api_key" =~ ^NRAK-[A-Za-z0-9_-]{20,200}$ ]] ||
-            { err "Invalid native provisioning User API key"; exit 1; }
     fi
-    if [[ "$MODE" == apply && -z "$native_api_key" ]] && ! systemctl is-active --quiet newrelic-infra.service; then
-        err "Native Infrastructure bootstrap requires a User API key; use --native-key-stdin"
-        exit 1
+    if [[ "$MODE" == apply ]] && ! systemctl is-active --quiet newrelic-infra.service; then
+        [[ "$native_api_key" =~ ^NRAK-[A-Za-z0-9_-]{20,200}$ ]] || { err "Native Infrastructure bootstrap requires a User API key; use --native-key-stdin"; exit 1; }
     fi
 
     setup_users

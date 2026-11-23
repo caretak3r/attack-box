@@ -5,6 +5,7 @@ setup() {
   mkdir -p "$FIXTURE/scripts" "$FIXTURE/deploy/newrelic" "$FIXTURE/bootstrap" "$FIXTURE/bin" "$FIXTURE/etc/newrelic-infra/logging.d" "$FIXTURE/usr/local/sbin" "$FIXTURE/usr/bin"
   cp "$BATS_TEST_DIRNAME/bootstrap-infrastructure.sh" "$FIXTURE/scripts/"
   cp "$BATS_TEST_DIRNAME/../deploy/newrelic/host-logging.yml" "$FIXTURE/deploy/newrelic/"
+  cp "$BATS_TEST_DIRNAME/../deploy/newrelic/edge-logging.yml" "$FIXTURE/deploy/newrelic/"
   printf '#!/bin/sh\nexit 0\n' >"$FIXTURE/newrelic"
   chmod +x "$FIXTURE/newrelic"
   tar -czf "$FIXTURE/fixture.tar.gz" -C "$FIXTURE" newrelic
@@ -136,6 +137,7 @@ SH
   [ "$(cat "$FIXTURE/etc/newrelic-infra.yml")" = operator ]
   ! grep -q '^env ' "$FIXTURE/calls"
   ! grep -q 'refresh-install' "$FIXTURE/calls"
+  cmp "$FIXTURE/deploy/newrelic/edge-logging.yml" "$FIXTURE/etc/newrelic-infra/logging.d/attackbox-edge.yml"
 }
 
 @test "verify refuses missing agent" {

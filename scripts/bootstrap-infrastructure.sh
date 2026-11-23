@@ -75,7 +75,18 @@ done
 if [[ -e /etc/newrelic-infra.yml || -L /etc/newrelic-infra.yml ]]; then
   python3 "$ROOT/deploy/newrelic/configure-agent.py" --secure-only
 fi
+install_edge_route() {
+  local target=/etc/newrelic-infra/logging.d/attackbox-edge.yml staged
+  [[ ! -L $target ]] || fail 'edge logging configuration must not be a symlink'
+  install -d -m 0755 /etc/newrelic-infra/logging.d
+  staged=$(mktemp /etc/newrelic-infra/logging.d/.attackbox-edge.XXXXXX)
+  install -m 0600 "$ROOT/deploy/newrelic/edge-logging.yml" "$staged"
+  mv -f -- "$staged" "$target"
+}
 if verify_agent; then
+  # Infrastructure watches logging.d for changes; preserve its agent identity,
+  # credentials and operator-owned host log settings on upgrades.
+  install_edge_route
   printf '%s\n' 'Native Infrastructure is already ready; operator configuration preserved.'
   exit 0
 fi
@@ -136,6 +147,7 @@ for config in discovered.yml logging.yml; do
   fi
 done
 install -m 0600 "$ROOT/deploy/newrelic/host-logging.yml" /etc/newrelic-infra/logging.d/attackbox-host.yml
+install_edge_route
 systemctl enable newrelic-infra.service
 systemctl restart newrelic-infra.service
 ready=false

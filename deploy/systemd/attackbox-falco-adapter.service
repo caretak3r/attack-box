@@ -9,11 +9,10 @@ Type=simple
 User=root
 Group=root
 
-# Own socket on the shipper: the spool.sock default only admits the bait uid
-Environment=ATTACKBOX_SPOOL_SOCKET=/run/attackbox/runtime.sock
-
-# Follow Falco JSONL output and pipe to shipper
-ExecStart=/bin/bash -c 'exec tail -n0 -F /var/log/falco-events.jsonl | /usr/local/bin/attackbox-shipper -stdin-stream runtime'
+# Commit source positions only after durable shipper receipts.
+ExecStart=/usr/local/bin/attackbox-hostreader -source falco -state-dir /var/lib/attackbox-falco-reader -socket /run/attackbox/runtime.sock -file /var/log/falco-events.jsonl
+StateDirectory=attackbox-falco-reader
+StateDirectoryMode=0700
 
 # Hardening
 NoNewPrivileges=yes
@@ -21,7 +20,8 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadOnlyPaths=/
-ReadWritePaths=/var/log
+ReadWritePaths=/var/lib/attackbox-falco-reader
+RestrictAddressFamilies=AF_UNIX
 
 # Logging
 StandardOutput=journal
@@ -33,7 +33,7 @@ Restart=on-failure
 RestartSec=5s
 
 # Resource limits
-MemoryMax=64M
+MemoryMax=128M
 TasksMax=50
 
 [Install]

@@ -4,9 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
+	"attackbox/internal/observability"
 	"attackbox/internal/shipper"
 	"attackbox/internal/telemetry"
 )
@@ -16,6 +19,7 @@ import (
 const minQueueBytes = 5 * (shipper.MaxData + shipper.FrameHeader)
 
 type config struct {
+	tracing         observability.Config
 	endpoints       []shipper.Endpoint
 	queueDir        string
 	queueBytes      int64
@@ -24,12 +28,23 @@ type config struct {
 	nrLogURL        string
 	nrMetricURL     string
 	hostname        string
+	sensorID        string
+	deploymentID    string
 	shutdownTimeout time.Duration
 }
+
+// idRule is the shape of sensor and deployment IDs.
+var idRule = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
 
 func loadConfig(getenv func(string) string) (config, error) {
 	var c config
 	var errs []error
+
+	var traceErr error
+	c.tracing, traceErr = observability.FromEnv(getenv)
+	if traceErr != nil {
+		errs = append(errs, traceErr)
+	}
 
 	// Queue settings
 	c.queueDir = getenv("ATTACKBOX_SHIP_QUEUE_DIR")
@@ -73,6 +88,34 @@ func loadConfig(getenv func(string) string) (config, error) {
 		c.hostname = "attackbox"
 	}
 
+	// ATTACKBOX_SENSOR_ID names this sensor on every New Relic log and metric.
+	// Rule: idRule. Default: the host name above in lower case, or "attackbox"
+	// when that does not match the rule. A set value that breaks the rule is a
+	// configuration error.
+	c.sensorID = strings.ToLower(c.hostname)
+	if !idRule.MatchString(c.sensorID) {
+		c.sensorID = "attackbox"
+	}
+	if v := getenv("ATTACKBOX_SENSOR_ID"); v != "" {
+		if idRule.MatchString(v) {
+			c.sensorID = v
+		} else {
+			errs = append(errs, fmt.Errorf("ATTACKBOX_SENSOR_ID must match %s", idRule))
+		}
+	}
+
+	// ATTACKBOX_DEPLOYMENT_ID names the build that runs, so evidence from two
+	// rebuilds can be told apart. Rule: idRule. Default: "unset". A set value
+	// that breaks the rule is a configuration error.
+	c.deploymentID = "unset"
+	if v := getenv("ATTACKBOX_DEPLOYMENT_ID"); v != "" {
+		if idRule.MatchString(v) {
+			c.deploymentID = v
+		} else {
+			errs = append(errs, fmt.Errorf("ATTACKBOX_DEPLOYMENT_ID must match %s", idRule))
+		}
+	}
+
 	timeout := getenv("ATTACKBOX_SHIP_SHUTDOWN_TIMEOUT")
 	if timeout == "" {
 		c.shutdownTimeout = 15 * time.Second
@@ -105,6 +148,17 @@ func loadConfig(getenv func(string) string) (config, error) {
 		},
 	}
 
+	// Receipt mode requires the paired durable host readers. Legacy adapters
+	// remain supported when this explicit migration setting is absent.
+	hostReceipts := false
+	if v := getenv("ATTACKBOX_HOST_RECEIPTS"); v != "" {
+		var err error
+		hostReceipts, err = strconv.ParseBool(v)
+		if err != nil {
+			errs = append(errs, errors.New("ATTACKBOX_HOST_RECEIPTS must be a boolean"))
+		}
+	}
+
 	// Optional runtime socket
 	runtimeSocket := getenv("ATTACKBOX_RUNTIME_SOCKET")
 	if runtimeSocket != "" {
@@ -112,6 +166,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 			errs = append(errs, fmt.Errorf("ATTACKBOX_RUNTIME_SOCKET: %w", err))
 		}
 		c.endpoints = append(c.endpoints, shipper.Endpoint{
+			Receipts: hostReceipts,
 			Path:     runtimeSocket,
 			Role:     shipper.RoleRuntime,
 			Mode:     0220,
@@ -129,6 +184,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 			errs = append(errs, fmt.Errorf("ATTACKBOX_EGRESS_SOCKET: %w", err))
 		}
 		c.endpoints = append(c.endpoints, shipper.Endpoint{
+			Receipts: hostReceipts,
 			Path:     egressSocket,
 			Role:     shipper.RoleEgress,
 			Mode:     0220,

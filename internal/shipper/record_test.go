@@ -28,11 +28,11 @@ func ev(e telemetry.Event) telemetry.Record {
 	if e.Timestamp.IsZero() {
 		e.Timestamp = admitNow.Add(-time.Second)
 	}
-	return telemetry.Record{ID: testBoot + "-7", Event: &e}
+	return telemetry.Record{ID: testBoot + "-7", V: telemetry.SchemaVersion, Event: &e}
 }
 
 func met(name, kind string, v float64, attrs map[string]string) telemetry.Record {
-	return telemetry.Record{ID: testBoot + "-8", Metric: &telemetry.MetricRecord{Name: name, Kind: kind, Value: v, At: admitNow, Attrs: attrs}}
+	return telemetry.Record{ID: testBoot + "-8", V: telemetry.SchemaVersion, Metric: &telemetry.MetricRecord{Name: name, Kind: kind, Value: v, At: admitNow, Attrs: attrs}}
 }
 
 func mustReject(t *testing.T, role Role, l []byte, reason string) {
@@ -114,7 +114,11 @@ func TestAdmitRoleMatrix(t *testing.T) {
 		{RoleRuntime, telemetry.StreamRuntime, "falco", true, ""},
 		{RoleRuntime, telemetry.StreamRuntime, "start", false, "action"},
 		{RoleRuntime, telemetry.StreamEdge, "request", false, "stream"},
-		{RoleRuntime, telemetry.StreamHeartbeat, "bait_heartbeat", false, "stream"},
+		{RoleRuntime, telemetry.StreamHeartbeat, "bait_heartbeat", false, "action"},
+		{RoleRuntime, telemetry.StreamHeartbeat, "runtime_heartbeat", true, ""},
+		{RoleEgress, telemetry.StreamHeartbeat, "egress_heartbeat", true, ""},
+		{RoleBait, telemetry.StreamHeartbeat, "runtime_heartbeat", false, "action"},
+		{RoleRuntime, telemetry.StreamHeartbeat, "egress_heartbeat", false, "action"},
 		{RoleEgress, telemetry.StreamEgress, "egress_blocked", true, ""},
 		{RoleEgress, telemetry.StreamRuntime, "falco", false, "stream"},
 		{RoleEgress, telemetry.StreamProbe, "decision", false, "stream"},
@@ -184,13 +188,208 @@ func TestAdmitForgedIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := a.Record.Event.Attrs
-	want := map[string]any{"kept": "yes", "source": "bait", "record_id": a.Key(), "boot": testBoot, "seq": "7", "reserved_attrs_removed": true}
+	want := map[string]any{"kept": "yes", "source": "bait", "record_id": a.Key(), "boot": testBoot, "seq": "7", "reserved_attrs_removed": true,
+		"schema_version": telemetry.SchemaVersion, "ingest_ts": admitNow.UnixMilli()}
 	if len(got) != len(want) {
 		t.Fatalf("attrs = %v", got)
 	}
 	for k, v := range want {
 		if got[k] != v {
 			t.Fatalf("%s = %v, want %v", k, got[k], v)
+		}
+	}
+}
+
+func TestAdmitSchemaVersion(t *testing.T) {
+	absent := []byte(`{"id":"` + testBoot + `-7","event":{"stream":"edge","timestamp":"2026-11-22T11:59:59Z"}}`)
+	mustReject(t, RoleBait, absent, "schema_version")
+	for _, v := range []int{0, 2, -1} {
+		r := ev(telemetry.Event{Stream: telemetry.StreamEdge})
+		r.V = v
+		mustReject(t, RoleBait, line(t, r), "schema_version")
+	}
+	// A rejected version beats every later check, a bad id included.
+	bad := ev(telemetry.Event{Stream: telemetry.StreamEdge})
+	bad.V, bad.ID = 2, "nope"
+	mustReject(t, RoleBait, line(t, bad), "schema_version")
+
+	a, err := Admit(RoleBait, line(t, ev(telemetry.Event{Stream: telemetry.StreamEdge})), admitNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Record.V != 1 || a.Record.Event.Attrs["schema_version"] != 1 {
+		t.Fatalf("v = %d, schema_version = %v", a.Record.V, a.Record.Event.Attrs["schema_version"])
+	}
+	if !strings.Contains(string(a.Data), `"v":1`) {
+		t.Fatalf("queue payload has no v: %s", a.Data)
+	}
+	var back map[string]any
+	if err := json.Unmarshal(a.Data, &back); err != nil || back["v"] != 1.0 {
+		t.Fatalf("payload v = %v, err %v", back["v"], err)
+	}
+	// A metric record carries the version too.
+	m, err := Admit(RoleBait, line(t, met("attackbox.requests", "count", 1, nil)), admitNow)
+	if err != nil || !strings.Contains(string(m.Data), `"v":1`) {
+		t.Fatalf("metric: %v %s", err, m.Data)
+	}
+}
+
+func TestAdmitStampsIngestTime(t *testing.T) {
+	now := admitNow.Add(123456789 * time.Nanosecond) // sub-millisecond part must truncate
+	a, err := Admit(RoleBait, line(t, ev(telemetry.Event{Stream: telemetry.StreamEdge})), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := a.Record.Event.Attrs["ingest_ts"]; got != now.UnixMilli() {
+		t.Fatalf("ingest_ts = %v, want %d", got, now.UnixMilli())
+	}
+	var back telemetry.Record
+	if err := json.Unmarshal(a.Data, &back); err != nil {
+		t.Fatal(err)
+	}
+	if got := back.Event.Attrs["ingest_ts"]; got != float64(now.UnixMilli()) {
+		t.Fatalf("ingest_ts in Data = %v, want %d", got, now.UnixMilli())
+	}
+}
+
+func TestAdmitKeepsProducerTimeWhenClamped(t *testing.T) {
+	old := admitNow.Add(-25 * time.Hour).Add(7 * time.Millisecond)
+	ahead := admitNow.Add(6 * time.Minute).Add(9 * time.Millisecond)
+	inRange := admitNow.Add(-time.Hour)
+	cases := []struct {
+		name       string
+		ts         time.Time
+		clamped    bool
+		producerTS int64 // 0: absent
+	}{
+		{"too old", old, true, old.UnixMilli()},
+		{"too far ahead", ahead, true, ahead.UnixMilli()},
+		{"zero", time.Time{}, true, 0},
+		{"in range", inRange, false, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := ev(telemetry.Event{Stream: telemetry.StreamEdge})
+			r.Event.Timestamp = c.ts
+			a, err := Admit(RoleBait, line(t, r), admitNow)
+			if err != nil {
+				t.Fatal(err)
+			}
+			attrs := a.Record.Event.Attrs
+			if _, ok := attrs["timestamp_clamped"]; ok != c.clamped {
+				t.Fatalf("timestamp_clamped present = %v, want %v", ok, c.clamped)
+			}
+			if c.clamped && (attrs["timestamp_clamped"] != true || !a.Record.Event.Timestamp.Equal(admitNow)) {
+				t.Fatalf("clamped = %v, timestamp %v", attrs["timestamp_clamped"], a.Record.Event.Timestamp)
+			}
+			got, ok := attrs["producer_ts"]
+			if c.producerTS == 0 {
+				if ok {
+					t.Fatalf("producer_ts = %v, want none", got)
+				}
+				return
+			}
+			if got != c.producerTS {
+				t.Fatalf("producer_ts = %v, want %d", got, c.producerTS)
+			}
+			var back telemetry.Record
+			if err := json.Unmarshal(a.Data, &back); err != nil || back.Event.Attrs["producer_ts"] != float64(c.producerTS) {
+				t.Fatalf("producer_ts in Data = %v, err %v", back.Event.Attrs["producer_ts"], err)
+			}
+		})
+	}
+}
+
+func TestAdmitRemovesProvenanceNames(t *testing.T) {
+	names := []string{
+		"schema_version", "Schema_Version", "ingest_ts", "INGEST_TS", "producer_ts", "Producer_Ts",
+		"sensor_id", "SENSOR_ID", "deployment_id", "Deployment_Id", "shipper_boot", "Shipper_Boot",
+	}
+	roles := []struct {
+		role         Role
+		stream, acts string
+	}{
+		{RoleBait, telemetry.StreamEdge, "request"},
+		{RoleRuntime, telemetry.StreamRuntime, FalcoAction},
+		{RoleEgress, telemetry.StreamEgress, EgressAction},
+	}
+	for _, rl := range roles {
+		for _, name := range names {
+			in := ev(telemetry.Event{Stream: rl.stream, Action: rl.acts, Attrs: map[string]any{name: "forged", "kept": "yes"}})
+			a, err := Admit(rl.role, line(t, in), admitNow)
+			if err != nil {
+				t.Fatalf("%s %s: %v", rl.role, name, err)
+			}
+			attrs := a.Record.Event.Attrs
+			if _, ok := attrs[name]; ok && name != strings.ToLower(name) {
+				t.Fatalf("%s: %s survived", rl.role, name)
+			}
+			if attrs["reserved_attrs_removed"] != true || attrs["kept"] != "yes" {
+				t.Fatalf("%s %s: attrs = %v", rl.role, name, attrs)
+			}
+			if attrs["schema_version"] != 1 || attrs["ingest_ts"] != admitNow.UnixMilli() {
+				t.Fatalf("%s %s: shipper values lost: %v", rl.role, name, attrs)
+			}
+			for _, k := range []string{"producer_ts", "sensor_id", "deployment_id", "shipper_boot"} {
+				if _, ok := attrs[k]; ok {
+					t.Fatalf("%s %s: %s = %v must not be set on an unclamped event", rl.role, name, k, attrs[k])
+				}
+			}
+		}
+	}
+
+	// When the shipper clamps, its producer_ts stands over a forged one.
+	old := admitNow.Add(-48 * time.Hour)
+	in := ev(telemetry.Event{Stream: telemetry.StreamEdge, Timestamp: old, Attrs: map[string]any{"Producer_TS": 5.0}})
+	a, err := Admit(RoleBait, line(t, in), admitNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := a.Record.Event.Attrs["producer_ts"]; got != old.UnixMilli() {
+		t.Fatalf("producer_ts = %v, want %d", got, old.UnixMilli())
+	}
+	if _, ok := a.Record.Event.Attrs["Producer_TS"]; ok {
+		t.Fatal("forged Producer_TS survived")
+	}
+}
+
+func TestAdmitBaitOnlyNames(t *testing.T) {
+	names := []string{
+		"persona_version", "policy_version", "redaction_version", "fp_epoch", "fp_scope",
+		"Persona_Version", "POLICY_VERSION", "Fp_Epoch",
+	}
+	cases := []struct {
+		role         Role
+		stream, acts string
+		keeps        bool
+	}{
+		{RoleBait, telemetry.StreamEdge, "request", true},
+		{RoleRuntime, telemetry.StreamRuntime, FalcoAction, false},
+		{RoleEgress, telemetry.StreamEgress, EgressAction, false},
+	}
+	attrs := func() map[string]any {
+		m := map[string]any{"kept": "yes"}
+		for _, n := range names {
+			m[n] = "v"
+		}
+		return m
+	}
+	for _, c := range cases {
+		a, err := Admit(c.role, line(t, ev(telemetry.Event{Stream: c.stream, Action: c.acts, Attrs: attrs()})), admitNow)
+		if err != nil {
+			t.Fatalf("%s: %v", c.role, err)
+		}
+		got := a.Record.Event.Attrs
+		if got["kept"] != "yes" {
+			t.Fatalf("%s: ordinary attr lost: %v", c.role, got)
+		}
+		for _, n := range names {
+			if _, ok := got[n]; ok != c.keeps {
+				t.Fatalf("%s: %s present = %v, want %v", c.role, n, ok, c.keeps)
+			}
+		}
+		if removed := got["reserved_attrs_removed"] == true; removed == c.keeps {
+			t.Fatalf("%s: reserved_attrs_removed = %v, want %v", c.role, removed, !c.keeps)
 		}
 	}
 }
@@ -206,7 +405,7 @@ func TestAdmitHostileShapes(t *testing.T) {
 	mustReject(t, RoleBait, []byte(`{"id":"`+testBoot+`-1","event":{"stream":"edge","bogus":1}}`), "json")
 	mustReject(t, RoleBait, []byte(`not json`), "json")
 	mustReject(t, RoleBait, []byte(strings.Repeat(" ", MaxLine+1)), "oversize")
-	mustReject(t, RoleBait, []byte(`{"id":"`+testBoot+`-1"}`), "shape")
+	mustReject(t, RoleBait, []byte(`{"id":"`+testBoot+`-1","v":1}`), "shape")
 	both := ev(telemetry.Event{Stream: "edge"})
 	both.Metric = &telemetry.MetricRecord{Name: "attackbox.requests", Kind: "count"}
 	mustReject(t, RoleBait, line(t, both), "shape")

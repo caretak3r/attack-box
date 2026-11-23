@@ -1,0 +1,320 @@
+{
+  "accountId": 0,
+  "sensorId": "srv-000000",
+  "queryLanguage": "Lucene",
+  "collection": "logger-saved-views",
+  "visibility": "account",
+  "views": [
+    {
+      "id": "5a0e564b-a263-4bb5-96a5-d7e037bfc86c",
+      "name": "AttackBox / 01 All campaign logs",
+      "query": "sensor_id:srv-000000",
+      "selectedEventTypes": [
+        "Log",
+        "Log_AttackEvidence",
+        "Log_Security",
+        "Log_Operations"
+      ],
+      "tableConfiguration": [
+        "timestamp",
+        "source",
+        "stream",
+        "action",
+        "filePath",
+        "message"
+      ],
+      "timeRange": {
+        "duration": 1800000
+      },
+      "description": "All ingested rows. Host audit records can dominate this view."
+    },
+    {
+      "id": "522f5fce-c695-5d95-a033-9c6a095d7a46",
+      "name": "AttackBox / 02 HTTP requests",
+      "query": "sensor_id:srv-000000 AND source:bait AND stream:edge AND NOT action:capture AND NOT action:request_received AND direction:request",
+      "selectedEventTypes": [
+        "Log",
+        "Log_AttackEvidence"
+      ],
+      "tableConfiguration": [
+        "timestamp",
+        "src_ip",
+        "action",
+        "resource",
+        "status",
+        "request_id",
+        "session_id",
+        "trace.id"
+      ],
+      "timeRange": {
+        "duration": 1800000
+      },
+      "description": "HTTP request context, including health-check traffic. Each request can still span multiple chunks; row counts are not unique request counts."
+    },
+    {
+      "id": "20e0076e-f489-5a68-96b2-7c5d352376a2",
+      "name": "AttackBox / 03 Conversations",
+      "query": "sensor_id:srv-000000 AND source:bait AND stream:transcript",
+      "selectedEventTypes": [
+        "Log",
+        "Log_AttackEvidence"
+      ],
+      "tableConfiguration": [
+        "timestamp",
+        "src_ip",
+        "direction",
+        "resource",
+        "request_id",
+        "session_id",
+        "body_chunk",
+        "trace.id"
+      ],
+      "timeRange": {
+        "duration": 1800000
+      },
+      "description": "Request and synthetic response context. Open raw evidence to recover exact bytes."
+    },
+    {
+      "id": "67ff6e8b-9694-5e15-8ac8-1a0b6e0eb33b",
+      "name": "AttackBox / 04 Raw evidence",
+      "query": "sensor_id:srv-000000 AND source:bait AND action:capture",
+      "selectedEventTypes": [
+        "Log",
+        "Log_AttackEvidence"
+      ],
+      "tableConfiguration": [
+        "timestamp",
+        "request_id",
+        "evidence_kind",
+        "evidence_scope",
+        "evidence_complete",
+        "evidence_segment",
+        "chunk_index",
+        "body_chunk",
+        "record_id"
+      ],
+      "timeRange": {
+        "duration": 1800000
+      },
+      "description": "Raw base64 segments and manifests. Retain every chunk; counts are not request counts."
+    },
+    {
+      "id": "bfdf55c0-0330-5bae-9f29-2489d2a538e8",
+      "name": "AttackBox / 05 Probe decisions",
+      "query": "sensor_id:srv-000000 AND source:bait AND stream:probe",
+      "selectedEventTypes": [
+        "Log",
+        "Log_AttackEvidence"
+      ],
+      "tableConfiguration": [
+        "timestamp",
+        "src_ip",
+        "action",
+        "resource",
+        "request_id",
+        "session_id",
+        "body_chunk"
+      ],
+      "timeRange": {
+        "duration": 1800000
+      },
+      "description": "Observed probe decisions. These are classification results, not proof of exploitation."
+    },
+    {
+      "id": "ef2941b7-8ec6-5695-bd6a-a2729b3f4a19",
+      "name": "AttackBox / 06 Runtime Falco",
+      "query": "sensor_id:srv-000000 AND source:runtime AND stream:runtime",
+      "selectedEventTypes": [
+        "Log",
+        "Log_Security"
+      ],
+      "tableConfiguration": [
+        "timestamp",
+        "action",
+        "event.priority",
+        "event.rule",
+        "event.synthetic",
+        "event.output",
+        "record_id"
+      ],
+      "timeRange": {
+        "duration": 1800000
+      },
+      "description": "Runtime observations, including marked synthetic fixtures. Excludes adapter heartbeats."
+    },
+    {
+      "id": "e6d108d5-4751-5959-afe9-95abeff437c9",
+      "name": "AttackBox / 07 Blocked egress",
+      "query": "sensor_id:srv-000000 AND source:egress AND stream:egress",
+      "selectedEventTypes": [
+        "Log",
+        "Log_Security"
+      ],
+      "tableConfiguration": [
+        "timestamp",
+        "action",
+        "event.MESSAGE",
+        "body_chunk",
+        "record_id"
+      ],
+      "timeRange": {
+        "duration": 1800000
+      },
+      "description": "Blocked outbound attempts. Inspect the kernel record; a blocked attempt does not prove compromise."
+    },
+    {
+      "id": "a03a5e97-78fe-5b92-8a18-de658fc6bbd6",
+      "name": "AttackBox / 08 Linux audit file",
+      "query": "sensor_id:srv-000000 AND filePath:\"/var/log/audit/audit.log\"",
+      "selectedEventTypes": [
+        "Log",
+        "Log_Security"
+      ],
+      "tableConfiguration": [
+        "timestamp",
+        "hostname",
+        "filePath",
+        "logtype",
+        "message"
+      ],
+      "timeRange": {
+        "duration": 1800000
+      },
+      "description": "Raw host audit records. Routine collector activity produces substantial volume."
+    },
+    {
+      "id": "ba11dbd6-e6fb-512f-a44d-673fed4d5e09",
+      "name": "AttackBox / 09 SSH and auth file",
+      "query": "sensor_id:srv-000000 AND filePath:\"/var/log/auth.log\"",
+      "selectedEventTypes": [
+        "Log",
+        "Log_Operations"
+      ],
+      "tableConfiguration": [
+        "timestamp",
+        "hostname",
+        "filePath",
+        "logtype",
+        "message"
+      ],
+      "timeRange": {
+        "duration": 1800000
+      },
+      "description": "SSH, sudo, and authentication events from the host file."
+    },
+    {
+      "id": "5acc2b85-286b-59a2-8a0b-efac6272ded2",
+      "name": "AttackBox / 10 Syslog file",
+      "query": "sensor_id:srv-000000 AND filePath:\"/var/log/syslog\"",
+      "selectedEventTypes": [
+        "Log",
+        "Log_Operations"
+      ],
+      "tableConfiguration": [
+        "timestamp",
+        "hostname",
+        "filePath",
+        "logtype",
+        "message"
+      ],
+      "timeRange": {
+        "duration": 1800000
+      },
+      "description": "Host service and system messages."
+    },
+    {
+      "id": "f2f13f68-3b92-5de8-b7e4-360b2a94e563",
+      "name": "AttackBox / 11 Native host files",
+      "query": "sensor_id:srv-000000 AND collection_route:\"native-infrastructure\" AND NOT logtype:linux_audit",
+      "selectedEventTypes": [
+        "Log",
+        "Log_Operations"
+      ],
+      "tableConfiguration": [
+        "timestamp",
+        "filePath",
+        "logtype",
+        "hostname",
+        "message"
+      ],
+      "timeRange": {
+        "duration": 1800000
+      },
+      "description": "All native infrastructure file sources except audit. File paths remain separate columns."
+    },
+    {
+      "id": "1fda7aca-59f2-561a-91b6-7661c8793f24",
+      "name": "AttackBox / 12 Producer heartbeats",
+      "query": "sensor_id:srv-000000 AND stream:heartbeat",
+      "selectedEventTypes": [
+        "Log",
+        "Log_Operations"
+      ],
+      "tableConfiguration": [
+        "timestamp",
+        "source",
+        "action",
+        "bait_connected",
+        "last_bait_record_age_ms",
+        "queue_backlog_bytes",
+        "errors_total",
+        "dropped_total",
+        "lost_total",
+        "last_runtime_record_age_ms",
+        "last_egress_record_age_ms",
+        "quarantine_records",
+        "quarantine_bytes"
+      ],
+      "timeRange": {
+        "duration": 1800000
+      },
+      "description": "Bait, shipper, runtime adapter, and egress adapter liveness. A missing producer needs dashboard freshness checks."
+    },
+    {
+      "id": "1705fa81-3144-54e0-83e4-59b498c96e27",
+      "name": "AttackBox / 13 Transport fault counters",
+      "query": "sensor_id:srv-000000 AND source:shipper AND stream:heartbeat AND (errors_total:>0 OR dropped_total:>0 OR lost_total:>0 OR otel_dropped_spans_total:>0 OR otel_export_failed_spans_total:>0 OR bait_connected:false OR bait_connected:0 OR quarantine_records:>0 OR last_runtime_record_age_ms:>90000 OR last_egress_record_age_ms:>90000)",
+      "selectedEventTypes": [
+        "Log",
+        "Log_Operations"
+      ],
+      "tableConfiguration": [
+        "timestamp",
+        "bait_connected",
+        "errors_total",
+        "dropped_total",
+        "lost_total",
+        "queue_backlog_bytes",
+        "otel_dropped_spans_total",
+        "otel_export_failed_spans_total",
+        "quarantine_records",
+        "quarantine_bytes",
+        "last_runtime_record_age_ms",
+        "last_egress_record_age_ms"
+      ],
+      "timeRange": {
+        "duration": 1800000
+      },
+      "description": "Nonzero cumulative counters or a disconnected bait. Nonzero counters can describe an earlier fault in this process lifetime."
+    },
+    {
+      "id": "2592312e-6f4a-5c1b-bc32-02ba8ad73306",
+      "name": "AttackBox / 14 Proxy and Docker journal",
+      "query": "sensor_id:srv-000000 AND logtype:docker_journal",
+      "selectedEventTypes": [
+        "Log",
+        "Log_Operations"
+      ],
+      "tableConfiguration": [
+        "timestamp",
+        "CONTAINER_NAME",
+        "logtype",
+        "message"
+      ],
+      "timeRange": {
+        "duration": 1800000
+      },
+      "description": "Prepared native journal route: proxy access/TLS/parser logs and Docker daemon messages. Populates after paired deployment."
+    }
+  ]
+}

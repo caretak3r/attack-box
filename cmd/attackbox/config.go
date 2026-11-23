@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"attackbox/internal/observability"
 	"attackbox/internal/telemetry"
 )
 
@@ -39,6 +40,7 @@ type listener struct {
 
 // config is the process configuration, read from ATTACKBOX_* variables.
 type config struct {
+	tracing   observability.Config
 	listeners []listener
 
 	models         []string
@@ -64,6 +66,7 @@ type config struct {
 	maxSessions  int
 	maxBody      int64
 	maxLogBody   int
+	fullEvidence bool
 	maxPerSource int
 	maxInFlight  int
 	holdSilent   time.Duration
@@ -135,6 +138,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 		maxSessions:       num("MAX_SESSIONS", 10000, maxSessionsCap),
 		maxBody:           int64(num("MAX_BODY_BYTES", 1<<20, maxBodyCap)),
 		maxLogBody:        num("MAX_LOG_BODY", 128<<10, maxLogBodyCap),
+		fullEvidence:      flag("FULL_EVIDENCE", true),
 		maxPerSource:      num("MAX_PER_SOURCE", 8, maxPerSourceCap),
 		maxInFlight:       num("MAX_IN_FLIGHT", 256, maxInFlightCap),
 		holdSilent:        dur("HOLD_SILENT", 150*time.Second),
@@ -145,6 +149,11 @@ func loadConfig(getenv func(string) string) (config, error) {
 		readTimeout:       dur("READ_TIMEOUT", 30*time.Second),
 		idleTimeout:       dur("IDLE_TIMEOUT", 60*time.Second),
 		shutdownTimeout:   dur("SHUTDOWN_TIMEOUT", 15*time.Second),
+	}
+	var traceErr error
+	c.tracing, traceErr = observability.FromEnv(getenv)
+	if traceErr != nil {
+		errs = append(errs, traceErr)
 	}
 	if !validLabel(c.instance) {
 		errs = append(errs, errors.New("ATTACKBOX_INSTANCE: use 1-64 characters from [A-Za-z0-9._-]"))

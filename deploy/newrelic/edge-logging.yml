@@ -1,0 +1,9 @@
+# Project-managed edge route. The native host-file configuration stays separate.
+# Bait uses the local driver; the proxy uses journald. No Docker file glob.
+logs:
+  - name: attackbox-docker-journal
+    systemd: docker
+    attributes:
+      service.name: attackbox-host
+      collection_route: native-infrastructure
+      logtype: docker_journal

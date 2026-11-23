@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh AttackBox inventory every 15 seconds
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=15s
+AccuracySec=1s
+Unit=attackbox-hostcollector-snapshot.service
+
+[Install]
+WantedBy=timers.target

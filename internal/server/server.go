@@ -20,14 +20,19 @@ import (
 	"sync"
 	"time"
 
+	"attackbox/internal/observability"
 	"attackbox/internal/responder"
 	"attackbox/internal/telemetry"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // Config configures one Server. Zero values take defaults.
 type Config struct {
-	Persona string // "openai" (default), "vllm" or "ollama"
-	Version string // release string on /version and /api/version
+	Tracer  trace.Tracer // optional; default disabled
+	Persona string       // "openai" (default), "vllm" or "ollama"
+	Version string       // release string on /version and /api/version
 
 	Models []string // served model names; default qwen3:8b, gpt-oss:20b, llama3.1:8b
 
@@ -48,6 +53,7 @@ type Config struct {
 	MaxPerSource      int           // in-flight requests per source; default 8
 	MaxStreamDuration time.Duration // longest hold; default 180s
 	MaxLogBody        int           // request and response body bytes kept per log event; default 128 KiB
+	FullEvidence      bool          // also stream unredacted captured bytes and completion manifests
 	HoldSilent        time.Duration // hold length of the timeout gates; default 150s
 	IdleInterval      time.Duration // keepalive spacing in the idle hold; default 45s
 	StatusHold        time.Duration // hold of /v1/edge/{A-D}/status; default 200ms
@@ -104,6 +110,9 @@ func New(cfg Config) (*Server, error) {
 		m := hmac.New(sha256.New, cfg.SessionKey)
 		m.Write([]byte("redactor"))
 		cfg.Redactor = telemetry.NewRedactor(m.Sum(nil))
+	}
+	if cfg.Tracer == nil {
+		cfg.Tracer = noop.NewTracerProvider().Tracer("attackbox")
 	}
 	if cfg.Sink == nil {
 		cfg.Sink = telemetry.Multi{}
@@ -191,24 +200,30 @@ type call struct {
 	params    map[string]string
 	sessionID string
 
-	model      string
-	streaming  bool
-	tools      int
-	parallel   *bool
-	dec        *responder.Decision
-	adm        uint64              // admission tick, taken when the request arrived
-	iss        *responder.Issuance // the probe response this call is sending; nil otherwise
-	probeText  string
-	obs        []responder.Observation
-	holdResult string
-	holdMS     int64
-	streamCut  string // why frame emission stopped early, if it did
-	noFlush    bool   // the writer cannot flush, so acceptance is unconfirmed
-	termFailed bool   // the closing stream frame failed after the content was sent
+	model               string
+	streaming           bool
+	tools               int
+	parallel            *bool
+	dec                 *responder.Decision
+	adm                 uint64              // admission tick, taken when the request arrived
+	iss                 *responder.Issuance // the probe response this call is sending; nil otherwise
+	probeText           string
+	obs                 []responder.Observation
+	holdResult          string
+	holdMS              int64
+	streamCut           string // why frame emission stopped early, if it did
+	noFlush             bool   // the writer cannot flush, so acceptance is unconfirmed
+	termFailed          bool   // the closing stream frame failed after the content was sent
+	requestEvidence     *evidenceWriter
+	responseEvidence    *evidenceWriter
+	responseWriteFailed bool
 }
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	rid := randHex(16)
+	ctx, span := s.cfg.Tracer.Start(trace.ContextWithSpanContext(r.Context(), trace.SpanContext{}), "bait.request", trace.WithNewRoot(), trace.WithSpanKind(trace.SpanKindServer), trace.WithAttributes(attribute.String("attackbox.request_id", rid[:16]), attribute.String("attackbox.persona", s.persona), attribute.String("http.request.method", safeMethod(r.Method))))
+	defer span.End()
+	r = r.WithContext(ctx)
 	c := &call{s: s, r: r, id: rid[:16], start: s.cfg.Now(), w: &recorder{ResponseWriter: w, keep: s.logRawLimit()}}
 	c.adm = s.cfg.Responder.Admit() // before any read: a probe delivered after this is not this request's
 	c.rc = http.NewResponseController(w)
@@ -218,6 +233,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	c.style = s.styleFor(r.URL.Path)
 	c.endpoint = "/unmatched"
 	s.personaHeaders(c, rid)
+	c.startEvidence()
 	defer s.finish(c)
 	defer c.recoverPanic()
 	defer c.finalize()
@@ -249,7 +265,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	case c.tooLarge:
 		c.fail(http.StatusRequestEntityTooLarge, "Request body too large", "", "")
 	default:
-		h(c)
+		_, responseSpan := s.cfg.Tracer.Start(c.r.Context(), "bait.response")
+		func() { defer responseSpan.End(); h(c) }()
 	}
 }
 
@@ -276,6 +293,7 @@ func (c *call) recoverPanic() {
 		return
 	}
 	if v == http.ErrAbortHandler {
+		c.responseWriteFailed = true
 		panic(v)
 	}
 	c.panicked = true
@@ -309,12 +327,24 @@ func (s *Server) personaHeaders(c *call, rid string) {
 // MaxBodyBytes are kept for the log and tooLarge is set.
 func (c *call) readBody(w http.ResponseWriter) {
 	if c.r.Body == nil || c.r.Body == http.NoBody {
+		c.endRequestEvidence(true, "eof")
 		return
 	}
-	b, err := io.ReadAll(http.MaxBytesReader(w, c.r.Body, c.s.cfg.MaxBodyBytes))
+	var reader io.Reader = http.MaxBytesReader(w, c.r.Body, c.s.cfg.MaxBodyBytes)
+	if c.requestEvidence != nil {
+		reader = io.TeeReader(reader, c.requestEvidence)
+	}
+	b, err := io.ReadAll(reader)
 	c.body = b
 	var mbe *http.MaxBytesError
 	c.tooLarge = errors.As(err, &mbe)
+	reason := "eof"
+	if c.tooLarge {
+		reason = "body_limit"
+	} else if err != nil {
+		reason = "read_error"
+	}
+	c.endRequestEvidence(err == nil, reason)
 }
 
 // acquire takes a global and a per-source slot.
@@ -405,15 +435,20 @@ func (s *Server) sessionKey(src, ua string, h http.Header) string {
 // for the log. Capture is bounded: a long stream costs at most keep bytes.
 type recorder struct {
 	http.ResponseWriter
-	status int
-	n      int64
-	keep   int
-	head   []byte
+	status   int
+	n        int64
+	keep     int
+	head     []byte
+	onHeader func(int)
+	onWrite  func([]byte, error)
 }
 
 func (r *recorder) WriteHeader(code int) {
 	if r.status == 0 && code >= 200 {
 		r.status = code
+		if r.onHeader != nil {
+			r.onHeader(code)
+		}
 	}
 	r.ResponseWriter.WriteHeader(code)
 }
@@ -421,12 +456,18 @@ func (r *recorder) WriteHeader(code int) {
 func (r *recorder) Write(p []byte) (int, error) {
 	if r.status == 0 {
 		r.status = http.StatusOK
+		if r.onHeader != nil {
+			r.onHeader(http.StatusOK)
+		}
 	}
 	n, err := r.ResponseWriter.Write(p)
 	if room := r.keep - len(r.head); room > 0 && n > 0 {
 		r.head = append(r.head, p[:min(n, room)]...)
 	}
 	r.n += int64(n)
+	if r.onWrite != nil {
+		r.onWrite(p[:n], err)
+	}
 	return n, err
 }
 
@@ -438,6 +479,8 @@ func (r *recorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 // still writable. It returns false when the client left. The outcome goes to
 // the request log.
 func (c *call) wait(total, every time.Duration, idle func() bool) bool {
+	_, span := c.s.cfg.Tracer.Start(c.r.Context(), "bait.hold")
+	defer func() { span.SetAttributes(attribute.String("attackbox.hold_result", c.holdResult)); span.End() }()
 	s := c.s
 	began := s.cfg.Now()
 	ctx := c.r.Context()
@@ -504,4 +547,19 @@ func (c *call) holdFor(mode string, idle func() bool) bool {
 		idle = nil
 	}
 	return c.wait(total, c.s.cfg.IdleInterval, idle)
+}
+
+func safeMethod(method string) string {
+	switch method {
+	case "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH":
+		return method
+	default:
+		return "_OTHER"
+	}
+}
+
+// emit attaches only generated trace identity. Attacker headers never choose it.
+func (c *call) emit(e telemetry.Event) {
+	e.Attrs = observability.Correlate(c.r.Context(), e.Attrs)
+	c.s.cfg.Sink.Emit(e)
 }

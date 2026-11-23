@@ -107,8 +107,8 @@ var roleEvents = map[Role]map[string][]string{
 		telemetry.StreamHeartbeat: {"bait_heartbeat"},
 		telemetry.StreamRuntime:   {"start", "stop", "stopped"},
 	},
-	RoleRuntime: {telemetry.StreamRuntime: {FalcoAction}},
-	RoleEgress:  {telemetry.StreamEgress: {EgressAction}},
+	RoleRuntime: {telemetry.StreamRuntime: {FalcoAction}, telemetry.StreamHeartbeat: {"runtime_heartbeat"}},
+	RoleEgress:  {telemetry.StreamEgress: {EgressAction}, telemetry.StreamHeartbeat: {"egress_heartbeat"}},
 }
 
 // Actions of the host adapters' events.
@@ -146,12 +146,19 @@ var reservedAttrs = []string{
 	"instance", "service.name", "hostname", "entity.guid", "entity.name", "entity.type",
 	"newrelic.source", "plugin.type", "timestamp", "message",
 	"source", "record_id", "boot", "seq",
+	"schema_version", "ingest_ts", "producer_ts", "sensor_id", "deployment_id", "shipper_boot",
 	"timestamp_clamped", "attrs_truncated", "fields_truncated", "reserved_attrs_removed",
 	// Event.Attributes lets a fixed field win only when it is non-empty, so
 	// an attr of the same name would otherwise slip past validation.
 	"session_id", "request_id", "src_ip", "user_agent", "persona", "action",
 	"resource", "result", "probe_id", "status", "task_labels",
 	"stream", "body_sha256", "chunk_index", "chunk_count",
+}
+
+// baitOnlyAttrs are the bait's own provenance names. Every role but the bait
+// loses them from Attrs. Matching is case-insensitive.
+var baitOnlyAttrs = []string{
+	"persona_version", "policy_version", "redaction_version", "fp_epoch", "fp_scope",
 }
 
 // Admit decodes and validates one wire line from a producer whose role the
@@ -177,6 +184,9 @@ func Admit(role Role, line []byte, now time.Time) (Admitted, error) {
 	if _, err := dec.Token(); err != io.EOF {
 		return Admitted{}, reject("json", errors.New("trailing data"))
 	}
+	if r.V != telemetry.SchemaVersion {
+		return Admitted{}, reject("schema_version", nil)
+	}
 	m := idRe.FindStringSubmatch(r.ID)
 	if m == nil {
 		return Admitted{}, reject("id", nil)
@@ -190,7 +200,7 @@ func Admit(role Role, line []byte, now time.Time) (Admitted, error) {
 	case (r.Event == nil) == (r.Metric == nil):
 		return Admitted{}, reject("shape", nil)
 	case r.Event != nil:
-		e, err := admitEvent(role, *r.Event, a.Key(), a.Boot, seq, now)
+		e, err := admitEvent(role, *r.Event, a.Key(), a.Boot, seq, r.V, now)
 		if err != nil {
 			return Admitted{}, err
 		}
@@ -212,7 +222,7 @@ func Admit(role Role, line []byte, now time.Time) (Admitted, error) {
 	return a, nil
 }
 
-func admitEvent(role Role, e telemetry.Event, key, boot string, seq uint64, now time.Time) (telemetry.Event, error) {
+func admitEvent(role Role, e telemetry.Event, key, boot string, seq uint64, version int, now time.Time) (telemetry.Event, error) {
 	actions, ok := roleEvents[role][e.Stream]
 	if !ok {
 		return e, reject("stream", nil)
@@ -268,12 +278,15 @@ func admitEvent(role Role, e telemetry.Event, key, boot string, seq uint64, now 
 		e.TaskLabels = labels
 	}
 
-	attrs, removed, attrsCut, err := sanitizeAttrs(e.Attrs)
+	attrs, removed, attrsCut, err := sanitizeAttrs(role, e.Attrs)
 	if err != nil {
 		return e, err
 	}
 	switch {
 	case e.Timestamp.IsZero(), e.Timestamp.Before(now.Add(-maxPast)), e.Timestamp.After(now.Add(maxFuture)):
+		if !e.Timestamp.IsZero() {
+			attrs["producer_ts"] = e.Timestamp.UnixMilli()
+		}
 		e.Timestamp = now
 		attrs["timestamp_clamped"] = true
 	}
@@ -290,6 +303,8 @@ func admitEvent(role Role, e telemetry.Event, key, boot string, seq uint64, now 
 	attrs["record_id"] = key
 	attrs["boot"] = boot
 	attrs["seq"] = strconv.FormatUint(seq, 10)
+	attrs["schema_version"] = version
+	attrs["ingest_ts"] = now.UnixMilli()
 	e.Attrs = attrs
 
 	// Bound what this record becomes after the final-hop Chunk: every item
@@ -312,14 +327,14 @@ func admitEvent(role Role, e telemetry.Event, key, boot string, seq uint64, now 
 
 // sanitizeAttrs copies attrs, removes reserved keys and cuts long strings.
 // Structure beyond the depth, node, key, array or byte limits is rejected.
-func sanitizeAttrs(in map[string]any) (out map[string]any, removed, cut bool, err error) {
+func sanitizeAttrs(role Role, in map[string]any) (out map[string]any, removed, cut bool, err error) {
 	out = make(map[string]any, len(in)+8)
 	if len(in) > maxKeys {
 		return nil, false, false, reject("attrs_keys", nil)
 	}
 	w := walker{}
 	for k, v := range in {
-		if isReserved(k) {
+		if isReserved(k) || (role != RoleBait && isBaitOnly(k)) {
 			removed = true
 			continue
 		}
@@ -333,8 +348,12 @@ func sanitizeAttrs(in map[string]any) (out map[string]any, removed, cut bool, er
 	return out, removed, w.cut, nil
 }
 
-func isReserved(k string) bool {
-	for _, r := range reservedAttrs {
+func isReserved(k string) bool { return matchFold(reservedAttrs, k) }
+
+func isBaitOnly(k string) bool { return matchFold(baitOnlyAttrs, k) }
+
+func matchFold(names []string, k string) bool {
+	for _, r := range names {
 		if strings.EqualFold(k, r) {
 			return true
 		}

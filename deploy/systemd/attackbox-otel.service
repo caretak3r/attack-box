@@ -1,0 +1,48 @@
+[Unit]
+Description=AttackBox OpenTelemetry Collector
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=abx-otel
+Group=abx-otel
+EnvironmentFile=/etc/attackbox/monitoring.env
+LoadCredential=newrelic_license_key:/etc/attackbox/otel-license.key
+ExecStartPre=+/usr/local/libexec/attackbox-otel-sockets prepare
+ExecStart=/usr/local/bin/attackbox-otel --config=/etc/attackbox-otel/config.yaml
+ExecStartPost=+/usr/local/libexec/attackbox-otel-sockets ready
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+MemoryMax=320M
+TasksMax=100
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/attackbox-otel
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Full /proc and /sys read access is required for hostmetrics. No process scraper.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=attackbox-otel
+
+[Install]
+WantedBy=multi-user.target

@@ -81,6 +81,10 @@ sudo chmod 0400 secrets/redaction.key secrets/server.key secrets/server.crt
 
 ## Build & Deploy
 
+With gVisor, `/Users/rohit/attack-box/compose.gvisor.yaml` fixes bait at `172.30.0.2` and adds the matching `bait` entry to the proxy's `/etc/hosts`. Docker's embedded DNS is not available inside the runsc sandbox. Keep both addresses equal if you change the internal subnet. Do not enable host networking to repair DNS. See the [gVisor DNS guidance](https://gvisor.dev/docs/user_guide/faq/#dns-doesnt-work-on-a-docker-user-defined-bridge-network-including-docker-compose).
+
+After startup, run `curl --noproxy '*' -kfsS --max-time 10 https://127.0.0.1:8443/v1/models` on the VPS. It must return a model list. The `-k` option permits the bootstrap self-signed certificate for this loopback check.
+
 ```bash
 # Build the bait image
 docker compose build bait

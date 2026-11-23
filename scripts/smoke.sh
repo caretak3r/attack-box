@@ -80,8 +80,19 @@ expect "openai follow-up reply" '"object":"chat.completion"' \
 expect "vllm version" '"version"' "$(c "$v/version")"
 expect "vllm metrics" 'vllm:' "$(c "$v/metrics")"
 expect "vllm openapi" '"/invocations"' "$(c "$v/openapi.json")"
-expect "vllm completions sse" 'data: [DONE]' \
-	"$(c -N -H "$json" -d '{"model":"qwen3:8b","stream":true,"prompt":"hello"}' "$v/v1/completions")"
+# The third generation request of the anonymous session gets the behavioral
+# gate. One of the ten gates answers 429 with Retry-After. A client then sends
+# the request again, and so does this step.
+vllm_sse() { c -N -H "$json" -d '{"model":"qwen3:8b","stream":true,"prompt":"hello"}' "$v/v1/completions"; }
+retried=""
+out=$(vllm_sse) || fail "vllm streaming transport failed"
+if [[ "$out" == *'"type":"TooManyRequests"'* ]]; then
+	echo "smoke: note retry gate answered first; sending the request again"
+	retried=1
+	sleep 1 # The fixed retry gate advertises Retry-After: 1.
+	out=$(vllm_sse) || fail "vllm streaming transport failed"
+fi
+expect "vllm completions sse" 'data: [DONE]' "$out"
 expect "ollama root" 'Ollama is running' "$(c "$l/")"
 expect "ollama tags" '"models"' "$(c "$l/api/tags")"
 expect "ollama chat ndjson" '"done":true' \
@@ -104,6 +115,8 @@ expect "log sse response body" 'data: [DONE]' "$(grep '"direction":"response"' "
 expect "log probe stream" '"stream":"probe"' "$log"
 expect "log probe nonce" '"nonce":"' "$(grep '"stream":"probe"' "$work/attackbox.log")"
 expect "log follow-up attribution" '"followup":"register-model"' "$(grep '"stream":"probe"' "$work/attackbox.log")"
+# The second attempt above is valid only after the retry gate, not after another 429.
+[[ -z "$retried" ]] || expect "log retry gate" '"probe_id":"retry"' "$(grep '"stream":"probe"' "$work/attackbox.log")"
 for m in requests probes sessions probe_followups request_bytes response_bytes session_duration_seconds; do
 	expect "metric attackbox.$m" "\"name\":\"attackbox.$m\"" "$log"
 done

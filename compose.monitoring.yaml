@@ -1,0 +1,17 @@
+# Opt-in overlay. The host Collector must be installed before container creation.
+# Load trusted IDs with docker compose --env-file /etc/attackbox/monitoring.env.
+services:
+  bait:
+    environment:
+      ATTACKBOX_OTEL_SOCKET: /run/attackbox-otel/bait/otlp.sock
+      ATTACKBOX_HOST_ID: ${ATTACKBOX_HOST_ID:?required}
+      ATTACKBOX_SERVICE_INSTANCE_ID: ${ATTACKBOX_BAIT_INSTANCE_ID:?required}
+      ATTACKBOX_CAMPAIGN_ID: ${ATTACKBOX_CAMPAIGN_ID:?required}
+      ATTACKBOX_CONTAINER_ID: ${ATTACKBOX_BAIT_CONTAINER_ID:-}
+    volumes:
+      - type: bind
+        source: /run/attackbox-otel/bait
+        target: /run/attackbox-otel/bait
+        read_only: true
+        bind:
+          create_host_path: false

@@ -202,8 +202,10 @@ fi
 
 if require_or_skip "container files" "[[ -f Dockerfile && -n $compose_file ]]" "Dockerfile or compose file not present"; then
 	# Clean up test image on exit
-	trap 'docker rmi attackbox-verify-test >/dev/null 2>&1 || true' EXIT
+	trap 'docker rmi attackbox-verify-test attackbox-verify-shipper >/dev/null 2>&1 || true' EXIT
 	check "Dockerfile build" docker build -t attackbox-verify-test .
+	# Build the actual host binaries too; the default image only builds bait.
+	check "Host shipper and reader build" docker build --target shipper-build -t attackbox-verify-shipper .
 	check "docker compose config" docker compose -f "$compose_file" config >/dev/null
 	check "gVisor compose config" docker compose -f "$compose_file" -f compose.gvisor.yaml config >/dev/null
 fi

@@ -178,7 +178,10 @@ func TestLogShape(t *testing.T) {
 			t.Error("message duplicated in attributes")
 		}
 	}
-	if len(lp[0].Logs[0].Message) != 3500 || len(lp[0].Logs[1].Message) != 1 {
+	if lp[0].Logs[0].Message != "attackbox POST" || lp[0].Logs[1].Message != "attackbox POST" {
+		t.Error("message must be a fixed non-JSON action")
+	}
+	if len(lp[0].Logs[0].Attributes["body_chunk"].(string)) != 3500 || len(lp[0].Logs[1].Attributes["body_chunk"].(string)) != 1 {
 		t.Error("chunk sizes wrong")
 	}
 	if st := n.Stats(); st.Sent < 2 || st.Errors != 0 {

@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"attackbox/internal/observability"
 	"attackbox/internal/shipper"
 	"attackbox/internal/telemetry"
 )
@@ -100,6 +101,27 @@ func runAdapter(stream string, getenv func(string) string, stdin io.Reader, stde
 		return err
 	}
 	defer sp.Close(context.Background())
+	// Quiet sensors must keep their socket alive and expose local transport loss.
+	// This heartbeat proves adapter liveness, not source or remote receipt.
+	stopBeat, beatDone := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(beatDone)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			stats := sp.Stats()
+			sp.Emit(telemetry.Event{Stream: telemetry.StreamHeartbeat,
+				Action: role.String() + "_heartbeat", Timestamp: time.Now(),
+				Attrs: map[string]any{"written_total": stats.Written, "dropped_total": stats.Dropped,
+					"lost_total": stats.Lost, "errors_total": stats.Errors, "reconnects_total": stats.Reconnects}})
+			select {
+			case <-stopBeat:
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	defer func() { close(stopBeat); <-beatDone }()
 
 	sc := bufio.NewScanner(stdin)
 	sc.Buffer(make([]byte, 8192), 8<<10)
@@ -147,11 +169,22 @@ func queueConfig(cfg config) shipper.QueueConfig {
 }
 
 func run(ctx context.Context, cfg config, stderr io.Writer) error {
+	tracing, err := observability.New(ctx, cfg.tracing, "attackbox-shipper", version)
+	if err != nil {
+		return err
+	}
+	defer tracing.Close()
+	ctx = observability.WithTracer(ctx, tracing.Tracer)
 	q, rec, err := shipper.OpenQueue(queueConfig(cfg))
 	if err != nil {
 		return err
 	}
 	defer q.Close()
+	rejected, err := shipper.OpenQuarantine(cfg.queueDir + "/quarantine")
+	if err != nil {
+		return err
+	}
+	defer rejected.Close()
 
 	ing, err := shipper.NewIngest(shipper.IngestConfig{
 		Endpoints: cfg.endpoints,
@@ -175,8 +208,10 @@ func run(ctx context.Context, cfg config, stderr io.Writer) error {
 		HeartbeatInterval: 30 * time.Second,
 		Now:               time.Now,
 		Common: map[string]any{
-			"service.name": "attackbox",
-			"hostname":     cfg.hostname,
+			"service.name":  "attackbox",
+			"hostname":      cfg.hostname,
+			"sensor_id":     cfg.sensorID,
+			"deployment_id": cfg.deploymentID,
 		},
 		HeartbeatAttrs: func() map[string]any {
 			stats := ing.Stats()
@@ -187,15 +222,33 @@ func run(ctx context.Context, cfg config, stderr io.Writer) error {
 				lastAge = time.Since(baitStats.LastRecord).Milliseconds()
 			}
 			qstats := q.Stats()
-			return map[string]any{
-				"source":                  "shipper",
-				"bait_connected":          baitConn,
-				"last_bait_record_age_ms": lastAge,
-				"spool_clients":           baitStats.Conns,
-				"queue_bytes":             qstats.Total,
-				"queue_backlog_bytes":     qstats.Total,
-				"ship_dropped_total":      qstats.Dropped,
+			quarantineRecords, quarantineBytes := rejected.Stats()
+			attrs := map[string]any{
+				"source":                     "shipper",
+				"quarantine_records":         quarantineRecords,
+				"quarantine_bytes":           quarantineBytes,
+				"bait_connected":             baitConn,
+				"last_bait_record_age_ms":    lastAge,
+				"spool_clients":              baitStats.Conns,
+				"queue_bytes":                qstats.Total,
+				"queue_backlog_bytes":        qstats.Total,
+				"ship_dropped_total":         qstats.Dropped,
+				"ship_dropped_bait_total":    qstats.Dropped[shipper.RoleBait],
+				"ship_dropped_runtime_total": qstats.Dropped[shipper.RoleRuntime],
+				"ship_dropped_egress_total":  qstats.Dropped[shipper.RoleEgress],
+				"ship_queue_dropped_total":   qstats.Dropped[shipper.RoleBait] + qstats.Dropped[shipper.RoleRuntime] + qstats.Dropped[shipper.RoleEgress],
 			}
+			for k, v := range tracing.Health() {
+				attrs[k] = v
+			}
+			for _, role := range []shipper.Role{shipper.RoleRuntime, shipper.RoleEgress} {
+				age := int64(-1)
+				if st, ok := stats[role]; ok && !st.LastRecord.IsZero() {
+					age = time.Since(st.LastRecord).Milliseconds()
+				}
+				attrs["last_"+role.String()+"_record_age_ms"] = age
+			}
+			return attrs
 		},
 		OnError: func(err error) {
 			fmt.Fprintln(stderr, "newrelic:", err)
@@ -214,7 +267,7 @@ func run(ctx context.Context, cfg config, stderr io.Writer) error {
 	drainDone := make(chan error, 1)
 	ingestDone := make(chan error, 1)
 	go func() {
-		drainDone <- drain(runCtx, q, nr, rec.Uncertain, rec.UncertainThrough)
+		drainDone <- drain(runCtx, q, nr, rec.Uncertain, rec.UncertainThrough, rejected)
 	}()
 	go func() {
 		ingestDone <- ing.Serve(runCtx)

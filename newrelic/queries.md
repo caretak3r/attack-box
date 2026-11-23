@@ -9,7 +9,7 @@ Operator reference for common New Relic queries. All queries respect chunk-safe 
 ### Verify All Six Streams Active
 
 ```nrql
-FROM Log
+FROM Log, Log_AttackEvidence, Log_Security, Log_Operations
 SELECT count(*WHERE stream IN ('edge', 'transcript', 'probe', 'runtime', 'egress', 'heartbeat')
 FACET stream
 SINCE 10 minutes ago
@@ -20,7 +20,7 @@ Expected: Six rows with nonzero counts. Missing streams indicate a producer fail
 ### Verify Heartbeat Sources
 
 ```nrql
-FROM Log
+FROM Log, Log_AttackEvidence, Log_Security, Log_Operations
 SELECT count(*) AS 'Events', latest(timestamp) AS 'Last Event'
 WHERE stream = 'heartbeat'
 FACET source
@@ -47,7 +47,7 @@ Expected metrics:
 ### Check Bait Liveness
 
 ```nrql
-FROM Log
+FROM Log, Log_AttackEvidence, Log_Security, Log_Operations
 SELECT latest(bait_connected) AS 'Connected',
        latest(last_bait_record_age_ms) / 1000 AS 'Age (sec)',
        latest(spool_clients) AS 'Clients'
@@ -60,7 +60,7 @@ Expected: `bait_connected = 1`, age < 60 seconds, clients ≥ 1.
 ### Check Queue Health
 
 ```nrql
-FROM Log
+FROM Log, Log_AttackEvidence, Log_Security, Log_Operations
 SELECT latest(queue_bytes) / 1048576 AS 'Queue (MB)',
        latest(queue_backlog_bytes) / 1048576 AS 'Backlog (MB)',
        latest(ship_dropped_total) AS 'Dropped'
@@ -77,7 +77,7 @@ Expected: Backlog < 128 MB, dropped count stable.
 ### Probe Decisions (Deduped)
 
 ```nrql
-FROM Log
+FROM Log, Log_AttackEvidence, Log_Security, Log_Operations
 SELECT latest(timestamp) AS 'Time',
        latest(session_id) AS 'Session',
        latest(src_ip) AS 'Source IP',
@@ -95,7 +95,7 @@ Each row is one unique probe decision event chunk.
 ### Falco Events (Deduped, Pending Validation)
 
 ```nrql
-FROM Log
+FROM Log, Log_AttackEvidence, Log_Security, Log_Operations
 SELECT latest(timestamp) AS 'Time',
        latest(action) AS 'Action',
        latest(resource) AS 'Resource'
@@ -112,7 +112,7 @@ LIMIT 100
 ### Egress Blocks (Deduped, Pending Validation)
 
 ```nrql
-FROM Log
+FROM Log, Log_AttackEvidence, Log_Security, Log_Operations
 SELECT latest(timestamp) AS 'Time',
        latest(event.dst_ip) AS 'Destination',
        latest(event.dst_port) AS 'Port',
@@ -130,14 +130,14 @@ LIMIT 100
 ### Reconstruct Chunked Event Body
 
 ```nrql
-FROM Log
-SELECT message, body_sha256, chunk_index, chunk_count
+FROM Log, Log_AttackEvidence, Log_Security, Log_Operations
+SELECT body_chunk, body_sha256, chunk_index, chunk_count
 WHERE record_id = '<record-id-here>'
   AND body_sha256 = '<sha256-here>'
 ORDER BY chunk_index ASC
 ```
 
-Manually concatenate `message` fields in chunk order to recover the full body.
+Manually concatenate `body_chunk` fields in chunk order to recover the full body.
 
 ## Attack Pattern Queries
 
@@ -218,7 +218,7 @@ SINCE 1 hour ago
 ### Session Timeline (Deduped Events)
 
 ```nrql
-FROM Log
+FROM Log, Log_AttackEvidence, Log_Security, Log_Operations
 SELECT timestamp, stream, action, task, probe_id, status
 WHERE session_id = '<session-id-here>'
   AND record_id IS NOT NULL
@@ -229,7 +229,7 @@ LIMIT 1000
 ### Session Requests
 
 ```nrql
-FROM Log
+FROM Log, Log_AttackEvidence, Log_Security, Log_Operations
 SELECT timestamp, method, endpoint, status, task
 WHERE session_id = '<session-id-here>'
   AND stream = 'edge'
@@ -241,7 +241,7 @@ ORDER BY timestamp ASC
 ### Session Probe Decisions
 
 ```nrql
-FROM Log
+FROM Log, Log_AttackEvidence, Log_Security, Log_Operations
 SELECT timestamp, action, probe_id, task
 WHERE session_id = '<session-id-here>'
   AND stream = 'probe'
@@ -255,7 +255,7 @@ ORDER BY timestamp ASC
 ### Source IP Activity
 
 ```nrql
-FROM Log
+FROM Log, Log_AttackEvidence, Log_Security, Log_Operations
 SELECT count(*) AS 'Requests',
        latest(user_agent) AS 'User-Agent'
 WHERE stream = 'edge' AND direction = 'request'
@@ -269,7 +269,7 @@ LIMIT 50
 ### User-Agent Distribution
 
 ```nrql
-FROM Log
+FROM Log, Log_AttackEvidence, Log_Security, Log_Operations
 SELECT count(*) AS 'Requests'
 WHERE stream = 'edge' AND direction = 'request'
 FACET user_agent
@@ -293,7 +293,7 @@ Expected: Zero events. Any errors indicate ingest API failures, quota exhaustion
 ### Shipper Metrics
 
 ```nrql
-FROM Log
+FROM Log, Log_AttackEvidence, Log_Security, Log_Operations
 SELECT latest(queue_bytes) AS 'Queue Bytes',
        latest(queue_backlog_bytes) AS 'Backlog',
        latest(spool_clients) AS 'Clients',
@@ -307,7 +307,7 @@ SINCE 1 hour ago
 ### Stopped Events
 
 ```nrql
-FROM Log
+FROM Log, Log_AttackEvidence, Log_Security, Log_Operations
 SELECT timestamp, nr_sent, nr_dropped, nr_lost, local_sent, local_dropped
 WHERE stream = 'runtime' AND action = 'stopped'
 ORDER BY timestamp DESC
@@ -345,3 +345,39 @@ The following field names require deployment validation:
 - `attackbox.probe_followups` counts attributed replies only.
 
 After deployment, verify these queries against actual emitted events and update as needed.
+
+## Live capture format
+
+Current exports store body text in `body_chunk`; `message` is an inert action label. For raw capture, reconstruct and verify all chunks, decode each base64 segment, and validate the completion manifest. Use the Go recovery tool and setup procedure in `/Users/rohit/attack-box/docs/live-evidence.md`. A redacted context log is not the raw evidence.
+
+## Host Infrastructure acceptance
+
+Native Infrastructure owns host resource metrics. On 2026-11-23, agent 2.1.1 on `srv-000000` reported dimensional `host.*` metrics. Use `average` for these series; `latest` and `SystemSample` did not return values in this account. Verify the reporting host entity separately.
+
+```sql
+FROM Metric SELECT average(host.cpuPercent), average(host.memoryUsedPercent), average(host.diskFreeBytes)
+WHERE host.hostname = 'srv-000000' SINCE 5 minutes ago
+```
+
+The current reporting host GUID is `ODc2NDQ1MHxJTkZSQXxOQXw3NzIwMjUwODE5MTg3MDg1NTI0`. Query the entity with NerdGraph or open it in New Relic; do not infer entity health from metric counts.
+
+```sql
+FROM Log, Log_AttackEvidence, Log_Security, Log_Operations SELECT count(*) WHERE hostname = 'srv-000000'
+FACET logtype SINCE 5 minutes ago
+```
+
+The following readiness queries apply only after the optional Go collector and OTel profile are deployed:
+
+```sql
+FROM Metric SELECT latest(attackbox_component_observed), latest(attackbox_component_running), latest(attackbox_component_ready), latest(attackbox_component_coverage_verified)
+WHERE sensor_id = 'srv-000000' FACET component SINCE 5 minutes ago LIMIT MAX
+```
+
+```sql
+FROM Metric SELECT latest(attackbox_inventory_snapshot_valid), latest(attackbox_inventory_snapshot_age_seconds)
+WHERE sensor_id = 'srv-000000' SINCE 5 minutes ago
+```
+
+Confirm fresh samples, source age below 90 seconds and all 12 expected inventory rows. The coverage gauge remains `-1`; local readiness does not certify remote forensic delivery. Host installation alone does not provide application spans. After trace rollout, query `Span` for `attackbox-bait` and `attackbox-shipper`; match their trusted `host.id` to the native agent display name. See the [New Relic resource contract](https://docs.newrelic.com/docs/opentelemetry/best-practices/opentelemetry-best-practices-resources/).
+
+Local health command: `curl -fsS http://127.0.0.1:18003/v1/status`. New Relic queries require a user key; an ingest key cannot query account data.

@@ -23,16 +23,30 @@ Follow `docs/newrelic-runbook.md` → "Key Provisioning" to create a dedicated `
 
 ### 2. Import Dashboard
 
+The dashboard uses offline account placeholders (`"accountIds": [0]`). Replace every widget account ID before import. New Relic's dashboard-account choice does not replace each query's account ID. Run the local checks first:
+
+```bash
+python3 /Users/rohit/attack-box/newrelic/validate_dashboard.py --self-test
+python3 /Users/rohit/attack-box/newrelic/validate_dashboard.py
+jq --argjson account_id 1234567 \
+  '(.pages[].widgets[].rawConfiguration.nrqlQueries[]?.accountIds) = [$account_id]' \
+  /Users/rohit/attack-box/newrelic/dashboards/attackbox-overview.json
+```
+
+Replace `1234567` with the intended query account. The command prints the import JSON; it does not change the checked-in template or call New Relic.
+
 **Via New Relic UI:**
 1. Navigate to **Dashboards → Import dashboard**
-2. Upload `dashboards/attackbox-overview.json`
-3. Select the AttackBox account
-4. Click **Import dashboard**
+2. Paste the `jq` output into the **Dashboard JSON** box
+3. Select the intended dashboard account and permissions, then save.
+
+Inspect every page after import. **Live Watch** and **Telemetry Health** use fixed 5/15-minute windows with a 30-second refresh setting. This setting is not a delivery-latency guarantee. **Evidence & Forensics** follows the dashboard time picker and defaults to 15 minutes. Use a `deployment_id` or `sensor_id` filter when the account holds more than one decoy. The account-wide `NrIntegrationError` table does not carry these decoy fields; inspect it without those filters if it is empty.
 
 **Via Terraform:**
 ```hcl
 resource "newrelic_one_dashboard_json" "attackbox_overview" {
-  json = file("${path.module}/newrelic/dashboards/attackbox-overview.json")
+  # Use the account-substituted JSON, not the offline placeholder template.
+  json = file("/absolute/path/to/account-substituted-dashboard.json")
 }
 ```
 
@@ -48,6 +62,16 @@ resource "newrelic_one_dashboard_json" "attackbox_overview" {
    - Save the condition
 4. Add notification channels (phone, email, Slack, PagerDuty)
 5. Repeat for `alerts/informational-alerts.yaml` with a separate policy
+
+**Mapping used when the conditions were created in the UI** (the YAML uses Terraform and NerdGraph names):
+
+- `INFO` priority: New Relic has only `CRITICAL` and `WARNING`. Use `WARNING`.
+- `evaluation_offset: 3`: use the streaming method **Event flow**. Set **Delay** to 3 windows (3 minutes for a 60-second window, 15 minutes for a 300-second window).
+- `threshold_occurrences: AT_LEAST_ONCE`: choose **at least once in**.
+- `expiration`: choose **Add lost signal threshold**. `expiration_duration` is the time. `open_violation_on_expiration` is the box "Open new lost signal alert event". `close_violations_on_expiration` is the box "Close all current open alert events".
+- Policy setting **Issue creation preference**: choose **One issue per condition**. The default (**One issue per policy**) lets one open issue hide the alerts of the other conditions.
+- Before you save a condition, open **View as code** → **Create with NerdGraph**. It shows the exact values that New Relic will store.
+- A policy without a workflow sends no notification. Create the workflow and its destination yourself.
 
 **Via Terraform:**
 ```hcl
@@ -100,14 +124,22 @@ See `docs/newrelic-runbook.md` → "Verification After Deployment" for the compl
 
 ## Files
 
-### `dashboards/attackbox-overview.json`
+### `/Users/rohit/attack-box/newrelic/dashboards/attackbox-overview.json`
 
 Three-page dashboard:
-1. **Overview**: Active sessions, request rate, heartbeat status, stream health, canary activity, probe distribution
-2. **Security Events**: Falco critical events, blocked egress, runtime events
-3. **Telemetry Health**: Bait connection status, queue backlog, ingest errors, NrIntegrationError events, dropped records
+1. **Live Watch**: Five-minute completed request/session/source indicators and heartbeat age; a recent-arrivals feed from `action = 'request_received'` that appears before a long response completes; 15-minute status/persona traffic, export lag, backlog, loss, source/session tables and probe follow-ups. Arrival capture completion refers to the request body, not completion of the response.
+2. **Evidence & Forensics**: Separate redacted request/response context and raw base64 capture tables; manifests, segment offsets/hashes, serialized observations, host-owned Falco/egress records and evidence provenance.
+3. **Telemetry Health**: Bait connection reports, backlog, producer silence, export-attempt lag, spool counters, truncation flags and account-wide integration errors.
 
-All queries respect chunk-safe deduplication via `(record_id, body_sha256, chunk_index)`.
+Request totals use `uniqueCount(record_id, precision: 10000)` with `chunk_index = 0`, `direction = 'request'`, and `action != 'capture'`. This avoids counting response records, raw capture segments, chunks or replays as extra requests. These totals count retained evidence; they cannot measure traffic that was never collected. Unique counts above the configured precision can be approximate. Session indicators mean sessions observed in the window, not open network connections. A follow-up means the bait reported attribution, not successful host execution.
+
+Forensic chunk tables retain `(record_id, body_sha256, chunk_index)` facets. They are bounded previews, not a complete archive or reconstruction tool. Raw bytes remain base64 in `body_chunk`; redacted contextual records use a separate table. A producer's `evidence_complete` flag does not prove all segments reached New Relic. Verify manifests, offsets and hashes during export/reconstruction.
+
+`event` and `observations` are serialized JSON strings. The dashboard displays those strings; it does not invent dotted subfields. Queue-loss charts use scalar `ship_queue_dropped_total` and `ship_dropped_bait_total` / `ship_dropped_runtime_total` / `ship_dropped_egress_total`, not the legacy JSON map `ship_dropped_total`. Booleans use `= true` / `= false`. `export_lag_ms` measures event time to export attempt, not remote acceptance or indexing. Empty charts and a live heartbeat do not prove delivery. Older deployed binaries without these scalars, `body_chunk`, capture fields or export-attempt fields show missing data until upgraded.
+
+Local validation checks the 12-column layout, overlap, account placeholders, window settings, request-count guards and raw/context separation. It does not compile NRQL or prove live vendor acceptance. After import, use a known request, a replay, a multi-chunk response and an export outage to verify the totals and joins. Do not interpret a zero result before that canary check.
+
+Schema and query references: [dashboard import](https://docs.newrelic.com/docs/query-your-data/explore-query-data/dashboards/dashboards-charts-import-export-data/), [widget configuration and Markdown](https://docs.newrelic.com/docs/apis/nerdgraph/examples/create-widgets-dashboards-api/), [NRQL functions and unique-count precision](https://docs.newrelic.com/docs/nrql/nrql-syntax-clauses-functions/).
 
 ### `alerts/critical-alerts.yaml`
 
@@ -250,3 +282,4 @@ Cross-check metric and stream names against source:
 ## No Live Account Calls
 
 All definitions are offline and read-only. No `newrelic` CLI or Terraform `apply` commands are executed. Import and apply these definitions manually or via your deployment pipeline.
+

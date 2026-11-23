@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"attackbox/internal/observability"
 	"attackbox/internal/responder"
 	"attackbox/internal/server"
 	"attackbox/internal/telemetry"
@@ -125,6 +126,7 @@ func healthcheck(raw string) error {
 
 // app is one running process: the listeners, their servers and the sinks.
 type app struct {
+	tracing   *observability.Runtime
 	cfg       config
 	local     *telemetry.Async    // JSONLog behind a bounded queue, off the request path
 	nr        *telemetry.NewRelic // direct mode only
@@ -143,12 +145,24 @@ type app struct {
 func newApp(cfg config, logOut io.Writer) (*app, error) {
 	a := &app{cfg: cfg, local: telemetry.NewAsync(telemetry.NewJSONLog(logOut), 0)}
 	a.sink = a.local
+	tracing, err := observability.New(context.Background(), cfg.tracing, "attackbox-bait", version)
+	if err != nil {
+		return nil, errors.Join(err, a.closeLocal())
+	}
+	a.tracing = tracing
+	success := false
+	defer func() {
+		if !success {
+			_ = tracing.Close()
+		}
+	}()
 	if cfg.nrKey != "" {
 		nr, err := telemetry.NewNewRelic(telemetry.NRConfig{
-			LicenseKey: cfg.nrKey,
-			LogURL:     cfg.nrLogURL,
-			MetricURL:  cfg.nrMetricURL,
-			Common:     map[string]any{"service.name": "attackbox", "instance": cfg.instance},
+			LicenseKey:    cfg.nrKey,
+			LogURL:        cfg.nrLogURL,
+			MetricURL:     cfg.nrMetricURL,
+			FlushInterval: time.Second,
+			Common:        map[string]any{"service.name": "attackbox", "instance": cfg.instance},
 			// Delivery failures go to the local log only, never back into
 			// the queue that is failing.
 			OnError: func(err error) {
@@ -190,6 +204,7 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 	for _, l := range cfg.listeners {
 		s, err := server.New(server.Config{
 			Persona:           l.persona,
+			Tracer:            tracing.Tracer,
 			Models:            cfg.models,
 			Responder:         resp,
 			Sink:              a.sink,
@@ -198,6 +213,7 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 			EmbedSeed:         embedSeed,
 			MaxBodyBytes:      cfg.maxBody,
 			MaxLogBody:        cfg.maxLogBody,
+			FullEvidence:      cfg.fullEvidence,
 			MaxConcurrent:     cfg.maxInFlight,
 			MaxPerSource:      cfg.maxPerSource,
 			MaxStreamDuration: cfg.maxStream,
@@ -242,6 +258,7 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 			return nil, errors.Join(bindErr, remoteErr, a.closeLocal())
 		}
 	}
+	success = true
 	return a, nil
 }
 
@@ -288,6 +305,27 @@ func (a *app) trackHandler(next http.Handler) http.Handler {
 // stop, in-flight requests get shutdownTimeout, and New Relic is flushed.
 // It returns an error if a listener failed or New Relic lost events.
 func (a *app) run(ctx context.Context) error {
+	healthCtx, stopHealth := context.WithCancel(context.Background())
+	healthDone := make(chan struct{})
+	go func() {
+		defer close(healthDone)
+		if a.cfg.tracing.Socket == "" {
+			return
+		}
+		tick := time.NewTicker(30 * time.Second)
+		defer tick.Stop()
+		for {
+			attrs := a.tracing.Health()
+			attrs["source"] = "bait"
+			attrs["observation"] = "tracing"
+			a.sink.Emit(telemetry.Event{Stream: telemetry.StreamHeartbeat, Action: "bait_heartbeat", Attrs: attrs})
+			select {
+			case <-healthCtx.Done():
+				return
+			case <-tick.C:
+			}
+		}
+	}()
 	a.runtime("start", "ok", map[string]any{"version": version, "listeners": a.addrs(), "newrelic": a.nr != nil, "spool": a.spool != nil})
 	// Request contexts derive from base. When the grace period ends it is
 	// cancelled with server.ErrShutdown, so cut holds are logged as
@@ -342,14 +380,19 @@ func (a *app) run(ctx context.Context) error {
 		serveErr = errors.Join(serveErr, errors.New("handlers did not finish evidence before shutdown deadline"))
 	}
 
-	attrs := map[string]any{}
+	stopHealth()
+	<-healthDone
+	traceErr := a.tracing.Close()
+	attrs := a.tracing.Health()
 	var nrErr error
 	if a.nr != nil {
 		flushCtx, cancelFlush := context.WithTimeout(context.Background(), a.cfg.shutdownTimeout)
 		nrErr = a.nr.Close(flushCtx)
 		cancelFlush()
 		st := a.nr.Stats()
-		attrs = map[string]any{"nr_sent": st.Sent, "nr_dropped": st.Dropped, "nr_lost": st.Lost, "nr_errors": st.Errors, "nr_retries": st.Retries}
+		for k, v := range map[string]any{"nr_sent": st.Sent, "nr_dropped": st.Dropped, "nr_lost": st.Lost, "nr_errors": st.Errors, "nr_retries": st.Retries} {
+			attrs[k] = v
+		}
 		if nrErr == nil {
 			nrErr = lossError(st)
 		}
@@ -359,15 +402,15 @@ func (a *app) run(ctx context.Context) error {
 		// The host shipper gets a stopped record with the spool counters as
 		// they stand before the drain; the local record below carries the
 		// final ones and stays authoritative.
-		a.spool.Emit(a.stopped(serveErr, nil, attrs))
+		a.spool.Emit(a.stopped(serveErr, traceErr, attrs))
 		flushCtx, cancelFlush := context.WithTimeout(context.Background(), a.cfg.shutdownTimeout)
 		spErr = a.spool.Close(flushCtx)
 		cancelFlush()
 	}
-	stopped := a.stopped(serveErr, errors.Join(nrErr, spErr), attrs)
+	stopped := a.stopped(serveErr, errors.Join(nrErr, spErr, traceErr), attrs)
 	// Written locally only: the remote sink is closed at this point.
 	a.local.Emit(stopped)
-	return errors.Join(serveErr, nrErr, spErr, a.closeLocal())
+	return errors.Join(serveErr, nrErr, spErr, traceErr, a.closeLocal())
 }
 
 // stopped builds the final runtime record. attrs holds the New Relic

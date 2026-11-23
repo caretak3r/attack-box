@@ -10,26 +10,31 @@ Collect evidence about attacks against fake AI and agent services. Keep request 
 
 Build runtime services in Go. The existing module `/Users/rohit/attack-box/go.mod` declares Go 1.25. Prefer its standard library and existing packages. Retain nginx, systemd, nftables, Docker, gVisor, and Falco for their existing infrastructure roles. Shell provisioning and the Python client test harness remain support tools.
 
-## Current topology
+## Source topology (paired release pending)
 
 ```mermaid
 flowchart LR
     C[Client on host loopback] --> P[nginx proxy: 8443 TLS / 8080 redirect]
     P --> B[Go bait: OpenAI persona on 8080]
     B --> S[Go host shipper: bait Unix socket]
-    F[Host Falco] --> R[Go stdin adapter: runtime socket]
-    J[Kernel journal] --> E[Go stdin adapter: egress socket]
+    F[Host Falco] --> R[Go durable reader: runtime socket]
+    J[Kernel journal] --> E[Go durable reader: egress socket]
     R --> S
     E --> S
     S --> Q[Durable local queue]
     Q --> N[New Relic log and metric APIs]
+    P --> DJ[Persistent Docker journal]
+    DJ --> NI[Native Infrastructure log forwarder]
+    NI --> N
 ```
 
 The supplied Compose configuration publishes only `127.0.0.1:8443` and `127.0.0.1:8080`. vLLM and Ollama listeners are disabled. Port 8080 redirects to HTTPS port 8443. This configuration does not expose public AI discovery ports. Public 443, 8000, and 11434 are proposed in I01 of `/Users/rohit/attack-box/IMPROVE.md`.
 
 The bait joins the internal Docker network `172.30.0.0/24`. The proxy joins that network and an external bridge. Both containers use UID/GID 65532, read-only root filesystems, dropped capabilities, and no-new-privileges. The override `/Users/rohit/attack-box/compose.gvisor.yaml` selects runsc for both. Host Unix-socket access requires the configured runsc host-UDS support. This access is a deliberate boundary exception.
 
-Current container limits: bait 2 CPUs, 512 MiB, 100 PIDs; proxy 1 CPU, 256 MiB, 50 PIDs. Current shipper systemd limits: 256 MiB and 100 tasks. Runtime and egress adapters have separate 64 MiB and 50-task limits.
+Current container limits: bait 2 CPUs, 512 MiB, 100 PIDs; proxy 1 CPU, 256 MiB, 50 PIDs. Current shipper systemd limits: 256 MiB and 100 tasks. Prepared runtime and egress reader units have separate 128 MiB and 50-task limits.
+
+The gVisor override assigns `172.30.0.2` to bait and maps `bait` to that address in the proxy's `/etc/hosts`. Keep these two values equal. Docker's embedded DNS at `127.0.0.11` is not reachable from runsc's isolated network stack. This fixed address removes that dependency and preserves the internal bridge and sandbox. See the [gVisor DNS guidance](https://gvisor.dev/docs/user_guide/faq/#dns-doesnt-work-on-a-docker-user-defined-bridge-network-including-docker-compose). Deployment verification must receive a model list through `https://127.0.0.1:8443/v1/models`; a valid nginx configuration alone does not prove that forwarding works.
 
 ## Go components and trust boundaries
 
@@ -37,8 +42,8 @@ Current container limits: bait 2 CPUs, 512 MiB, 100 PIDs; proxy 1 CPU, 256 MiB, 
 |---|---|---|---|
 | Bait | `/Users/rohit/attack-box/cmd/attackbox/main.go` | HTTP personas to synthetic responses; redacted events to local output and configured sink | Container UID 65532; redaction secret; no ingest key in deployed spool mode |
 | Shipper | `/Users/rohit/attack-box/cmd/attackbox-shipper/main.go` | Role-specific Unix sockets to disk queue and New Relic | Host user `abx-ship`, primary group `abx-bait`, supplemental group `abx-ship`; owns ingest key in process environment |
-| Runtime adapter | Same shipper binary with `-stdin-stream runtime` | Falco JSON lines to runtime socket | Host root, separate systemd unit; no ingest key required by adapter mode |
-| Egress adapter | Same shipper binary with `-stdin-stream egress` | Filtered kernel journal JSON to egress socket | Host root, separate systemd unit; no ingest key required by adapter mode |
+| Runtime adapter | Go `attackbox-hostreader -source falco` | Falco JSON lines to runtime socket | Host root, separate systemd unit; no ingest key required by adapter mode |
+| Egress adapter | Go `attackbox-hostreader -source journal` | Filtered kernel journal JSON to egress socket | Host root, separate systemd unit; no ingest key required by adapter mode |
 | Analysis job | Proposed; no binary exists | Approved redacted exports to bounded families, candidate links, and reports | Separate analysis environment, outside decoy and operator Mac; no authority over the live response policy |
 
 Keep a typed response planner inside the Go bait package. Do not add a model network service for ordinary response generation. Start future analysis as a Go batch command. A broker, public analysis API, database, or language-model provider is not part of this approved documentation change.
@@ -107,7 +112,7 @@ A standing field is a value that the probe request already carried. A scored gat
 | `credential_presented` | The exact value is in a credential surface. `credential_source` names the surface. |
 | `presented_undelivered` | The client shows the canary before the server fully sent its probe. |
 
-The server reports each state once for each canary in a session. The canaries are `url_password`, `two_part`, `three_part`, and `payout`. Only exact issued values match. `independently_observed` is always `unavailable`. Presence in a prompt is not exfiltration.
+The server reports each state once for each canary in a session. The canaries are `url_password`, `two_part`, `three_part`, and `payout`. Only exact issued values match. `independently_observed` is always `unavailable`. Presence in a prompt is not exfiltration. Probe events with observations include `canary_credential_presented`, a scalar flag set only for a `canary-reuse` credential-presentation state. Alert on that flag; nested observation JSON is not a flattened attribute contract.
 
 | Constant | Value | Behaviour at the bound |
 |---|---|---|
@@ -174,7 +179,15 @@ Validation applies role-specific stream/action and metric allowlists, reserved-a
 
 Wire record IDs use `<16-lowercase-hex-boot>-<positive-sequence>`. Forwarded IDs use `<role>-<boot>-<sequence>`. Deduplicate chunks by record ID and chunk index. Reassemble only within that identity and validate expected count and content hash. Hash alone is not a transcript identity.
 
-Stdin adapters accept lines up to 8 KiB. Invalid JSON is skipped. These adapters do not supply complete loss accounting; their absence of events cannot prove absence of host activity. Native host Falco does not observe all syscalls inside gVisor.
+The bootstrap uses the Go host reader for Falco files and kernel journal events. Set `ATTACKBOX_HOST_RECEIPTS=true` on the shipper. Only root-only runtime and egress sockets can return receipts. The bait socket remains one-way. A receipt confirms an fsynced local queue append; it does not confirm New Relic delivery.
+
+The reader preserves each source record as base64 segments of at most 128 KiB. It retains source records up to 8 MiB. It commits its source position only after all segments have receipts. The private cursor file uses fsync, rename and directory fsync. One process holds the state-directory lock. A lost receipt can produce duplicates with stable record IDs. Use `source_event_id`, `source_segment`, `source_segments`, `source_bytes` and `source_sha256` to reconstruct and check source bytes after reconstructing each exported body chunk.
+
+Falco state tracks device, inode, offset and the previous line hash. A missing saved inode, changed anchor, truncation or oversized line stops the reader without a cursor advance. Journal state tracks `__CURSOR`; startup checks that the cursor still exists. Journal selection spans retained boots and includes full JSON fields. Records begin at the oldest retained source data on first start. These rules cannot recover data already removed by source retention.
+
+File rotation requires rename-and-reopen, retained old files, and a writer that finishes the old inode before the reader switches files. Do not use copy-truncate, compression, or multiple rotations while the reader is behind. Automated source rotation with those cases is not validated. Native host Falco does not observe all syscalls inside gVisor.
+
+The legacy stdin adapters remain available for compatibility. Their 8 KiB limit and lack of source receipts make them unsuitable for complete host evidence collection.
 
 Source: `/Users/rohit/attack-box/internal/shipper/record.go`, `/Users/rohit/attack-box/internal/shipper/ingest.go`, and `/Users/rohit/attack-box/cmd/attackbox-shipper/main.go`.
 
@@ -186,7 +199,7 @@ The `checkpoint` file records generation, segment, offset, and acknowledged sequ
 
 The default unacknowledged queue limit is 256 MiB. Role reservations are bait 60%, runtime 20%, and egress 20%. Full queues reject new records; they do not evict unacknowledged data. Physical disk use can exceed the logical unacknowledged limit due to retained segments and quarantine files. Monitor filesystem usage separately.
 
-The drain reads up to 200 records or 512 KiB, delivers in order, and checkpoints confirmed deliveries after 200 records or one second. Delivery failure blocks later records. Empty polls wait 100 ms; blocked delivery retries after 250 ms. Remote API acceptance is not proof of query availability.
+The drain reads up to 200 records or 512 KiB, delivers in order, and checkpoints confirmed deliveries after 200 records or one second. Authentication, endpoint, transport and outage failures block later records. HTTP 413 first splits encoded batches. Record-level HTTP 400, 413 or 422 failures isolate the source record. The drain can advance past that record only after it stores the exact queue bytes and SHA-256 in `/var/lib/attackbox-shipper/queue/quarantine`. The quarantine is bounded to 64 MiB and 4096 files. It never evicts records. A full or damaged quarantine stops the drain. Replayed entries use deterministic filenames. A server-wide 400 response can fill this store; it is not treated as successful remote delivery. Monitor `quarantine_records` and `quarantine_bytes`. Empty polls wait 100 ms; blocked delivery retries after 250 ms. Remote API acceptance is not proof of query availability.
 
 Recovery truncates a torn final frame in the newest segment. Other corruption preserves the valid prefix and quarantines the segment. Missing or inconsistent checkpoint state causes uncertain replay. Logs can repeat. Metrics in the uncertain range are suppressed and `attackbox.metric_replay_gap` records the gap. An I/O error can leave the queue broken until restart and recovery; do not delete queue files to clear it.
 
@@ -229,3 +242,19 @@ For each service change, update this document and `/Users/rohit/attack-box/docs/
 ## Validation boundary
 
 Source review and local tests establish only their tested behavior. Public port reachability, gVisor host-socket behavior, authenticated remote ingest, proxy containment, restart recovery, and the provider-console recovery path require deployment evidence. The current deploy-script verifier has false-positive paths and incomplete coverage; see `/Users/rohit/attack-box/docs/operator.md` before using it.
+
+## Live evidence and delivery
+
+The [service ecosystem](service-ecosystem.md) documents service identities, collection routes, and coverage checks. New Relic Infrastructure supplies host, process, and Docker metrics. An optional OpenTelemetry Collector supplies application spans and readiness metrics. See the [monitoring guide](monitoring-setup.md) for setup and rollback.
+
+The implemented application capture, batch export, evidence recovery CLI, shutdown ordering, dashboard setup and validation gates are documented in `/Users/rohit/attack-box/docs/live-evidence.md`. The process defaults to `ATTACKBOX_FULL_EVIDENCE=true`; Compose sets it explicitly. Raw capture preserves submitted bytes and credentials; readable summaries remain redacted. This does not extend capture to proxy-rejected traffic or remove bounded-queue loss. The fixed readiness collector is implemented locally. The durable forensic host reader is implemented and tested locally; its paired shipper/reader release is not deployed.
+
+
+## Prepared edge collection and containment changes
+
+The proxy writes JSON access records to stdout and TLS/parser diagnostics to stderr. Its Docker log driver is `journald`; native Infrastructure reads the `docker.service` journal with `logtype=docker_journal`. This keeps the route valid when a container ID changes. Bait still uses the Go evidence route and the bounded local Docker driver. The native systemd input is documented at https://docs.newrelic.com/docs/logs/forward-logs/forward-your-logs-using-infrastructure-agent/ .
+
+Each access record includes a proxy request ID, client address, raw request line, response status, byte counts, timing and TLS fields. `bait_request_id` comes from the upstream response header, not a client-supplied header. It is empty for requests that nginx rejects before forwarding. Error records remain text. These records contain metadata; they do not contain a full rejected request body or raw TLS packets. Request lines can contain submitted credentials. Treat all fields as inert evidence.
+
+The prepared firewall pins the gVisor proxy to `172.30.0.3` and bait to `172.30.0.2`. It permits new proxy-to-bait TCP traffic on 8080 before denying other container-originated forwarding. Container-to-host TCP/UDP is denied. Link-scoped IPv6 neighbor discovery remains allowed. External proxy-port exceptions run after container denials. The Docker rules and provider firewall remain separate controls. The Falco health listener binds to `127.0.0.1` in bootstrap.
+

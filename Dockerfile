@@ -32,13 +32,27 @@ RUN CGO_ENABLED=0 go build \
     -ldflags='-s -w -X main.version=container' \
     -o /work/out/attackbox-shipper \
     ./cmd/attackbox-shipper
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' \
+    -o /work/out/attackbox-hostreader ./cmd/attackbox-hostreader
 
 FROM scratch AS shipper-export
+COPY --from=shipper-build /work/out/attackbox-hostreader /attackbox-hostreader
 COPY --from=shipper-build /work/out/attackbox-shipper /attackbox-shipper
 
 FROM cgr.dev/chainguard/static@sha256:8658e9eaeb2294fa0e49b0667f7d66b4e21fa7690b8d2a4c30cd1d013ceb9eb7 AS shipper
 COPY --from=shipper-build /work/out/attackbox-shipper /attackbox-shipper
 ENTRYPOINT ["/attackbox-shipper"]
+
+# Host readiness collector. Export only; no Docker socket in a container.
+FROM builder AS hostcollector-build
+RUN CGO_ENABLED=0 go build \
+    -trimpath \
+    -ldflags='-s -w -X main.version=container' \
+    -o /work/out/attackbox-hostcollector \
+    ./cmd/attackbox-hostcollector
+
+FROM scratch AS hostcollector-export
+COPY --from=hostcollector-build /work/out/attackbox-hostcollector /attackbox-hostcollector
 
 # Runtime stage: Chainguard static (distroless, no shell)
 # Verification: docker pull cgr.dev/chainguard/static:latest

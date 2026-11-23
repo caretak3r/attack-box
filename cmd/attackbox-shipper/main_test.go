@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,6 +23,52 @@ import (
 	"attackbox/internal/shipper"
 	"attackbox/internal/telemetry"
 )
+
+func TestQuietAdapterHeartbeat(t *testing.T) {
+	for _, role := range []string{"runtime", "egress"} {
+		t.Run(role, func(t *testing.T) {
+			dir, err := os.MkdirTemp("/tmp", "abx-beat-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(dir)
+			path := filepath.Join(dir, "s")
+			listener, err := net.Listen("unix", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			_ = listener.(*net.UnixListener).SetDeadline(time.Now().Add(3 * time.Second))
+			input, writer := io.Pipe()
+			defer input.Close()
+			defer writer.Close()
+			done := make(chan error, 1)
+			go func() { done <- runAdapter(role, func(string) string { return path }, input, io.Discard) }()
+			conn, err := listener.Accept()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			var record telemetry.Record
+			if err := json.NewDecoder(conn).Decode(&record); err != nil {
+				t.Fatal(err)
+			}
+			if record.Event == nil || record.Event.Stream != telemetry.StreamHeartbeat || record.Event.Action != role+"_heartbeat" {
+				t.Fatalf("wrong quiet adapter heartbeat: %+v", record.Event)
+			}
+			_ = writer.Close()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("adapter did not stop on EOF")
+			}
+		})
+	}
+}
 
 // fakeNewRelic is a test double for the New Relic endpoints that tracks
 // received logs and metrics and can simulate failures.
@@ -85,7 +132,7 @@ func (f *fakeNewRelic) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if ts, ok := lm["timestamp"].(float64); ok {
 					e.Timestamp = time.UnixMilli(int64(ts))
 				}
-				if msg, ok := lm["message"].(string); ok {
+				if msg, ok := attrs["body_chunk"].(string); ok {
 					e.Body = msg
 				}
 				if a, ok := attrs["action"].(string); ok {
@@ -221,7 +268,7 @@ func TestDrainAcksOnlyAfterDelivery(t *testing.T) {
 	}
 }
 
-func TestDrainFailureLeavesPrefixUnacknowledged(t *testing.T) {
+func TestDrainAcceptedBatchAfterCancellationIsAcknowledged(t *testing.T) {
 	dir := t.TempDir()
 	qcfg := shipper.QueueConfig{
 		Dir:          filepath.Join(dir, "queue"),
@@ -282,9 +329,9 @@ func TestDrainFailureLeavesPrefixUnacknowledged(t *testing.T) {
 	cancel()
 	<-done
 
-	// First record retries after 1s backoff and succeeds before the 1s mark,
-	// so it's accepted before full cancellation and should be Ack'd.
-	// Records 2 and 3 were never attempted, so they remain unacknowledged.
+	// All three records share one POST. Its retry can complete after the
+	// drain context is canceled. Confirmed acceptance still checkpoints all
+	// three; cancellation must not split an accepted batch.
 	q2, rec2, err := shipper.OpenQueue(qcfg)
 	if err != nil {
 		t.Fatal(err)
@@ -299,12 +346,17 @@ func TestDrainFailureLeavesPrefixUnacknowledged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 2 {
-		t.Fatalf("got %d unacknowledged entries, want 2 (first was accepted before cancel)", len(entries))
+	if len(entries) != 0 {
+		t.Fatalf("got %d unacknowledged entries, want 0 after full batch acceptance", len(entries))
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.logs) != 3 {
+		t.Fatalf("accepted %d logs, want 3", len(fake.logs))
 	}
 }
 
-func TestDrainAcksAcceptedPrefixBeforeRewind(t *testing.T) {
+func TestDrainPartialHTTPBatchReplaysAllRecords(t *testing.T) {
 	dir := t.TempDir()
 	qcfg := shipper.QueueConfig{
 		Dir:          filepath.Join(dir, "queue"),
@@ -319,7 +371,7 @@ func TestDrainAcksAcceptedPrefixBeforeRewind(t *testing.T) {
 	}
 	defer q.Close()
 
-	// Enqueue two records
+	// Enqueue one log and one metric, forcing two HTTP signal requests.
 	var items []shipper.Item
 	for i := 1; i <= 2; i++ {
 		rec := telemetry.Record{
@@ -329,6 +381,10 @@ func TestDrainAcksAcceptedPrefixBeforeRewind(t *testing.T) {
 				Action:    fmt.Sprintf("test%d", i),
 				Timestamp: time.Now(),
 			},
+		}
+		if i == 2 {
+			rec.Event = nil
+			rec.Metric = &telemetry.MetricRecord{Name: "attackbox.requests", Kind: "count", Value: 1, At: time.Now()}
 		}
 		data, _ := json.Marshal(rec)
 		items = append(items, shipper.Item{Role: shipper.RoleBait, Data: data})
@@ -378,7 +434,8 @@ func TestDrainAcksAcceptedPrefixBeforeRewind(t *testing.T) {
 	cancel()
 	<-done
 
-	// Record 1 should be delivered and Ack'd, record 2 should replay
+	// The log POST succeeded but the metric POST failed. Both records must
+	// replay because the batch has not been fully accepted.
 	fake.mu.Lock()
 	delivered := len(fake.logs)
 	fake.mu.Unlock()
@@ -401,15 +458,15 @@ func TestDrainAcksAcceptedPrefixBeforeRewind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("got %d unacknowledged entries, want 1 (record 2 should replay, not record 1)", len(entries))
+	if len(entries) != 2 {
+		t.Fatalf("got %d unacknowledged entries, want 2 after partial batch failure", len(entries))
 	}
 
-	// Verify the replayed record is 2, not 1
+	// Replay starts with the accepted log; its stable record ID permits dedup.
 	var rec telemetry.Record
 	json.Unmarshal(entries[0].Data, &rec)
-	if rec.Event == nil || rec.Event.Action != "test2" {
-		t.Fatalf("replayed record action %q, want test2", rec.Event.Action)
+	if rec.Event == nil || rec.Event.Action != "test1" {
+		t.Fatalf("replayed record action %q, want test1", rec.Event.Action)
 	}
 }
 
@@ -833,6 +890,124 @@ func TestLoadConfigRejectsQueueBelowOneMaxFramePerRole(t *testing.T) {
 	}
 }
 
+func TestLoadConfigSensorAndDeploymentID(t *testing.T) {
+	max63 := strings.Repeat("a", 63)
+	cases := []struct {
+		name           string
+		env            map[string]string
+		sensor, deploy string
+		errFor         string // setting named in the error; "" means none
+	}{
+		{"defaults", map[string]string{"HOSTNAME": "bait-01"}, "bait-01", "unset", ""},
+		{"host name lower-cased", map[string]string{"HOSTNAME": "Bait-01.Lab"}, "bait-01.lab", "unset", ""},
+		{"host name breaks the rule", map[string]string{"HOSTNAME": "bait_01!"}, "attackbox", "unset", ""},
+		{"host name leads with a dash", map[string]string{"HOSTNAME": "-bait"}, "attackbox", "unset", ""},
+		{"host name too long", map[string]string{"HOSTNAME": strings.Repeat("a", 64)}, "attackbox", "unset", ""},
+		{"explicit values", map[string]string{"HOSTNAME": "bait-01", "ATTACKBOX_SENSOR_ID": "edge.eu-1_a", "ATTACKBOX_DEPLOYMENT_ID": "build-42"}, "edge.eu-1_a", "build-42", ""},
+		{"explicit sensor beats a bad host name", map[string]string{"HOSTNAME": "Bad Host", "ATTACKBOX_SENSOR_ID": "s1"}, "s1", "unset", ""},
+		{"longest valid", map[string]string{"ATTACKBOX_SENSOR_ID": max63, "ATTACKBOX_DEPLOYMENT_ID": max63}, max63, max63, ""},
+		{"sensor upper case", map[string]string{"ATTACKBOX_SENSOR_ID": "Sensor"}, "", "", "ATTACKBOX_SENSOR_ID"},
+		{"sensor leading dot", map[string]string{"ATTACKBOX_SENSOR_ID": ".s"}, "", "", "ATTACKBOX_SENSOR_ID"},
+		{"sensor space", map[string]string{"ATTACKBOX_SENSOR_ID": "a b"}, "", "", "ATTACKBOX_SENSOR_ID"},
+		{"sensor too long", map[string]string{"ATTACKBOX_SENSOR_ID": strings.Repeat("a", 64)}, "", "", "ATTACKBOX_SENSOR_ID"},
+		{"deployment upper case", map[string]string{"ATTACKBOX_DEPLOYMENT_ID": "Build"}, "", "", "ATTACKBOX_DEPLOYMENT_ID"},
+		{"deployment slash", map[string]string{"ATTACKBOX_DEPLOYMENT_ID": "a/b"}, "", "", "ATTACKBOX_DEPLOYMENT_ID"},
+		{"deployment leading dash", map[string]string{"ATTACKBOX_DEPLOYMENT_ID": "-b"}, "", "", "ATTACKBOX_DEPLOYMENT_ID"},
+		{"deployment too long", map[string]string{"ATTACKBOX_DEPLOYMENT_ID": strings.Repeat("a", 64)}, "", "", "ATTACKBOX_DEPLOYMENT_ID"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, err := loadConfig(testEnv(t, c.env))
+			if c.errFor != "" {
+				if err == nil || !strings.Contains(err.Error(), c.errFor+" must match") {
+					t.Fatalf("got %v, want an error for %s", err, c.errFor)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.sensorID != c.sensor || cfg.deploymentID != c.deploy {
+				t.Fatalf("sensor %q deployment %q, want %q %q", cfg.sensorID, cfg.deploymentID, c.sensor, c.deploy)
+			}
+		})
+	}
+
+	// Both settings broken: one error names each.
+	_, err := loadConfig(testEnv(t, map[string]string{"ATTACKBOX_SENSOR_ID": "S", "ATTACKBOX_DEPLOYMENT_ID": "D"}))
+	if err == nil || !strings.Contains(err.Error(), "ATTACKBOX_SENSOR_ID") || !strings.Contains(err.Error(), "ATTACKBOX_DEPLOYMENT_ID") {
+		t.Fatalf("got %v, want both settings named", err)
+	}
+}
+
+// The Common attributes of a real run reach New Relic with the sensor and
+// deployment IDs.
+func TestRunSendsSensorAndDeploymentCommonAttributes(t *testing.T) {
+	commons := make(chan map[string]any, 16)
+	nr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			if gr, err := gzip.NewReader(bytes.NewReader(body)); err == nil {
+				body, _ = io.ReadAll(gr)
+			}
+		}
+		var env []struct {
+			Common struct {
+				Attributes map[string]any `json:"attributes"`
+			} `json:"common"`
+		}
+		if json.Unmarshal(body, &env) == nil {
+			for _, e := range env {
+				select {
+				case commons <- e.Common.Attributes:
+				default:
+				}
+			}
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer nr.Close()
+	cfg, err := loadConfig(testEnv(t, map[string]string{
+		"ATTACKBOX_NR_LOG_URL":    nr.URL + "/log/v1",
+		"ATTACKBOX_NR_METRIC_URL": nr.URL + "/metric/v1",
+		"ATTACKBOX_SENSOR_ID":     "sensor-7",
+		"ATTACKBOX_DEPLOYMENT_ID": "build-9",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.endpoints[0].UIDs = []uint32{uint32(os.Getuid())} // the test is the bait
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var stderr bytes.Buffer
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, cfg, &stderr) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	waitForSocket(t, cfg.endpoints[0].Path)
+	c, err := net.Dial("unix", cfg.endpoints[0].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	line := fmt.Sprintf(`{"id":"0123456789abcdef-1","v":1,"event":{"stream":"edge","action":"request","timestamp":%q}}`+"\n", time.Now().Format(time.RFC3339Nano))
+	if _, err := c.Write([]byte(line)); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-commons:
+		if got["sensor_id"] != "sensor-7" || got["deployment_id"] != "build-9" || got["service.name"] != "attackbox" {
+			t.Fatalf("common attributes = %v", got)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("no New Relic post\nstderr: %s", stderr.String())
+	}
+}
+
 // The largest record the admission layer lets through must be appendable on
 // every role at the smallest allowed queue, not dropped as oversize.
 func TestMaxAdmittedRecordIsAppendable(t *testing.T) {
@@ -859,7 +1034,7 @@ func TestMaxAdmittedRecordIsAppendable(t *testing.T) {
 		shipper.RoleEgress:  `{"stream":"egress","action":"egress_blocked","body":"` + body + `"}`,
 	}
 	for role, ev := range lines {
-		line := []byte(`{"id":"0123456789abcdef-1","event":` + ev + `}`)
+		line := []byte(`{"id":"0123456789abcdef-1","v":1,"event":` + ev + `}`)
 		a, err := shipper.Admit(role, line, time.Now())
 		if err != nil {
 			t.Fatalf("%s: Admit: %v", role, err)
@@ -949,6 +1124,7 @@ func TestSixStreams(t *testing.T) {
 	for i, st := range streamTests {
 		rec := telemetry.Record{
 			ID: fmt.Sprintf("0123456789abcdef-%d", i+1),
+			V:  telemetry.SchemaVersion,
 			Event: &telemetry.Event{
 				Stream:    st.stream,
 				Action:    st.action,
@@ -1057,6 +1233,7 @@ func TestFullMetric(t *testing.T) {
 	for i, m := range baitMetrics {
 		rec := telemetry.Record{
 			ID: fmt.Sprintf("fedcba9876543210-%d", i+1),
+			V:  telemetry.SchemaVersion,
 			Metric: &telemetry.MetricRecord{
 				Name:  m.name,
 				Kind:  m.kind,
@@ -1077,6 +1254,7 @@ func TestFullMetric(t *testing.T) {
 	// 1 egress metric through shipper.Admit with RoleEgress
 	egressRec := telemetry.Record{
 		ID: "fedcba9876543210-99",
+		V:  telemetry.SchemaVersion,
 		Metric: &telemetry.MetricRecord{
 			Name:  "attackbox.egress_blocked",
 			Kind:  "count",

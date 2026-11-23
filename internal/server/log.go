@@ -12,6 +12,9 @@ import (
 	"attackbox/internal/responder"
 	"attackbox/internal/secret"
 	"attackbox/internal/telemetry"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -23,9 +26,15 @@ const (
 
 // finish writes the edge and transcript events and the request counters.
 func (s *Server) finish(c *call) {
+	c.endEvidence()
 	status := c.w.status
 	if status == 0 {
 		status = 499 // the client left before any response bytes
+	}
+	span := trace.SpanFromContext(c.r.Context())
+	span.SetAttributes(attribute.String("http.route", c.endpoint), attribute.Int("http.response.status_code", status))
+	if status >= 500 || c.panicked {
+		span.SetStatus(codes.Error, "handler_error")
 	}
 	red := s.cfg.Redactor
 	now := s.cfg.Now()
@@ -89,7 +98,7 @@ func (s *Server) finish(c *call) {
 		result = holdServerShutdown
 	}
 
-	s.cfg.Sink.Emit(telemetry.Event{
+	c.emit(telemetry.Event{
 		Timestamp: now,
 		Stream:    telemetry.StreamEdge,
 		SessionID: sessionID,
@@ -109,7 +118,7 @@ func (s *Server) finish(c *call) {
 		s.emitResponse(c, now, sessionID, ua, resource, result, status, probeID)
 	}
 	if c.dec != nil {
-		s.cfg.Sink.Emit(telemetry.Event{
+		c.emit(telemetry.Event{
 			Timestamp:  now,
 			Stream:     telemetry.StreamTranscript,
 			SessionID:  sessionID,
@@ -215,6 +224,7 @@ func (s *Server) emitProbe(c *call, now time.Time, sessionID, ua, resource, resu
 	}
 	if len(obs) > 0 {
 		attrs["observations"] = obs
+		attrs["canary_credential_presented"] = canaryCredentialPresented(obs)
 	}
 	if c.holdResult != "" {
 		attrs["hold_result"] = c.holdResult
@@ -226,7 +236,7 @@ func (s *Server) emitProbe(c *call, now time.Time, sessionID, ua, resource, resu
 	if c.disconnected(status) {
 		attrs["disconnect_ms"] = now.Sub(c.start).Milliseconds()
 	}
-	s.cfg.Sink.Emit(telemetry.Event{
+	c.emit(telemetry.Event{
 		Timestamp: now,
 		Stream:    telemetry.StreamProbe,
 		SessionID: sessionID,
@@ -241,6 +251,24 @@ func (s *Server) emitProbe(c *call, now time.Time, sessionID, ua, resource, resu
 		ProbeID:   probeID,
 		Attrs:     attrs,
 	})
+}
+
+// A scalar alert field avoids JSON-array path assumptions in the log backend.
+// History copies and undelivered canaries do not prove credential presentation.
+func canaryCredentialPresented(obs []responder.Observation) int {
+	for _, o := range obs {
+		if o.ProbeID != "canary-reuse" {
+			continue
+		}
+		for _, key := range []string{"url_password", "two_part", "three_part", "payout"} {
+			for _, state := range strings.Split(o.Result[key], ",") {
+				if state == "credential_presented" {
+					return 1
+				}
+			}
+		}
+	}
+	return 0
 }
 
 // logRedactMargin is how far past MaxLogBody the redactor still looks. Redaction
@@ -262,7 +290,7 @@ func (s *Server) emitResponse(c *call, now time.Time, sessionID, ua, resource, r
 	if cut {
 		attrs["body_truncated"] = true
 	}
-	s.cfg.Sink.Emit(telemetry.Event{
+	c.emit(telemetry.Event{
 		Timestamp: now,
 		Stream:    telemetry.StreamEdge,
 		SessionID: sessionID,

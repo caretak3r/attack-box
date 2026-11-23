@@ -29,8 +29,12 @@ import (
 // Event is unchunked, and BodySHA256, ChunkIndex and ChunkCount are zero on
 // the wire: Chunk at the last hop is the only producer of chunk metadata.
 // Attrs round-trip through JSON, so integers above 2^53 lose precision.
+//
+// V is the wire version. Every producer writes SchemaVersion, and the shipper
+// rejects any other value, an absent one included.
 type Record struct {
 	ID     string        `json:"id"`
+	V      int           `json:"v"`
 	Event  *Event        `json:"event,omitempty"`
 	Metric *MetricRecord `json:"metric,omitempty"`
 }
@@ -43,6 +47,10 @@ type MetricRecord struct {
 	At    time.Time         `json:"at"`
 	Attrs map[string]string `json:"attrs,omitempty"`
 }
+
+// SchemaVersion is the wire version of Record that this build writes and the
+// shipper accepts.
+const SchemaVersion = 1
 
 // Spool limits and defaults.
 const (
@@ -246,7 +254,8 @@ func (s *Spool) put(field string, v any) {
 		return
 	}
 	id := s.boot + "-" + strconv.FormatUint(s.seq, 10)
-	size := len(`{"id":"","":}`) + len(id) + len(field) + len(payload) + 1
+	ver := strconv.Itoa(SchemaVersion)
+	size := len(`{"id":"","v":,"":}`) + len(id) + len(ver) + len(field) + len(payload) + 1
 	if size > s.cfg.MaxRecord {
 		s.drop(true)
 		return
@@ -258,7 +267,9 @@ func (s *Spool) put(field string, v any) {
 	line := make([]byte, 0, size)
 	line = append(line, `{"id":"`...)
 	line = append(line, id...)
-	line = append(line, `","`...)
+	line = append(line, `","v":`...)
+	line = append(line, ver...)
+	line = append(line, `,"`...)
 	line = append(line, field...)
 	line = append(line, `":`...)
 	line = append(line, payload...)

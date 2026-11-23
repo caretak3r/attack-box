@@ -8,7 +8,7 @@ alerts:
     enabled: true
     violation_time_limit_seconds: 3600
     nrql:
-      query: "FROM Log SELECT count(*) WHERE stream = 'heartbeat' AND source = 'shipper'"
+      query: "FROM Log, Log_AttackEvidence, Log_Security, Log_Operations SELECT count(*) WHERE stream = 'heartbeat' AND source = 'shipper'"
     signal:
       aggregation_window: 60
       evaluation_offset: 3
@@ -29,7 +29,7 @@ alerts:
     enabled: true
     violation_time_limit_seconds: 3600
     nrql:
-      query: "FROM Log SELECT latest(bait_connected) WHERE stream = 'heartbeat' AND source = 'shipper'"
+      query: "FROM Log, Log_AttackEvidence, Log_Security, Log_Operations SELECT latest(bait_connected) WHERE stream = 'heartbeat' AND source = 'shipper'"
     signal:
       aggregation_window: 60
       evaluation_offset: 3
@@ -46,7 +46,7 @@ alerts:
     enabled: true
     violation_time_limit_seconds: 3600
     nrql:
-      query: "FROM Log SELECT latest(last_bait_record_age_ms) WHERE stream = 'heartbeat' AND source = 'shipper' AND bait_connected = 1"
+      query: "FROM Log, Log_AttackEvidence, Log_Security, Log_Operations SELECT latest(last_bait_record_age_ms) WHERE stream = 'heartbeat' AND source = 'shipper' AND bait_connected = 1"
     signal:
       aggregation_window: 60
       evaluation_offset: 3
@@ -64,7 +64,7 @@ alerts:
     violation_time_limit_seconds: 600
     nrql:
       # Counts all events; adapter field structure requires deployment validation
-      query: "FROM Log SELECT count(*) WHERE stream = 'runtime' AND action = 'falco'"
+      query: "FROM Log, Log_AttackEvidence, Log_Security, Log_Operations SELECT count(*) WHERE stream = 'runtime' AND action = 'falco'"
     signal:
       aggregation_window: 60
       evaluation_offset: 3
@@ -81,7 +81,7 @@ alerts:
     enabled: true
     violation_time_limit_seconds: 1800
     nrql:
-      query: "FROM Log SELECT count(*) WHERE stream = 'egress' AND action = 'egress_blocked'"
+      query: "FROM Log, Log_AttackEvidence, Log_Security, Log_Operations SELECT count(*) WHERE stream = 'egress' AND action = 'egress_blocked'"
     signal:
       aggregation_window: 60
       evaluation_offset: 3
@@ -142,7 +142,7 @@ alerts:
     enabled: true
     violation_time_limit_seconds: 1800
     nrql:
-      query: "FROM Log SELECT latest(queue_backlog_bytes) WHERE stream = 'heartbeat' AND source = 'shipper'"
+      query: "FROM Log, Log_AttackEvidence, Log_Security, Log_Operations SELECT latest(queue_backlog_bytes) WHERE stream = 'heartbeat' AND source = 'shipper'"
     signal:
       aggregation_window: 60
       evaluation_offset: 3
@@ -165,7 +165,7 @@ alerts:
     violation_time_limit_seconds: 3600
     nrql:
       # Counts decision events; observation array queries require deployment validation
-      query: "FROM Log SELECT count(*) WHERE stream = 'probe' AND action = 'decision'"
+      query: "FROM Log, Log_AttackEvidence, Log_Security, Log_Operations SELECT count(*) WHERE stream = 'probe' AND action = 'decision'"
     signal:
       aggregation_window: 60
       evaluation_offset: 3
@@ -176,16 +176,13 @@ alerts:
         operator: ABOVE
         threshold: 0
 
-  - name: "AttackBox - Canary Credential Returned (Pending Validation)"
+  - name: "AttackBox - Canary Credential Presented"
     type: NRQL
-    description: "A canary-reuse observation exists. It holds a comma list of states for each canary (present_in_history, newly_echoed, destination_placed, credential_presented, presented_undelivered) and credential_source. present_in_history is not exfiltration. Each state is reported once for each canary in a session. independently_observed is always unavailable. Unscored replies are observations with probe_id attribution. Requires observations.probe_id array filtering (pending account-side validation)."
-    enabled: true
+    description: "A delivered synthetic credential was presented as a credential. History-only, echoed and undelivered values do not trigger. Enable after the scalar field is deployed and tested in this account."
+    enabled: false
     violation_time_limit_seconds: 3600
     nrql:
-      # Probe decisions with observations; observations.probe_id filtering requires validation.
-      # The query matches every canary-reuse observation, not only credential_presented.
-      # attackbox.probe_followups counts attributed replies only.
-      query: "FROM Log SELECT count(*) AS 'Events' WHERE stream = 'probe' AND action = 'decision' AND observations.probe_id = 'canary-reuse'"
+      query: "FROM Log, Log_AttackEvidence, Log_Security, Log_Operations SELECT count(*) WHERE sensor_id = 'srv-000000' AND stream = 'probe' AND action = 'decision' AND canary_credential_presented = 1"
     signal:
       aggregation_window: 60
       evaluation_offset: 3

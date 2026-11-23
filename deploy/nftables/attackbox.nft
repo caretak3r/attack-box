@@ -26,6 +26,10 @@ table inet attackbox {
     set nr_log_ipv6 { type ipv6_addr; flags interval; }
     set nr_metric_ipv4 { type ipv4_addr; flags interval; }
     set nr_metric_ipv6 { type ipv6_addr; flags interval; }
+    # Optional OTel profile. Only the dedicated collector UID may use these.
+    set nr_otlp_ipv4 { type ipv4_addr; flags interval; }
+    set nr_otlp_ipv6 { type ipv6_addr; flags interval; }
+    set collector_uids { type uid; }
 
     # Native Infrastructure agent runs as root. Destination-scoped HTTPS only.
     set nr_infra_ipv4 { type ipv4_addr; flags interval; }
@@ -52,16 +56,30 @@ table inet attackbox {
         # Allow established/related (Docker NAT return traffic)
         ct state established,related accept
 
-        # Allow external → proxy (DNAT'd to proxy container on docker0/br-*)
+        # The only new container-to-container flow: the pinned proxy upstream.
+        iifname "br-*" oifname "br-*" ip saddr 172.30.0.3 ip daddr 172.30.0.2 tcp dport 8080 accept
+
+        # Deny container origins BEFORE listener-port exceptions. Otherwise a
+        # container can reach arbitrary bridge destinations on 8080/8443.
+        iifname "docker0" counter log prefix "CONTAINER-EGRESS-BLOCK: " drop
+        iifname "br-*" counter log prefix "CONTAINER-EGRESS-BLOCK: " drop
+
+        # External → published proxy ports. Docker still validates DNAT rules.
         oifname "docker0" tcp dport { 8080, 8443 } accept
         oifname "br-*" tcp dport { 8080, 8443 } accept
 
-        # Drop NEW container-originated forwarding (both proxy and bait)
-        # Containers need no outbound Internet
-        iifname "docker0" ct state new counter log prefix "CONTAINER-EGRESS-BLOCK: " drop
-        iifname "br-*" ct state new counter log prefix "CONTAINER-EGRESS-BLOCK: " drop
-
         # Everything else passes to Docker's rules
+    }
+
+    # Unix sockets carry evidence and OTLP. Containers need no host TCP/UDP
+    # listeners, including SSH and sensor health endpoints on bridge gateways.
+    chain input_early {
+        type filter hook input priority -150; policy accept;
+        ct state established,related accept
+        # Link-scoped neighbor discovery is required for permitted IPv6 flows.
+        ip6 hoplimit 255 icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert } accept
+        iifname "docker0" counter log prefix "CONTAINER-EGRESS-BLOCK: " drop
+        iifname "br-*" counter log prefix "CONTAINER-EGRESS-BLOCK: " drop
     }
 
     # Host egress policy - default drop
@@ -104,6 +122,10 @@ table inet attackbox {
         skuid @shipper_uids ip6 daddr @nr_log_ipv6 tcp dport 443 accept
         skuid @shipper_uids ip daddr @nr_metric_ipv4 tcp dport 443 accept
         skuid @shipper_uids ip6 daddr @nr_metric_ipv6 tcp dport 443 accept
+
+        # Private tracing and host metrics leave through the collector only.
+        skuid @collector_uids ip daddr @nr_otlp_ipv4 tcp dport 443 accept
+        skuid @collector_uids ip6 daddr @nr_otlp_ipv6 tcp dport 443 accept
 
         # Native Infrastructure telemetry. No administrative API access at runtime.
         skuid 0 ip daddr @nr_infra_ipv4 tcp dport 443 accept

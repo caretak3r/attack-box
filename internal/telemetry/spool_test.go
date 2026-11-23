@@ -200,6 +200,55 @@ func TestSpoolAdmissionBounds(t *testing.T) {
 	}
 }
 
+// The hand-built wire line carries v, and the size that put checks against
+// MaxRecord and the byte budget is the real line length.
+func TestSpoolLineCarriesVersion(t *testing.T) {
+	at := time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)
+	now := func() time.Time { return at }
+	event := func(n int) Event { return Event{Stream: StreamEdge, Body: strings.Repeat("x", n)} }
+
+	probe := newIdleSpool(SpoolConfig{QueueSize: 4, QueueBytes: 1 << 20, MaxRecord: 1 << 20, Now: now})
+	probe.Emit(event(100))
+	probe.Count("attackbox.requests", 1, nil)
+	evLine, metLine := <-probe.queue, <-probe.queue
+	for _, line := range [][]byte{evLine, metLine} {
+		var r Record
+		if err := json.Unmarshal(line, &r); err != nil || r.V != 1 {
+			t.Fatalf("line %q: v = %d, err %v", line, r.V, err)
+		}
+		if !strings.HasPrefix(string(line), `{"id":"0123456789abcdef-`) || !strings.Contains(string(line), `","v":1,"`) {
+			t.Errorf("v is not written after the id: %q", line)
+		}
+	}
+
+	// A line of exactly MaxRecord bytes is written; one byte more is oversize.
+	s := newIdleSpool(SpoolConfig{QueueSize: 4, QueueBytes: 1 << 20, MaxRecord: len(evLine), Now: now})
+	s.Emit(event(100)) // seq 1, same line as the probe
+	s.Emit(event(101)) // seq 2, one byte longer
+	if st := s.Stats(); st.Dropped != 1 || st.Oversize != 1 || len(s.queue) != 1 {
+		t.Fatalf("stats = %+v, queued %d; want the exact-size line kept and the longer one dropped as oversize", st, len(s.queue))
+	}
+	var total int64
+	for len(s.queue) > 0 {
+		line := <-s.queue
+		if len(line) != len(evLine) {
+			t.Errorf("queued line is %d bytes, want %d", len(line), len(evLine))
+		}
+		total += int64(len(line))
+	}
+	if s.bytes.Load() != total || total != int64(len(evLine)) {
+		t.Errorf("byte counter %d, sum of real line lengths %d, want %d", s.bytes.Load(), total, len(evLine))
+	}
+
+	// The byte budget counts the real length too: room for one line less one
+	// byte refuses it.
+	tight := newIdleSpool(SpoolConfig{QueueSize: 4, QueueBytes: len(evLine) - 1, MaxRecord: 1 << 20, Now: now})
+	tight.Emit(event(100))
+	if st := tight.Stats(); st.Dropped != 1 || st.Oversize != 0 || len(tight.queue) != 0 {
+		t.Errorf("stats = %+v; a line over the byte budget by one byte must be dropped", st)
+	}
+}
+
 // scriptConn is a net.Conn whose writes fail, or record into a buffer.
 type scriptConn struct {
 	net.Conn
