@@ -119,6 +119,23 @@ test_verification_curl_nr() { grep -q "sudo.*curl.*log_url\|metric_url" "$DEPLOY
 test_verification_before_ssh() { local ver_line=$(grep -n "run_verification_enhanced" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:run_verification_enhanced()" | tail -1 | cut -d: -f1); local ssh_line=$(grep -n "disable_ssh" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:disable_ssh()" | head -1 | cut -d: -f1); [[ -n "$ver_line" && -n "$ssh_line" && "$ver_line" -lt "$ssh_line" ]]; }
 test_no_host_attackbox_binary() { ! grep -q '"/usr/local/bin/attackbox"' "$DEPLOY_SCRIPT"; }
 test_busybox_prepull() { grep -q "docker pull busybox@sha256:" "$DEPLOY_SCRIPT"; }
+test_upgrade_bootstrap() (
+    local tmp MODE=apply
+    tmp=$(mktemp -d)
+    log() { :; }; ok() { :; }
+    nft() {
+        if [[ "$*" == 'list table inet attackbox' ]]; then return 0; fi
+        if [[ "$*" == '-f -' ]]; then cat > "$tmp/rules"; else printf '%s\n' "$*" >> "$tmp/calls"; fi
+    }
+    awk '/^bootstrap_firewall\(\) \{/ {copy=1} /^# Add resolved/ {exit} copy {print}' "$DEPLOY_SCRIPT" > "$tmp/function"
+    source "$tmp/function"
+    (bootstrap_firewall)
+    grep -q '0 timeout 20m' "$tmp/rules" &&
+        grep -q 'meta skuid @bootstrap_root_uids tcp dport { 80, 443 } accept' "$tmp/rules" &&
+        ! grep -q 'attackbox_bootstrap\|flush table\|delete table' "$tmp/rules" || return 1
+    grep -q 'flush set inet attackbox bootstrap_root_uids' "$tmp/calls" || return 1
+    rm -rf "$tmp"
+)
 test_bootstrap_before_docker() { local boot_line=$(grep -n "bootstrap_firewall" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:bootstrap_firewall()" | head -1 | cut -d: -f1); local dock_line=$(grep -n "start_docker" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:start_docker()" | head -1 | cut -d: -f1); [[ -n "$boot_line" && -n "$dock_line" && "$boot_line" -lt "$dock_line" ]]; }
 test_docker_before_prepare() { local dock_line=$(grep -n "start_docker" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:start_docker()" | head -1 | cut -d: -f1); local prep_line=$(grep -n "prepare_bait" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:prepare_bait()" | head -1 | cut -d: -f1); [[ -n "$dock_line" && -n "$prep_line" && "$dock_line" -lt "$prep_line" ]]; }
 test_prepare_before_final_firewall() { local prep_line=$(grep -n "^[[:space:]]*prepare_bait$" "$DEPLOY_SCRIPT" | head -1 | cut -d: -f1); local fw_line=$(grep -n "^[[:space:]]*setup_firewall$" "$DEPLOY_SCRIPT" | head -1 | cut -d: -f1); [[ -n "$prep_line" && -n "$fw_line" && "$prep_line" -lt "$fw_line" ]]; }
@@ -182,6 +199,7 @@ main() {
     run_test "Verification before SSH" test_verification_before_ssh
     run_test "No host attackbox binary" test_no_host_attackbox_binary
     run_test "Busybox prepull" test_busybox_prepull
+    run_test "Existing host bootstrap and cleanup" test_upgrade_bootstrap
     run_test "Bootstrap before Docker" test_bootstrap_before_docker
     run_test "Docker before prepare" test_docker_before_prepare
     run_test "Prepare before final firewall" test_prepare_before_final_firewall

@@ -610,7 +610,22 @@ bootstrap_firewall() {
         return 0
     fi
 
-    # Create minimal bootstrap table
+    # A second base chain cannot override an existing policy's drop. Keep the
+    # running host's containment and telemetry rules during upgrades. Permit
+    # root registry access for at most 20 minutes; clear it on normal/error exit.
+    if nft list table inet attackbox >/dev/null 2>&1; then
+        trap 'nft flush set inet attackbox bootstrap_root_uids 2>/dev/null || true' EXIT
+        nft -f - <<'UPGRADE'
+add set inet attackbox bootstrap_root_uids { type uid; flags timeout; timeout 20m; }
+flush set inet attackbox bootstrap_root_uids
+add element inet attackbox bootstrap_root_uids { 0 timeout 20m }
+insert rule inet attackbox output_policy meta skuid @bootstrap_root_uids tcp dport { 80, 443 } accept
+UPGRADE
+        ok "Existing containment retained; root registry access expires in 20 minutes"
+        return 0
+    fi
+
+    # Create minimal bootstrap table on a new host only.
     nft -f - <<'EOF'
 add table inet attackbox_bootstrap
 flush table inet attackbox_bootstrap
