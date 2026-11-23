@@ -7,8 +7,14 @@ fail() { printf 'local-ci: %s\n' "$*" >&2; exit 1; }
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 mode=${1:-}
 case "$mode" in
-    check|release-check|deploy) ;;
-    *) fail 'expected check, release-check, or deploy' ;;
+    deploy)
+        if ! git cat-file -e HEAD:scripts/vultr-launch.sh 2>/dev/null || ! git diff --quiet HEAD -- scripts/vultr-launch.sh; then
+            fail 'Vultr launcher is not committed and unchanged in this checkout'
+        fi
+        exec bash scripts/vultr-launch.sh bootstrap
+        ;;
+    check|release-check|authorize-deploy) ;;
+    *) fail 'expected check, release-check, deploy, or authorize-deploy' ;;
 esac
 
 commit=$(git rev-parse --verify --end-of-options "${COMMIT:-HEAD}^{commit}")
@@ -22,7 +28,7 @@ if [[ $mode != check ]]; then
     receipt="$state/$commit-${platform#linux/}.verified"
 fi
 
-if [[ $mode == deploy ]]; then
+if [[ $mode == authorize-deploy ]]; then
     [[ ${APPROVE:-} == "$commit" ]] || fail "set APPROVE=$commit to approve this deployment"
     [[ $(git rev-parse HEAD) == "$commit" ]] || fail 'release commit differs from checkout HEAD'
     status=$(git status --porcelain --untracked-files=no)
@@ -31,9 +37,9 @@ if [[ $mode == deploy ]]; then
     verified=$(<"$receipt")
     prefix="$commit $platform "
     [[ $verified == "$prefix"* && ${verified#"$prefix"} =~ ^sha256:[0-9a-f]{64}$ ]] || fail 'invalid release record'
-    launcher=scripts/vultr-launch.sh
-    git cat-file -e "$commit:$launcher" 2>/dev/null || fail 'Vultr launcher is not committed in this checkout'
-    exec bash "$launcher" bootstrap
+    git cat-file -e "$commit:scripts/vultr-launch.sh" 2>/dev/null || fail 'Vultr launcher is not committed in this checkout'
+    printf '%s\n' "$commit"
+    exit 0
 fi
 
 mkdir -p -- "$state"
@@ -52,8 +58,10 @@ printf 'Checking commit %s\n' "$commit"
 )
 [[ $mode == release-check ]] || exit 0
 
+(cd -- "$run/source" && GOWORK=off GOFLAGS= GOTOOLCHAIN=local go mod vendor)
 image="attackbox-release-check:$commit-${platform#linux/}"
-docker buildx build --platform "$platform" --target bait --load --tag "$image" "$run/source"
+docker buildx build --platform "$platform" --network=none --build-arg OFFLINE_GO_BUILD=1 \
+    --target bait --load --tag "$image" "$run/source"
 metadata=$(docker image inspect --format '{{.Os}}/{{.Architecture}} {{.Config.User}} {{json .Config.Entrypoint}} {{.Id}}' "$image")
 expected="$platform 65532:65532 [\"/attackbox\"] "
 image_id=${metadata#"$expected"}

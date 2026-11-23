@@ -34,7 +34,7 @@ while [[ $# -gt 0 ]]; do
 			  - Client matrix: OpenAI/Ollama compatibility
 			  - Shipper: six-stream and full-metric integration
 			  - Containers: Dockerfile build, compose config
-			  - Deployment: Ubuntu scripts validation
+			  - Deployment: Ubuntu, Vultr launcher and native bootstrap tests (requires Bats)
 			  - Docs: operator guide, env consistency
 
 			Exit 0 only when all checks pass. Prerequisites fail immediately.
@@ -205,14 +205,23 @@ if require_or_skip "container files" "[[ -f Dockerfile && -n $compose_file ]]" "
 	trap 'docker rmi attackbox-verify-test >/dev/null 2>&1 || true' EXIT
 	check "Dockerfile build" docker build -t attackbox-verify-test .
 	check "docker compose config" docker compose -f "$compose_file" config >/dev/null
+	check "gVisor compose config" docker compose -f "$compose_file" -f compose.gvisor.yaml config >/dev/null
 fi
 
 echo
 info "Deployment validation"
+if require_or_skip "native bootstrap tests" "command -v bats >/dev/null && [[ -f scripts/test-bootstrap-infrastructure.bats ]]" "install Bats and include the native bootstrap tests"; then
+	check "native bootstrap tests" bats scripts/test-bootstrap-infrastructure.bats
+	check "native agent configuration tests" python3 -B -m unittest discover -s deploy/newrelic -p 'test_*.py'
+fi
 if require_or_skip "deployment scripts" "[[ -f scripts/deploy-ubuntu.sh && -f scripts/test-deploy-ubuntu.sh ]]" "scripts/deploy-ubuntu.sh or test-deploy-ubuntu.sh not implemented"; then
 	check "deploy-ubuntu.sh syntax" bash -n scripts/deploy-ubuntu.sh
 	check "test-deploy-ubuntu.sh syntax" bash -n scripts/test-deploy-ubuntu.sh
 	check "test-deploy-ubuntu.sh execution" scripts/test-deploy-ubuntu.sh
+fi
+if require_or_skip "vultr launch scripts" "[[ -f scripts/vultr-launch.sh && -f scripts/test-vultr-launch.sh ]]" "scripts/vultr-launch.sh or test-vultr-launch.sh not implemented"; then
+	check "vultr-launch.sh syntax" bash -n scripts/vultr-launch.sh
+	check "test-vultr-launch.sh execution" scripts/test-vultr-launch.sh
 fi
 
 echo
