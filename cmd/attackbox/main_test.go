@@ -491,28 +491,91 @@ func TestLocalOnlyAndPortConflict(t *testing.T) {
 	}
 }
 
-// TestShutdownCutsHolds checks that a held stream does not block shutdown past
-// the grace period.
+type heldReadListener struct {
+	net.Listener
+	cut     func()
+	release <-chan struct{}
+}
+
+func (l heldReadListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return heldReadConn{conn, l.cut, l.release}, nil
+}
+
+type heldReadConn struct {
+	net.Conn
+	cut     func()
+	release <-chan struct{}
+}
+
+func (c heldReadConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if err != nil {
+		c.cut()
+		<-c.release
+	}
+	return n, err
+}
+
 func TestShutdownCutsHolds(t *testing.T) {
-	a, _, cancel, done := startApp(t, map[string]string{
+	cfg, err := loadConfig(envOf(map[string]string{
 		"ATTACKBOX_NR_DISABLED":      "true",
 		"ATTACKBOX_OPENAI_ADDR":      "127.0.0.1:0",
-		"ATTACKBOX_SHUTDOWN_TIMEOUT": "200ms",
-	})
-	// Never send the body: the connection is active, so Shutdown must give up.
+		"ATTACKBOX_SHUTDOWN_TIMEOUT": "500ms",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &syncBuf{}
+	a, err := newApp(cfg, logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cut, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	defer unblock()
+	a.listeners[0] = heldReadListener{a.listeners[0], sync.OnceFunc(func() { close(cut) }), release}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- a.run(ctx) }()
+	// A 100 response proves that the real handler is waiting for the body.
 	conn, err := net.Dial("tcp", a.addrs()["openai"])
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	_, _ = conn.Write([]byte("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{"))
-	time.Sleep(50 * time.Millisecond)
-	start := time.Now()
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := bufio.NewReader(conn).ReadString('\n'); line != "HTTP/1.1 100 Continue\r\n" || err != nil {
+		t.Fatalf("want 100 Continue, got %q (%v)", line, err)
+	}
+	cancel()
+	select {
+	case <-cut:
+	case <-time.After(3 * time.Second):
+		t.Fatal("shutdown did not cancel the handler")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("shutdown returned before the handler finished: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	unblock()
 	if err := stop(t, cancel, done); err != nil {
 		t.Fatal(err)
 	}
-	if d := time.Since(start); d > 3*time.Second {
-		t.Fatalf("shutdown took %v", d)
+	out := logs.String()
+	request, stopped := strings.Index(out, `"direction":"request"`), strings.Index(out, `"action":"stopped"`)
+	if request < 0 || stopped <= request {
+		t.Fatalf("expected the interrupted request log before stopped:\n%s", out)
 	}
 }
 

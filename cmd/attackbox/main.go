@@ -133,6 +133,9 @@ type app struct {
 	servers   []*http.Server
 	listeners []net.Listener
 	personas  []string
+	handlerMu sync.Mutex
+	handlers  sync.WaitGroup
+	closing   bool
 }
 
 // newApp binds every listener before it returns, so a port conflict fails
@@ -210,7 +213,7 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 				a.listeners = append(a.listeners, ln)
 				a.personas = append(a.personas, l.persona)
 				a.servers = append(a.servers, &http.Server{
-					Handler:           s.Handler(),
+					Handler:           a.trackHandler(s.Handler()),
 					ReadHeaderTimeout: cfg.readHeaderTimeout,
 					ReadTimeout:       cfg.readTimeout,
 					// Holds and streams last up to maxStream; allow headroom.
@@ -264,6 +267,23 @@ func (a *app) addrs() map[string]string {
 	return m
 }
 
+// Close can return before active handlers finish their final evidence. Gate
+// new handlers and join existing ones before closing any telemetry sink.
+func (a *app) trackHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		a.handlerMu.Lock()
+		if a.closing {
+			a.handlerMu.Unlock()
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		a.handlers.Add(1)
+		a.handlerMu.Unlock()
+		defer a.handlers.Done()
+		next.ServeHTTP(w, r)
+	})
+}
+
 // run serves until ctx ends or a listener fails, then shuts down: listeners
 // stop, in-flight requests get shutdownTimeout, and New Relic is flushed.
 // It returns an error if a listener failed or New Relic lost events.
@@ -296,6 +316,9 @@ func (a *app) run(ctx context.Context) error {
 		reason = "listener_error"
 	}
 	a.runtime("stop", "ok", map[string]any{"reason": reason, "grace_ms": a.cfg.shutdownTimeout.Milliseconds()})
+	a.handlerMu.Lock()
+	a.closing = true
+	a.handlerMu.Unlock()
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), a.cfg.shutdownTimeout)
 	defer cancel()
@@ -311,6 +334,13 @@ func (a *app) run(ctx context.Context) error {
 		}(srv)
 	}
 	wg.Wait()
+	finished := make(chan struct{})
+	go func() { a.handlers.Wait(); close(finished) }()
+	select {
+	case <-finished:
+	case <-time.After(max(time.Second, a.cfg.shutdownTimeout)):
+		serveErr = errors.Join(serveErr, errors.New("handlers did not finish evidence before shutdown deadline"))
+	}
 
 	attrs := map[string]any{}
 	var nrErr error
