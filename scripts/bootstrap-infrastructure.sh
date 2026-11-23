@@ -80,7 +80,8 @@ install_edge_route() {
   [[ ! -L $target ]] || fail 'edge logging configuration must not be a symlink'
   install -d -m 0755 /etc/newrelic-infra/logging.d
   staged=$(mktemp /etc/newrelic-infra/logging.d/.attackbox-edge.XXXXXX)
-  install -m 0600 "$ROOT/deploy/newrelic/edge-logging.yml" "$staged"
+  python3 "$ROOT/deploy/newrelic/configure-agent.py" --logs "$ROOT/deploy/newrelic/edge-logging.yml" > "$staged"
+  chmod 0600 "$staged"
   mv -f -- "$staged" "$target"
 }
 if verify_agent; then
@@ -146,7 +147,8 @@ for config in discovered.yml logging.yml; do
     chmod 0600 "/etc/newrelic-infra/bootstrap-backup/$config"
   fi
 done
-install -m 0600 "$ROOT/deploy/newrelic/host-logging.yml" /etc/newrelic-infra/logging.d/attackbox-host.yml
+python3 "$ROOT/deploy/newrelic/configure-agent.py" --logs "$ROOT/deploy/newrelic/host-logging.yml" > /etc/newrelic-infra/logging.d/attackbox-host.yml
+chmod 0600 /etc/newrelic-infra/logging.d/attackbox-host.yml
 install_edge_route
 systemctl enable newrelic-infra.service
 systemctl restart newrelic-infra.service

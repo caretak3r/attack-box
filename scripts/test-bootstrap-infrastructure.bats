@@ -22,7 +22,7 @@ p.write_text(s)
 PY
   printf '#!/bin/sh\nprintf "refresh %%s\\n" "$*" >>"$FIXTURE/calls"\n' >"$FIXTURE/usr/local/sbin/attackbox-deploy"
   printf '#!/bin/sh\nexit 0\n' >"$FIXTURE/usr/bin/newrelic-infra"
-  printf 'import os\np=os.environ["FIXTURE"]+"/etc/newrelic-infra.yml"\nif os.path.isfile(p): os.chmod(p, 0o600)\n' >"$FIXTURE/deploy/newrelic/configure-agent.py"
+  printf 'import os,sys,pathlib\nif len(sys.argv)==3 and sys.argv[1]=="--logs": print(pathlib.Path(sys.argv[2]).read_text(),end=""); sys.exit(0)\np=os.environ["FIXTURE"]+"/etc/newrelic-infra.yml"\nif os.path.isfile(p): os.chmod(p, 0o600)\n' >"$FIXTURE/deploy/newrelic/configure-agent.py"
   printf 'import os\nassert os.path.exists(os.environ["FIXTURE"] + "/etc/newrelic-infra.yml")\n' >"$FIXTURE/deploy/newrelic/verify-config.py"
   cat >"$FIXTURE/bin/curl" <<'SH'
 #!/bin/bash

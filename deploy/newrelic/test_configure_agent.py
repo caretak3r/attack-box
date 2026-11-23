@@ -8,6 +8,15 @@ spec.loader.exec_module(module)
 
 
 class IdentityTests(unittest.TestCase):
+    def test_native_log_templates_receive_partition_identity(self):
+        for name, count in [('host-logging.yml', 6), ('edge-logging.yml', 1)]:
+            template = pathlib.Path(__file__).with_name(name).read_text()
+            rendered = module.add_log_identity(template, 'sensor-1', 'release-1')
+            self.assertEqual(rendered.count('sensor_id: "sensor-1"'), count)
+            self.assertEqual(rendered.count('deployment_id: "release-1"'), count)
+            with self.assertRaises(ValueError):
+                module.add_log_identity(rendered, 'other', 'other')
+
     def test_adds_identity_without_replacing_cli_attributes(self):
         result = module.add_identity('license_key: a\ncustom_attributes:\n  nr_deployed_by: cli\n', 'sensor-1', 'campaign-1', 'host-1')
         self.assertIn('  nr_deployed_by: cli\n', result)

@@ -42,29 +42,49 @@ def add_identity(text, sensor, deployment, hostname):
     return ''.join(lines)
 
 
+def load_identity():
+    values = {}
+    for shipper in (pathlib.Path("/etc/attackbox/shipper.env"), pathlib.Path("/etc/attackbox/shipper-monitoring.env")):
+        if shipper.name == 'shipper-monitoring.env' and not shipper.exists() and not shipper.is_symlink():
+            continue
+        seen = set()
+        st = shipper.lstat()
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o600 or st.st_size > 65536:
+            raise ValueError('shipper.env must be root-owned mode0600 regular file <=64KiB')
+        for line in shipper.read_text().splitlines():
+            name, sep, value = line.partition('=')
+            if name in ('ATTACKBOX_SENSOR_ID', 'ATTACKBOX_DEPLOYMENT_ID', 'ATTACKBOX_HOSTNAME'):
+                if not sep or name in seen:
+                    raise ValueError('invalid or duplicate shipper identity')
+                seen.add(name)
+                values[name] = value
+    hostname = socket.gethostname()
+    sensor = values.get('ATTACKBOX_SENSOR_ID', values.get('ATTACKBOX_HOSTNAME', hostname).lower())
+    deployment = values.get('ATTACKBOX_DEPLOYMENT_ID', 'unset')
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_.-]{0,62}', sensor) or not re.fullmatch(r'[a-z0-9][a-z0-9_.-]{0,62}', deployment):
+        raise ValueError('shipper identity does not match the approved grammar')
+    return sensor, deployment, hostname
+
+
+def add_log_identity(text, sensor, deployment):
+    marker = "    attributes:\n"
+    if marker not in text or re.search(r"^\s+(sensor_id|deployment_id):", text, re.M):
+        raise ValueError("log template must have unassigned block attributes")
+    return text.replace(marker, marker + f"      sensor_id: {json.dumps(sensor)}\n      deployment_id: {json.dumps(deployment)}\n")
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--logs":
+        sensor, deployment, _ = load_identity()
+        print(add_log_identity(pathlib.Path(sys.argv[2]).read_text(), sensor, deployment), end="")
+        return
     path = pathlib.Path('/etc/newrelic-infra.yml')
     secure_config(path)
     if sys.argv[1:] == ['--secure-only']:
         return
     if sys.argv[1:] != ['--fresh']:
         raise ValueError('usage: configure-agent.py --secure-only|--fresh')
-    shipper = pathlib.Path('/etc/attackbox/shipper.env')
-    st = shipper.lstat()
-    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o600 or st.st_size > 65536:
-        raise ValueError('shipper.env must be root-owned mode0600 regular file <=64KiB')
-    values = {}
-    for line in shipper.read_text().splitlines():
-        name, sep, value = line.partition('=')
-        if name in ('ATTACKBOX_SENSOR_ID', 'ATTACKBOX_DEPLOYMENT_ID', 'ATTACKBOX_HOSTNAME'):
-            if not sep or name in values:
-                raise ValueError('invalid or duplicate shipper identity')
-            values[name] = value
-    hostname = socket.gethostname()
-    sensor = values.get('ATTACKBOX_SENSOR_ID', values.get('ATTACKBOX_HOSTNAME', hostname).lower())
-    deployment = values.get('ATTACKBOX_DEPLOYMENT_ID', 'unset')
-    if not re.fullmatch(r'[a-z0-9][a-z0-9_.-]{0,62}', sensor) or not re.fullmatch(r'[a-z0-9][a-z0-9_.-]{0,62}', deployment):
-        raise ValueError('shipper identity does not match the approved grammar')
+    sensor, deployment, hostname = load_identity()
     output = add_identity(path.read_text(), sensor, deployment, hostname)
     fd, tmp = tempfile.mkstemp(prefix='.newrelic-infra-', dir=path.parent)
     try:
