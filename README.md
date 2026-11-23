@@ -43,6 +43,22 @@ curl --fail --silent --show-error http://127.0.0.1:18080/health
 
 The API returns a JSON object with `"status":"ok"`. Press Ctrl+C in the first terminal to stop the bait. Use synthetic requests only.
 
+## Local release checks
+
+Install Docker with Compose and Buildx, ShellCheck, Python 3, and Make. The full gate also uses Go and `curl`.
+
+Run `make check` to verify the commit at `HEAD`. Set `COMMIT` to select a different commit. The gate uses a Git archive and does not include uncommitted files.
+
+For an x86-64 VPS, run `make release-check PLATFORM=linux/amd64`. For an Arm VPS, use `PLATFORM=linux/arm64`. This target runs the full gate and verifies the bait image platform, non-root user, and entry point. It writes the commit, platform, and Docker image ID to a record in the checkout's Git directory.
+
+Deployment is a separate action. After authorization, set `commit` to the full commit ID from the release record and select the VPS platform:
+
+```bash
+make deploy PLATFORM=linux/amd64 COMMIT="$commit" APPROVE="$commit"
+```
+
+Deployment requires the same checkout, a matching record, and a committed Vultr launcher. The host rebuilds from the verified source. The local image ID is not a registry digest or proof that the rebuild is identical.
+
 ## Documentation site
 
 The static site uses Nextra, Next.js, React, MDX, Mermaid, KaTeX, and Pagefind. Install Node.js 22 or later and pnpm 10. From the repository root, run:
