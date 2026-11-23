@@ -34,6 +34,7 @@ type scenario struct {
 	name, method, path, body, accept string
 	status                           int
 	fakeAuth                         bool
+	proxyReject                      bool
 }
 type result struct {
 	RunID            string    `json:"run_id"`
@@ -167,6 +168,13 @@ func execute(ctx context.Context, c *http.Client, base, run string, s scenario) 
 	if r.Status != s.status {
 		return finish(fmt.Errorf("status %d; expected %d", r.Status, s.status))
 	}
+	if s.proxyReject {
+		if r.ResponseID != "" || !strings.HasPrefix(r.ContentType, "text/html") || !bytes.Contains(b, []byte("nginx")) {
+			return finish(errors.New("expected nginx rejection before the application"))
+		}
+		r.ResponseVerified = true
+		return finish(nil)
+	}
 	if r.LogRequestID == "" {
 		return finish(errors.New("missing OpenAI server request ID"))
 	}
@@ -223,6 +231,7 @@ func run(args []string, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	target := fs.String("target", "https://127.0.0.1:8443", "loopback IP origin only")
 	model := fs.String("model", "qwen3:8b", "model advertised by the target (1-128 printable ASCII bytes)")
+	proxy := fs.Bool("proxy", false, "expect nginx to reject traversal and oversized requests before Go")
 	output := fs.String("output", "", "new JSONL manifest file (required)")
 	id := fs.String("run-id", "", "reproducible research label; default random")
 	selfSigned := fs.Bool("self-signed", false, "permit a self-signed certificate for this loopback HTTPS client only")
@@ -264,6 +273,12 @@ func run(args []string, stderr io.Writer) int {
 	defer cancel()
 	failed := 0
 	for _, s := range casesForModel(*model) {
+		if *proxy && (s.name == "traversal-path" || s.name == "oversized") {
+			s.proxyReject = true
+			if s.name == "traversal-path" {
+				s.status = http.StatusBadRequest
+			}
+		}
 		r := execute(ctx, client, base, *id, s)
 		if !r.ResponseVerified {
 			failed++

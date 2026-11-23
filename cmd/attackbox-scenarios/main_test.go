@@ -256,3 +256,24 @@ func TestSSERejectsPartialOrMalformedFrames(t *testing.T) {
 		t.Fatal("valid JSON frame rejected")
 	}
 }
+
+func TestProxyRejectionRequiresEdgeEnvelope(t *testing.T) {
+	for _, backendID := range []string{"", "req_0123456789abcdef0123456789abcdef"} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html")
+			w.Header().Set("X-Request-Id", backendID)
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = io.WriteString(w, "<html><body>413 nginx</body></html>")
+		}))
+		client, base, err := localClient(srv.URL, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := execute(context.Background(), client, base, "edge", scenario{name: "oversized", method: "POST", path: "/v1/chat/completions", status: 413, proxyReject: true})
+		client.CloseIdleConnections()
+		srv.Close()
+		if r.ResponseVerified != (backendID == "") || r.LoggingVerified {
+			t.Fatalf("edge rejection misclassified: %+v", r)
+		}
+	}
+}
