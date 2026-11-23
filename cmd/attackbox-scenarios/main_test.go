@@ -64,7 +64,7 @@ func rebuild(t *testing.T, events []telemetry.Event, id, kind string) ([]byte, t
 
 func TestScenariosRealServerEvidence(t *testing.T) {
 	sink := &capture{}
-	app, err := server.New(server.Config{Responder: responder.New(responder.Config{}, responder.NewStore(responder.StoreConfig{})), Sink: sink, FullEvidence: true, HoldSilent: time.Millisecond, IdleInterval: time.Millisecond, MaxStreamDuration: time.Second})
+	app, err := server.New(server.Config{Models: []string{"gpt-4o"}, Responder: responder.New(responder.Config{}, responder.NewStore(responder.StoreConfig{})), Sink: sink, FullEvidence: true, HoldSilent: time.Millisecond, IdleInterval: time.Millisecond, MaxStreamDuration: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestScenariosRealServerEvidence(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { app.Handler().ServeHTTP(w, r); done <- struct{}{} }))
 	defer srv.Close()
 	manifest := filepath.Join(t.TempDir(), "manifest.jsonl")
-	if code := run([]string{"-target", srv.URL, "-output", manifest, "-run-id", "local-evidence-check"}, os.Stderr); code != 0 {
+	if code := run([]string{"-target", srv.URL, "-model", "gpt-4o", "-output", manifest, "-run-id", "local-evidence-check"}, os.Stderr); code != 0 {
 		t.Fatalf("scenario CLI exit %d", code)
 	}
 	f, err := os.Open(manifest)
@@ -82,7 +82,7 @@ func TestScenariosRealServerEvidence(t *testing.T) {
 	defer f.Close()
 	decoder := json.NewDecoder(f)
 	var results []result
-	for _, s := range cases() {
+	for _, s := range casesForModel("gpt-4o") {
 		var r result
 		if err := decoder.Decode(&r); err != nil {
 			t.Fatal(err)

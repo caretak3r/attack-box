@@ -60,8 +60,12 @@ type result struct {
 
 func digest(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 func cases() []scenario {
+	return casesForModel("qwen3:8b")
+}
+
+func casesForModel(model string) []scenario {
 	chat := func(text string, stream bool) string {
-		b, _ := json.Marshal(map[string]any{"model": "qwen3:8b", "stream": stream, "messages": []map[string]string{{"role": "user", "content": text}}})
+		b, _ := json.Marshal(map[string]any{"model": model, "stream": stream, "messages": []map[string]string{{"role": "user", "content": text}}})
 		return string(b)
 	}
 	return []scenario{
@@ -218,6 +222,7 @@ func run(args []string, stderr io.Writer) int {
 	fs := flag.NewFlagSet("attackbox-scenarios", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	target := fs.String("target", "https://127.0.0.1:8443", "loopback IP origin only")
+	model := fs.String("model", "qwen3:8b", "model advertised by the target (1-128 printable ASCII bytes)")
 	output := fs.String("output", "", "new JSONL manifest file (required)")
 	id := fs.String("run-id", "", "reproducible research label; default random")
 	selfSigned := fs.Bool("self-signed", false, "permit a self-signed certificate for this loopback HTTPS client only")
@@ -226,6 +231,10 @@ func run(args []string, stderr io.Writer) int {
 	}
 	if fs.NArg() != 0 || *output == "" {
 		fmt.Fprintln(stderr, "required: -output NEW_FILE")
+		return 2
+	}
+	if len(*model) == 0 || len(*model) > 128 || strings.IndexFunc(*model, func(r rune) bool { return r < 33 || r > 126 }) >= 0 {
+		fmt.Fprintln(stderr, "model must contain 1-128 printable ASCII bytes without spaces")
 		return 2
 	}
 	if *id == "" {
@@ -254,7 +263,7 @@ func run(args []string, stderr io.Writer) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	failed := 0
-	for _, s := range cases() {
+	for _, s := range casesForModel(*model) {
 		r := execute(ctx, client, base, *id, s)
 		if !r.ResponseVerified {
 			failed++
