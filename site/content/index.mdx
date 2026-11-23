@@ -1,0 +1,22 @@
+---
+title: Overview
+---
+
+# AttackBox overview
+
+AttackBox is a defensive honeypot for AI service interfaces. It records how clients interact with a simulated service so defenders can study those interactions.
+
+AttackBox implements OpenAI, vLLM, and Ollama API personas. The responses are synthetic. AttackBox does not run models, execute client instructions, or contact destinations from request payloads.
+
+## Functions
+
+| Function | What AttackBox does |
+|---|---|
+| Simulate | Return protocol-shaped responses without a model backend. |
+| Observe | Record bounded, redacted observations of service activity. |
+| Transport | Pass observations to a host shipper for local queueing and delivery to New Relic. |
+
+The supplied Ubuntu deployment uses an nginx proxy on host loopback and enables only the OpenAI persona. Local development does not need Docker, a VPS, or a New Relic key.
+
+- [Architecture](/architecture/) explains the data flow and what the records can prove.
+- [Local setup](/local-setup/) starts a loopback instance with remote telemetry disabled.

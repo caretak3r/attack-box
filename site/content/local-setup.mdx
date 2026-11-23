@@ -1,0 +1,33 @@
+---
+title: Local setup
+---
+
+# Local setup
+
+Use Go 1.25 or later and `curl`. Run the commands from the repository root. This exercise does not need Docker or an ingest key.
+
+1. Run the Go tests.
+
+   ```bash filename="Terminal"
+   go test ./...
+   ```
+
+2. Start the bait with a clean environment. This binds the OpenAI persona to loopback and disables remote telemetry.
+
+   ```bash filename="Terminal 1" {2-3}
+   env -i PATH="$PATH" HOME="$HOME" \
+     ATTACKBOX_OPENAI_ADDR=127.0.0.1:18080 \
+     ATTACKBOX_NR_DISABLED=true go run ./cmd/attackbox
+   ```
+
+3. After the server starts, run the health request from a second terminal.
+
+   ```bash filename="Terminal 2"
+   curl --fail --silent --show-error http://127.0.0.1:18080/health
+   ```
+
+   The API returns a JSON object with `"status":"ok"`. This result proves local HTTP reachability only.
+
+4. Press Ctrl+C in the first terminal to stop the bait.
+
+Use synthetic requests only. Do not submit real credentials, production data, or personal information.
