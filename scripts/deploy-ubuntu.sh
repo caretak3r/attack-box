@@ -4,6 +4,9 @@
 # Both --disable-ssh --console-confirmed required for SSH/cloud-init changes
 
 set -euo pipefail
+# Do not trace the provisioning key or inherit an environment-based key.
+if [[ $- == *x* ]]; then set +x; fi
+unset NEW_RELIC_API_KEY
 
 # Configuration
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,9 +24,10 @@ readonly NR_LOG_HOST="log-api.newrelic.com"
 readonly NR_METRIC_HOST="metric-api.newrelic.com"
 
 # Flags
-MODE="preflight"
+MODE=""
 DISABLE_SSH=false
 CONSOLE_CONFIRMED=false
+NATIVE_KEY_STDIN=false
 
 # Colors for output
 readonly RED='\033[0;31m'
@@ -44,7 +48,9 @@ Options:
     --dry-run                Explicit preflight (same as default, no mutations)
     --verify                 Real validation: proxy/bait metadata, DNS/NTP, NR endpoints
                              (requires Linux with Docker + gVisor; reports prerequisites)
-    --refresh-sets           Re-resolve NR/Ubuntu endpoints into the nftables sets
+    --refresh-install-sets   Populate expiring official New Relic installation destinations
+    --native-key-stdin       Read the provisioning User API key from stdin (apply only)
+    --refresh-sets           Re-resolve New Relic/Ubuntu runtime endpoints into nftables sets
                              (run by attackbox-nft-refresh.timer; needs the table loaded)
     --disable-ssh            Mark SSH for disablement (needs --console-confirmed)
     --console-confirmed      Confirm console access verified (needs --disable-ssh)
@@ -52,6 +58,8 @@ Options:
 
 SSH disablement requires BOTH --disable-ssh AND --console-confirmed.
 Verification mode requires Linux, Docker, and gVisor runtime.
+Before a manual source transfer, run go mod vendor and stage the pinned CLI
+with scripts/bootstrap-infrastructure.sh --stage bootstrap (create bootstrap first).
 EOF
     exit "${1:-0}"
 }
@@ -75,18 +83,25 @@ ok() {
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --apply) MODE="apply"; shift ;;
-        --dry-run) MODE="preflight"; shift ;;
-        --verify) MODE="verify"; shift ;;
-        --refresh-sets) MODE="refresh"; shift ;;
+        --apply|--dry-run|--verify|--refresh-sets|--refresh-install-sets)
+            [[ -z "$MODE" ]] || { err "Choose only one deployment mode"; exit 1; }
+            MODE="${1#--}"
+            shift
+            ;;
+        --native-key-stdin) NATIVE_KEY_STDIN=true; shift ;;
         --disable-ssh) DISABLE_SSH=true; shift ;;
         --console-confirmed) CONSOLE_CONFIRMED=true; shift ;;
         -h|--help) usage 0 ;;
         *) err "Unknown option: $1"; usage 1 ;;
     esac
 done
+if [[ -z "$MODE" || "$MODE" == dry-run ]]; then MODE=preflight; fi
 
 # Validation
+if [[ "$NATIVE_KEY_STDIN" == true && "$MODE" != apply ]]; then
+    err "--native-key-stdin requires --apply"
+    exit 1
+fi
 if [[ "$DISABLE_SSH" == true && "$CONSOLE_CONFIRMED" != true ]]; then
     err "SSH disablement requires BOTH --disable-ssh AND --console-confirmed"
     exit 1
@@ -532,6 +547,29 @@ resolve_nr_endpoints() {
     echo "$tmpdir"  # Return tmpdir path
 }
 
+use_host_dns_stub() {
+    local resolver="$1" stub="$2" backup="${1}.pre-attackbox"
+    [[ "$(readlink "$resolver" || true)" != "$stub" ]] || return 0
+    if [[ "$MODE" != "apply" ]]; then
+        warn "Would route the host resolver through systemd-resolved"
+        return 0
+    fi
+
+    if [[ ! -s "$stub" || -d "$resolver" ]]; then
+        err "Cannot switch the host resolver to $stub"
+        return 1
+    fi
+    if ! dig @127.0.0.53 +short +time=3 +tries=1 registry-1.docker.io A | grep -E '^[0-9.]+$' >/dev/null; then
+        err "The systemd-resolved stub cannot resolve Docker Hub"
+        return 1
+    fi
+    if [[ ( -e "$resolver" || -L "$resolver" ) && ! -e "$backup" && ! -L "$backup" ]]; then
+        cp -pP -- "$resolver" "$backup" || return
+    fi
+    ln -sfn -- "$stub" "$resolver" || return
+    ok "Host DNS uses the systemd-resolved stub"
+}
+
 # Host DNS/NTP must match what the nftables output policy allows (Cloudflare
 # only). Install before any firewall loads, or host lookups time out.
 setup_host_dns_ntp() {
@@ -566,7 +604,7 @@ setup_host_dns_ntp() {
         fi
     done
 
-    warn "DHCP-provided per-link DNS is overridden by Domains=~. (set use-dns: false in netplan to be explicit)"
+    use_host_dns_stub /etc/resolv.conf /run/systemd/resolve/stub-resolv.conf
 }
 
 # nftables firewall (enforced before Docker starts)
@@ -667,6 +705,53 @@ populate_nr_sets() {
     nft add element inet attackbox shipper_uids { "$ship_uid" }
 }
 
+# Resolve fixed destinations before replacing both address families atomically.
+populate_native_sets() {
+    local phase="$1" prefix host address resolved
+    local hosts=() v4=() v6=()
+    case "$phase" in
+        runtime)
+            prefix=nr_infra
+            hosts=(infra-api.newrelic.com identity-api.newrelic.com infrastructure-command-api.newrelic.com metric-api.newrelic.com log-api.newrelic.com)
+            ;;
+        install)
+            prefix=nr_install
+            hosts=(download.newrelic.com api.newrelic.com insights-collector.newrelic.com urly.service.newrelic.com d20hasrqv82i0q.cloudfront.net github.com api.github.com raw.githubusercontent.com objects.githubusercontent.com release-assets.githubusercontent.com download.docker.com download.falco.org storage.googleapis.com archive.ubuntu.com security.ubuntu.com)
+            ;;
+        *) return 1 ;;
+    esac
+
+    for host in "${hosts[@]}"; do
+        resolved=false
+        while IFS= read -r address; do
+            [[ "$address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+            [[ " ${v4[*]:-} " == *" $address "* ]] || v4+=("$address")
+            resolved=true
+        done < <(dig +short +time=3 +tries=1 "$host" A)
+        while IFS= read -r address; do
+            [[ "$address" =~ ^[a-fA-F0-9:]+$ && "$address" == *:* ]] || continue
+            [[ " ${v6[*]:-} " == *" $address "* ]] || v6+=("$address")
+            resolved=true
+        done < <(dig +short +time=3 +tries=1 "$host" AAAA)
+        [[ "$resolved" == true ]] || { err "Cannot resolve native Infrastructure destination $host"; return 1; }
+    done
+    if [[ ${#v4[@]} -gt 128 || ${#v6[@]} -gt 128 ]]; then
+        err "Too many native Infrastructure destination addresses"
+        return 1
+    fi
+
+    local IFS=,
+    {
+        printf 'flush set inet attackbox %s_ipv4\nflush set inet attackbox %s_ipv6\n' "$prefix" "$prefix"
+        if [[ ${#v4[@]} -gt 0 ]]; then
+            printf 'add element inet attackbox %s_ipv4 { %s }\n' "$prefix" "${v4[*]}"
+        fi
+        if [[ ${#v6[@]} -gt 0 ]]; then
+            printf 'add element inet attackbox %s_ipv6 { %s }\n' "$prefix" "${v6[*]}"
+        fi
+    } | nft -f - || return
+}
+
 setup_firewall() {
     log "Checking nftables firewall..."
 
@@ -708,6 +793,7 @@ setup_firewall() {
 
         # Populate NR endpoint sets and shipper UID
         populate_nr_sets "$tmpdir"
+        populate_native_sets runtime
 
         # Persist across reboot: nftables.service loads /etc/nftables.conf. The
         # sets come back empty, attackbox-nft-refresh.timer repopulates them.
@@ -804,6 +890,23 @@ setup_unattended_upgrades() {
 
     local config="/etc/apt/apt.conf.d/50unattended-upgrades"
     local auto_config="/etc/apt/apt.conf.d/20auto-upgrades"
+    local sources="/etc/apt/sources.list.d/ubuntu.sources"
+    local vultr_mirror='^URIs: https?://ubuntu\.mirror\.constant\.com/?[[:space:]]*$'
+    if [[ -f "$sources" ]] && grep -Eq "$vultr_mirror" "$sources"; then
+        if [[ "$MODE" == "apply" ]]; then
+            local updated
+            updated=$(mktemp "${sources}.XXXXXX")
+            if ! sed -E "s|$vultr_mirror|URIs: https://archive.ubuntu.com/ubuntu/|" "$sources" > "$updated" ||
+                ! chmod --reference="$sources" "$updated" || ! mv -fT -- "$updated" "$sources"; then
+                rm -f -- "$updated"
+                err "Cannot replace the Vultr Ubuntu archive mirror"
+                return 1
+            fi
+            ok "Set the Ubuntu archive to an allowed mirror"
+        else
+            warn "Would replace the Vultr Ubuntu mirror with archive.ubuntu.com"
+        fi
+    fi
 
     if [[ -f "$config" ]]; then
         if grep -q 'Automatic-Reboot "false"' "$config"; then
@@ -836,6 +939,29 @@ EOF
     else
         ok "Automatic security updates enabled"
     fi
+}
+
+apply_initial_security_updates() {
+    local stamp="$1" reboot
+    [[ ! -f "$stamp" ]] || return 0
+    if [[ "$MODE" != "apply" ]]; then
+        warn "Would refresh Ubuntu indexes and run unattended security updates"
+        return 0
+    fi
+
+    reboot=$(apt-config shell reboot Unattended-Upgrade::Automatic-Reboot/b) || return
+    if [[ "$reboot" == "reboot='true'" ]]; then
+        err "Disable automatic reboot before applying initial security updates"
+        return 1
+    fi
+
+    log "Applying initial Ubuntu security updates..."
+    apt-get update -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources \
+        -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=false -o APT::Update::Error-Mode=any \
+        -o Acquire::Retries=0 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 || return
+    unattended-upgrade --verbose || return
+    mkdir -p -- "$(dirname "$stamp")" && touch -- "$stamp" || return
+    ok "Initial Ubuntu security update run complete"
 }
 
 # Systemd units
@@ -1079,8 +1205,8 @@ resolve_ubuntu_mirrors() {
     fi
 }
 
-# Re-resolve endpoints into the live sets (timer entry point). Sets are
-# additive: stale IPs stay until the next boot or reload of /etc/nftables.conf.
+# Re-resolve endpoints into the live sets (timer entry point).
+# The existing shipper and Ubuntu sets are additive.
 refresh_endpoint_sets() {
     log "Refreshing nftables endpoint sets..."
 
@@ -1096,6 +1222,7 @@ refresh_endpoint_sets() {
     rmdir "$tmpdir"
 
     resolve_ubuntu_mirrors
+    populate_native_sets runtime
     ok "Endpoint sets refreshed"
 }
 
@@ -1147,7 +1274,7 @@ prepare_bait() {
 
     # Build bait image (dev tag for compose.yaml)
     if [[ -f "$repo_root/Dockerfile" ]]; then
-        docker build -t attackbox-bait:dev "$repo_root"
+        docker build --network=none --build-arg OFFLINE_GO_BUILD=1 -t attackbox-bait:dev "$repo_root"
         ok "Built bait image"
     else
         err "Dockerfile not found in repository root"
@@ -1158,7 +1285,7 @@ prepare_bait() {
     log "Installing shipper binary..."
     local shipper_build
     shipper_build=$(mktemp -d)
-    docker build --target shipper-export --output type=local,dest="$shipper_build" "$repo_root"
+    docker build --network=none --build-arg OFFLINE_GO_BUILD=1 --target shipper-export --output type=local,dest="$shipper_build" "$repo_root"
     install -m 0755 -o root -g root "$shipper_build/attackbox-shipper" /usr/local/bin/attackbox-shipper
     rm -rf "$shipper_build"
     ok "Installed attackbox-shipper binary"
@@ -1200,6 +1327,8 @@ run_verification_enhanced() {
         return 1
     fi
 
+    bash "${SCRIPT_DIR}/bootstrap-infrastructure.sh" --verify
+
     # Use verified multi-arch busybox digest for tests
     # Verification: docker pull busybox:1.36.1
     # Command: docker inspect busybox:1.36.1 | jq -r '.[0].RepoDigests[] | select(contains("docker.io"))'
@@ -1225,12 +1354,14 @@ run_verification_enhanced() {
         return 1
     fi
 
-    # Test internal Docker DNS (external DNS/NTP must be blocked from bait network)
-    log "Testing internal Docker name resolution..."
-    if docker run --rm --runtime=runsc --network "$network" "$test_img" nslookup attackbox-proxy >/dev/null 2>&1; then
-        ok "Internal Docker DNS works"
+    # runsc does not use Docker's embedded DNS. Check the pinned gVisor
+    # proxy-to-bait route over TLS; the bootstrap certificate is self-signed.
+    log "Testing HTTPS proxy to bait..."
+    if curl --noproxy '*' -kfsS --max-time 10 https://127.0.0.1:8443/v1/models |
+        jq -e '.object == "list" and (.data | type == "array")' >/dev/null; then
+        ok "HTTPS proxy forwards to bait"
     else
-        err "Internal Docker DNS does NOT work - required check failed"
+        err "HTTPS proxy cannot reach bait - required check failed"
         return 1
     fi
 
@@ -1286,10 +1417,16 @@ main() {
 
     check_root
 
-    if [[ "$MODE" == "refresh" ]]; then
-        refresh_endpoint_sets
-        exit $?
-    fi
+    case "$MODE" in
+        refresh-sets)
+            refresh_endpoint_sets
+            exit $?
+            ;;
+        refresh-install-sets)
+            populate_native_sets install
+            exit $?
+            ;;
+    esac
 
     check_linux
     check_os
@@ -1297,6 +1434,18 @@ main() {
     if [[ "$MODE" == "verify" ]]; then
         run_verification_enhanced
         exit $?
+    fi
+
+    local native_api_key=''
+    export -n native_api_key
+    if [[ "$NATIVE_KEY_STDIN" == true ]]; then
+        IFS= read -r native_api_key || { err "Missing native provisioning API key on stdin"; exit 1; }
+        [[ -z "$native_api_key" || "$native_api_key" =~ ^NRAK-[A-Za-z0-9_-]{20,200}$ ]] ||
+            { err "Invalid native provisioning User API key"; exit 1; }
+    fi
+    if [[ "$MODE" == apply && -z "$native_api_key" ]] && ! systemctl is-active --quiet newrelic-infra.service; then
+        err "Native Infrastructure bootstrap requires a User API key; use --native-key-stdin"
+        exit 1
     fi
 
     setup_users
@@ -1309,21 +1458,26 @@ main() {
     bootstrap_firewall
     start_docker
     prepare_bait
+    if [[ "$MODE" != apply ]]; then bash "${SCRIPT_DIR}/bootstrap-infrastructure.sh" --dry-run; fi
     setup_firewall
     setup_sysctl
     setup_auditd
     setup_unattended_upgrades
+    apply_initial_security_updates /var/lib/attackbox/initial-security-upgrade
     setup_systemd_units
 
     if [[ "$MODE" == "apply" ]]; then
         start_services
         start_bait
+        printf '%s\n' "$native_api_key" | bash "${SCRIPT_DIR}/bootstrap-infrastructure.sh" --apply
+        unset native_api_key
         run_verification_enhanced
         disable_ssh
 
         echo ""
         ok "Deployment complete"
         warn "Services started:"
+        warn "  - Native New Relic Infrastructure"
         warn "  - Docker (with gVisor runtime)"
         warn "  - attackbox-shipper (with socket)"
         warn "  - attackbox-bait (with proxy)"

@@ -24,3 +24,7 @@ scripts/
 *.md
 !cmd/**/*.go
 !internal/**/*.go
+
+# Bootstrap generates this tree from the committed Go module files.
+!vendor/
+!vendor/**

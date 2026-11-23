@@ -18,6 +18,13 @@
 services:
   bait:
     runtime: runsc
+    networks:
+      internal:
+        ipv4_address: 172.30.0.2
 
   proxy:
     runtime: runsc
+    # runsc cannot reach Docker's embedded DNS on 127.0.0.11. Keep
+    # sandbox networking and resolve the sole upstream through /etc/hosts.
+    extra_hosts:
+      bait: "172.30.0.2"

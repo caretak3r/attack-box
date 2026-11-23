@@ -7,7 +7,8 @@ FROM cgr.dev/chainguard/go@sha256:f90bc942e1f05e2d6b3b37af550fe50bbac9134a267b52
 
 WORKDIR /work
 COPY go.mod go.sum* ./
-RUN go mod download
+ARG OFFLINE_GO_BUILD=0
+RUN if [ "$OFFLINE_GO_BUILD" = 0 ]; then go mod download; fi
 COPY . .
 
 # Build static binaries with security flags
