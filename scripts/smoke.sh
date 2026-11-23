@@ -112,6 +112,18 @@ expect "log edge events" '"stream":"edge"' "$log"
 expect "log request capture" '"direction":"request"' "$log"
 expect "log response capture" '"direction":"response"' "$log"
 expect "log sse response body" 'data: [DONE]' "$(grep '"direction":"response"' "$work/attackbox.log")"
+request_summary=$(grep '"direction":"request"' "$work/attackbox.log" | grep '"parse_state":"ok"' | grep '"input_fp_scope":"full"' || true)
+expect "log parsed request fingerprint" '"input_fp":"hmac256:' "$request_summary"
+for field in capture_state declared_bytes observed_bytes captured_bytes body_utf8_replaced redactions; do
+	expect "log request $field" "\"$field\":" "$request_summary"
+done
+stopped=$(grep '"action":"stopped"' "$work/attackbox.log" || true)
+expect "log graceful shutdown" '"forced":false' "$stopped"
+expect "log local drops" '"local_dropped_total":0' "$stopped"
+for field in persona_version policy_version redaction_version fp_epoch fp_scope; do
+	expect "log request $field" "\"$field\":" "$request_summary"
+	expect "log stopped $field" "\"$field\":" "$stopped"
+done
 expect "log probe stream" '"stream":"probe"' "$log"
 expect "log probe nonce" '"nonce":"' "$(grep '"stream":"probe"' "$work/attackbox.log")"
 expect "log follow-up attribution" '"followup":"register-model"' "$(grep '"stream":"probe"' "$work/attackbox.log")"

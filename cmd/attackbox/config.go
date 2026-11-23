@@ -63,6 +63,10 @@ type config struct {
 	spoolQueue   int
 	spoolTimeout time.Duration
 
+	// beat is the heartbeat interval of the New Relic client and the spool.
+	// There is no environment variable; zero keeps their defaults, and tests set it.
+	beat time.Duration
+
 	maxSessions  int
 	maxBody      int64
 	maxLogBody   int

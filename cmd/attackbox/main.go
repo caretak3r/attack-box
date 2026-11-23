@@ -17,17 +17,20 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"attackbox/internal/observability"
 	"attackbox/internal/responder"
+	"attackbox/internal/secret"
 	"attackbox/internal/server"
 	"attackbox/internal/telemetry"
 )
@@ -138,12 +141,34 @@ type app struct {
 	handlerMu sync.Mutex
 	handlers  sync.WaitGroup
 	closing   bool
+	forced    atomic.Bool // a server Shutdown failed or the handler join timed out
+}
+
+// provenance is the bait-assigned attribute map: one value per process, laid
+// over every event of the local log, the direct New Relic sink and the spool.
+// fp_scope says what the redactor did, not what the setting asked for.
+func provenance(cfg config, r *telemetry.Redactor) map[string]any {
+	scope := "boot"
+	if cfg.secretFile != "" && !r.KeyReplaced() {
+		scope = "configured"
+	}
+	return map[string]any{
+		"persona_version":   server.PersonaVersion,
+		"policy_version":    responder.PolicyVersion,
+		"redaction_version": secret.RedactionVersion,
+		"fp_epoch":          r.Epoch(),
+		"fp_scope":          scope,
+	}
 }
 
 // newApp binds every listener before it returns, so a port conflict fails
 // startup instead of leaving a partial service.
 func newApp(cfg config, logOut io.Writer) (*app, error) {
-	a := &app{cfg: cfg, local: telemetry.NewAsync(telemetry.NewJSONLog(logOut), 0)}
+	redactor := telemetry.NewRedactor(cfg.derive("redact"))
+	stamp := provenance(cfg, redactor)
+	// The stamp sits below Async so that events the queue writes itself
+	// (local_dropped) carry it too.
+	a := &app{cfg: cfg, local: telemetry.NewAsync(telemetry.WithStamp(telemetry.NewJSONLog(logOut), stamp), 0)}
 	a.sink = a.local
 	tracing, err := observability.New(context.Background(), cfg.tracing, "attackbox-bait", version)
 	if err != nil {
@@ -158,11 +183,18 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 	}()
 	if cfg.nrKey != "" {
 		nr, err := telemetry.NewNewRelic(telemetry.NRConfig{
-			LicenseKey:    cfg.nrKey,
-			LogURL:        cfg.nrLogURL,
-			MetricURL:     cfg.nrMetricURL,
-			FlushInterval: time.Second,
-			Common:        map[string]any{"service.name": "attackbox", "instance": cfg.instance},
+			LicenseKey:        cfg.nrKey,
+			LogURL:            cfg.nrLogURL,
+			MetricURL:         cfg.nrMetricURL,
+			FlushInterval:     time.Second,
+			HeartbeatInterval: cfg.beat,
+			Common:            map[string]any{"service.name": "attackbox", "instance": cfg.instance},
+			// The client builds its own heartbeat, outside the sink wrapper.
+			HeartbeatAttrs: func() map[string]any {
+				attrs := maps.Clone(stamp)
+				attrs["local_dropped_total"] = a.local.Dropped()
+				return attrs
+			},
 			// Delivery failures go to the local log only, never back into
 			// the queue that is failing.
 			OnError: func(err error) {
@@ -174,13 +206,19 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 			return nil, err
 		}
 		a.nr = nr
-		a.sink = telemetry.Multi{a.local, nr}
+		a.sink = telemetry.Multi{a.local, telemetry.WithStamp(nr, stamp)}
 	}
 	if cfg.spoolSocket != "" {
 		sp, err := telemetry.NewSpool(telemetry.SpoolConfig{
 			Socket:       cfg.spoolSocket,
 			QueueSize:    cfg.spoolQueue,
 			WriteTimeout: cfg.spoolTimeout,
+			Heartbeat:    cfg.beat,
+			Stamp:        stamp,
+			// The spool cannot see the local queue's counter.
+			HeartbeatAttrs: func() map[string]any {
+				return map[string]any{"local_dropped_total": a.local.Dropped()}
+			},
 			// As for New Relic: failures go to the local log only.
 			OnError: func(err error) {
 				a.local.Emit(telemetry.Event{Stream: telemetry.StreamRuntime, Action: "spool_error", Result: "error", Attrs: map[string]any{"error": err.Error()}})
@@ -193,7 +231,6 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 		a.sink = telemetry.Multi{a.local, sp}
 	}
 
-	redactor := telemetry.NewRedactor(cfg.derive("redact"))
 	resp := responder.New(responder.Config{Fingerprint: redactor.Fingerprint},
 		responder.NewStore(responder.StoreConfig{MaxSessions: cfg.maxSessions}))
 	sessionKey, embedSeed := cfg.derive("session"), cfg.derive("embed")
@@ -366,6 +403,7 @@ func (a *app) run(ctx context.Context) error {
 		go func(srv *http.Server) {
 			defer wg.Done()
 			if err := srv.Shutdown(shutCtx); err != nil {
+				a.forced.Store(true)
 				cut(server.ErrShutdown) // holds outlived the grace period
 				_ = srv.Close()
 			}
@@ -377,6 +415,7 @@ func (a *app) run(ctx context.Context) error {
 	select {
 	case <-finished:
 	case <-time.After(max(time.Second, a.cfg.shutdownTimeout)):
+		a.forced.Store(true)
 		serveErr = errors.Join(serveErr, errors.New("handlers did not finish evidence before shutdown deadline"))
 	}
 
@@ -401,7 +440,9 @@ func (a *app) run(ctx context.Context) error {
 	if a.spool != nil {
 		// The host shipper gets a stopped record with the spool counters as
 		// they stand before the drain; the local record below carries the
-		// final ones and stays authoritative.
+		// final ones and stays authoritative. Stop the heartbeat before either
+		// record; a forced shutdown can still have handlers running.
+		a.spool.StopHeartbeat()
 		a.spool.Emit(a.stopped(serveErr, traceErr, attrs))
 		flushCtx, cancelFlush := context.WithTimeout(context.Background(), a.cfg.shutdownTimeout)
 		spErr = a.spool.Close(flushCtx)
@@ -414,9 +455,10 @@ func (a *app) run(ctx context.Context) error {
 }
 
 // stopped builds the final runtime record. attrs holds the New Relic
-// counters, if any; spool and local counters are read now.
+// counters, if any; spool and local counters are read now. A forced shutdown
+// never reports a clean end, so it sets forced and a result of error.
 func (a *app) stopped(serveErr, remoteErr error, nrAttrs map[string]any) telemetry.Event {
-	attrs := make(map[string]any, len(nrAttrs)+6)
+	attrs := make(map[string]any, len(nrAttrs)+20)
 	for k, v := range nrAttrs {
 		attrs[k] = v
 	}
@@ -425,11 +467,16 @@ func (a *app) stopped(serveErr, remoteErr error, nrAttrs map[string]any) telemet
 		st := a.spool.Stats()
 		attrs["spool_written"], attrs["spool_dropped"], attrs["spool_lost"], attrs["spool_errors"], attrs["spool_resent"] = st.Written, st.Dropped, st.Lost, st.Errors, st.Resent
 		loss = st.Dropped > 0 || st.Lost > 0
+		// The same cumulative counters as bait_heartbeat.
+		maps.Copy(attrs, a.spool.Counters())
 	}
 	localDropped := a.local.Dropped()
 	attrs["local_dropped"] = localDropped
+	attrs["local_dropped_total"] = localDropped
+	forced := a.forced.Load()
+	attrs["forced"] = forced
 	result := "ok"
-	if serveErr != nil || remoteErr != nil || loss || localDropped > 0 {
+	if serveErr != nil || remoteErr != nil || loss || localDropped > 0 || forced {
 		result = "error"
 	}
 	return telemetry.Event{Stream: telemetry.StreamRuntime, Action: "stopped", Result: result, Attrs: attrs}

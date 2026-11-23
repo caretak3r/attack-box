@@ -1008,6 +1008,86 @@ func TestRunSendsSensorAndDeploymentCommonAttributes(t *testing.T) {
 	}
 }
 
+func TestNewShipperBoot(t *testing.T) {
+	a, b := newShipperBoot(), newShipperBoot()
+	for _, id := range []string{a, b} {
+		if len(id) != 16 || strings.Trim(id, "0123456789abcdef") != "" {
+			t.Fatalf("shipper boot %q is not 16 lowercase hex characters", id)
+		}
+	}
+	if a == b {
+		t.Fatalf("two shipper boots are both %q", a)
+	}
+}
+
+// A run reports its accounting rows at start, on the log endpoint, with one
+// shipper_boot on every row.
+func TestRunSendsAccountingAtStart(t *testing.T) {
+	reports := make(chan []map[string]any, 4)
+	nr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if gr, err := gzip.NewReader(bytes.NewReader(body)); err == nil {
+			body, _ = io.ReadAll(gr)
+		}
+		var env []struct {
+			Logs []struct {
+				Attributes map[string]any `json:"attributes"`
+			} `json:"logs"`
+		}
+		if r.URL.Path == "/log/v1" && json.Unmarshal(body, &env) == nil && len(env) == 1 {
+			var rows []map[string]any
+			for _, l := range env[0].Logs {
+				if l.Attributes["source"] == "shipper_accounting" {
+					rows = append(rows, l.Attributes)
+				}
+			}
+			if len(rows) > 0 {
+				select {
+				case reports <- rows:
+				default:
+				}
+			}
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer nr.Close()
+	cfg, err := loadConfig(testEnv(t, map[string]string{
+		"ATTACKBOX_NR_LOG_URL":    nr.URL + "/log/v1",
+		"ATTACKBOX_NR_METRIC_URL": nr.URL + "/metric/v1",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var stderr bytes.Buffer
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, cfg, &stderr) }()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	select {
+	case rows := <-reports:
+		roles := map[any]bool{}
+		for _, row := range rows {
+			boot, _ := row["shipper_boot"].(string)
+			if len(boot) != 16 || strings.Trim(boot, "0123456789abcdef") != "" || boot != rows[0]["shipper_boot"] {
+				t.Fatalf("row %v: shipper_boot %q", row["action"], boot)
+			}
+			if row["action"] == "ingest_stats" {
+				roles[row["role"]] = true
+			}
+		}
+		if len(roles) != len(cfg.endpoints) {
+			t.Fatalf("ingest_stats rows cover roles %v, want %d roles", roles, len(cfg.endpoints))
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("no accounting report\nstderr: %s", stderr.String())
+	}
+}
+
 // The largest record the admission layer lets through must be appendable on
 // every role at the smallest allowed queue, not dropped as oversize.
 func TestMaxAdmittedRecordIsAppendable(t *testing.T) {

@@ -99,6 +99,8 @@ The binary supports `-version` and `-stdin-stream runtime|egress`. It does not h
 | `ATTACKBOX_NR_LICENSE_KEY` | None | Required for the shipper; local key-shape validation also applies |
 | `ATTACKBOX_NR_LOG_URL` | `https://log-api.newrelic.com/log/v1` | HTTPS ingest endpoint; no automatic regional selection |
 | `ATTACKBOX_NR_METRIC_URL` | `https://metric-api.newrelic.com/metric/v1` | HTTPS ingest endpoint; no automatic regional selection |
+| `ATTACKBOX_SENSOR_ID` | Lowercase hostname, or `attackbox` if invalid | Stable sensor label on shipper logs and metrics |
+| `ATTACKBOX_DEPLOYMENT_ID` | `unset` | Deployment label on shipper logs and metrics |
 | `ATTACKBOX_SPOOL_SOCKET` | `/run/attackbox/spool.sock` | Bait UID 65532; 4 connections, 1 MiB/s, 4 MiB burst |
 | `ATTACKBOX_RUNTIME_SOCKET` | Disabled | Root producer; 2 connections, 256 KiB/s, 4 MiB burst |
 | `ATTACKBOX_EGRESS_SOCKET` | Disabled | Root producer; 2 connections, 128 KiB/s, 4 MiB burst |
@@ -107,6 +109,8 @@ The binary supports `-version` and `-stdin-stream runtime|egress`. It does not h
 | `ATTACKBOX_SHIP_SEGMENT_BYTES` | `16777216` | Decimal bytes, accepted range 1048576–268435456 |
 | `ATTACKBOX_SHIP_SHUTDOWN_TIMEOUT` | `15s` | Duration from zero through one minute; align systemd stop timeout if changed |
 | `HOSTNAME` | OS hostname, then `attackbox` | Host label in shipper telemetry |
+
+Both ID values must match `^[a-z0-9][a-z0-9._-]{0,62}$`. Use a new deployment ID when you rebuild the sensor.
 
 Socket paths must be absolute, at most 107 bytes, and contain no NUL. Use distinct paths. Current byte-setting parsing silently falls back to defaults for non-integer input; it rejects parsed out-of-range integers. Check the effective configuration carefully. Strict deployment-manifest validation is proposed in `/Users/rohit/attack-box/IMPROVE.md`.
 
@@ -190,9 +194,15 @@ In New Relic, filter heartbeat records by `stream='heartbeat'`, `source='shipper
 
 Interpret `bait_connected` as socket connection presence. Interpret `last_bait_record_age_ms=-1` as no valid bait record yet. Both queue-byte fields report unacknowledged queue bytes. Queue drops omit other possible loss stages. Missing heartbeat, stale bait activity, growing physical disk use, queue corruption, replay gaps, and endpoint failures need investigation. None alone proves compromise.
 
+Use `source='shipper_accounting'` for `ingest_stats` and `producer_boot`. The shipper attempts the report at startup and every 30 seconds. It sends no more than 40 rows per POST and does not retry a failed report. The shipper reports each final verdict for up to 20 report intervals. A new verdict starts a new interval count. This count does not measure confirmed deliveries.
+
+Use `shipper_boot`, `role`, and `boot` to identify a boot report. `loss_scope=committed` excludes remote delivery. If `loss=unknown`, read `loss_reason` before interpreting the counters. Then check queue backlog and remote delivery separately.
+
 ## Stop, restart, recovery, and rebuild
 
 For a planned stop, close public ingress first, then stop bait, adapters, and shipper. The bait handles SIGTERM within its configured deadline. The shipper checkpoints confirmed remote delivery and preserves unacknowledged records for restart. It does not empty the disk queue on shutdown. Keep systemd stop limits consistent with application deadlines.
+
+For a schema upgrade, stop the bait and adapters before you replace the shipper. Restart all producers and the shipper from the same release. A shipper that requires `v=1` rejects old producers, but existing durable queue entries remain readable.
 
 Restart the shipper before bait so the spool socket is available. The bait startup requires its initial socket connection. Do not remove queue files to fix a startup error. Recovery may truncate a torn newest tail, quarantine corrupt segments, and replay uncertain logs. Metrics in uncertain replay ranges are suppressed with a gap signal. Account for duplicates by record ID and chunk index.
 
@@ -268,3 +278,5 @@ GOTOOLCHAIN=go1.25.11 go vet ./...
 shellcheck -S error /Users/rohit/attack-box/scripts/deploy-ubuntu.sh /Users/rohit/attack-box/scripts/test-deploy-ubuntu.sh
 bash /Users/rohit/attack-box/scripts/test-deploy-ubuntu.sh
 ```
+
+Receipt-enabled host readers retain stable record IDs across replay. Their aggregate admission statistics participate in I02 reports. They do not use legacy producer-boot sequence accounting; source cursor and receipt evidence are separate. `loss_scope=committed` cannot prove remote acceptance or completeness before source retention.

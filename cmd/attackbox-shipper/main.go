@@ -11,6 +11,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -168,6 +170,14 @@ func queueConfig(cfg config) shipper.QueueConfig {
 	}
 }
 
+// newShipperBoot returns the ID of this shipper process, 16 hex characters. A
+// new one marks a restart of the delivery path in the accounting rows.
+func newShipperBoot() string {
+	var b [8]byte
+	rand.Read(b[:]) // never fails
+	return hex.EncodeToString(b[:])
+}
+
 func run(ctx context.Context, cfg config, stderr io.Writer) error {
 	tracing, err := observability.New(ctx, cfg.tracing, "attackbox-shipper", version)
 	if err != nil {
@@ -198,6 +208,7 @@ func run(ctx context.Context, cfg config, stderr io.Writer) error {
 		return err
 	}
 
+	shipperBoot := newShipperBoot()
 	nr, err := telemetry.NewNewRelic(telemetry.NRConfig{
 		LicenseKey:        cfg.nrLicenseKey,
 		LogURL:            cfg.nrLogURL,
@@ -225,6 +236,7 @@ func run(ctx context.Context, cfg config, stderr io.Writer) error {
 			quarantineRecords, quarantineBytes := rejected.Stats()
 			attrs := map[string]any{
 				"source":                     "shipper",
+				"shipper_boot":               shipperBoot,
 				"quarantine_records":         quarantineRecords,
 				"quarantine_bytes":           quarantineBytes,
 				"bait_connected":             baitConn,
@@ -249,6 +261,9 @@ func run(ctx context.Context, cfg config, stderr io.Writer) error {
 				attrs["last_"+role.String()+"_record_age_ms"] = age
 			}
 			return attrs
+		},
+		AccountingReport: func(now time.Time) []telemetry.Event {
+			return ing.Accounting(now, shipperBoot)
 		},
 		OnError: func(err error) {
 			fmt.Fprintln(stderr, "newrelic:", err)

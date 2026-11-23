@@ -178,6 +178,49 @@ func New(cfg Config) (*Server, error) {
 // ReadTimeout never cuts a hold short, and it sets its own write deadline.
 func (s *Server) Handler() http.Handler { return http.HandlerFunc(s.serve) }
 
+// readOutcome is how reading the request body ended. The zero value means the
+// server answered before it read.
+type readOutcome uint8
+
+const (
+	readNotRead readOutcome = iota // rate limited: the body was never read
+	readNone                       // no body, or a body of zero bytes
+	readDone                       // read to the end
+	readLimit                      // MaxBodyBytes stopped the read
+	readError                      // another read error, or a client abort
+)
+
+// reason is the completion reason of the raw request manifest.
+func (o readOutcome) reason() string {
+	switch o {
+	case readLimit:
+		return "body_limit"
+	case readError:
+		return "read_error"
+	}
+	return "eof"
+}
+
+// parseOutcome is what the handler's top-level object decode did. The zero
+// value means no handler decoded the body.
+type parseOutcome uint8
+
+const (
+	parseNotAttempted parseOutcome = iota
+	parseOK
+	parseFailed
+)
+
+func (o parseOutcome) name() string {
+	switch o {
+	case parseOK:
+		return "ok"
+	case parseFailed:
+		return "failed"
+	}
+	return "not_attempted"
+}
+
 // call is the state of one request.
 type call struct {
 	s     *Server
@@ -195,6 +238,8 @@ type call struct {
 	panicInfo string
 
 	body      []byte
+	read      readOutcome
+	parse     parseOutcome
 	tooLarge  bool
 	endpoint  string
 	params    map[string]string
@@ -327,7 +372,8 @@ func (s *Server) personaHeaders(c *call, rid string) {
 // MaxBodyBytes are kept for the log and tooLarge is set.
 func (c *call) readBody(w http.ResponseWriter) {
 	if c.r.Body == nil || c.r.Body == http.NoBody {
-		c.endRequestEvidence(true, "eof")
+		c.read = readNone
+		c.endRequestEvidence(true, c.read.reason())
 		return
 	}
 	var reader io.Reader = http.MaxBytesReader(w, c.r.Body, c.s.cfg.MaxBodyBytes)
@@ -338,13 +384,17 @@ func (c *call) readBody(w http.ResponseWriter) {
 	c.body = b
 	var mbe *http.MaxBytesError
 	c.tooLarge = errors.As(err, &mbe)
-	reason := "eof"
-	if c.tooLarge {
-		reason = "body_limit"
-	} else if err != nil {
-		reason = "read_error"
+	switch {
+	case c.tooLarge:
+		c.read = readLimit
+	case err != nil:
+		c.read = readError
+	case len(b) == 0:
+		c.read = readNone
+	default:
+		c.read = readDone
 	}
-	c.endRequestEvidence(err == nil, reason)
+	c.endRequestEvidence(err == nil, c.read.reason())
 }
 
 // acquire takes a global and a per-source slot.

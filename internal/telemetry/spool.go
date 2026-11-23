@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"net"
 	"strconv"
@@ -80,7 +81,13 @@ type SpoolConfig struct {
 	WriteTimeout time.Duration // per batch write; default DefaultSpoolTimeout
 	Heartbeat    time.Duration // bait_heartbeat interval; 0 means DefaultSpoolBeat, <0 disables
 	Now          func() time.Time
-	OnError      func(error) // write and redial failures; must not call back into the Spool
+	OnError      func(error)    // write and redial failures; must not call back into the Spool
+	Stamp        map[string]any // added to every event, the heartbeat included; wins over an event attribute
+
+	// HeartbeatAttrs adds attributes the spool cannot know, such as the
+	// caller's own drop counter, to each bait_heartbeat. Spool counters win over
+	// it. It must not block or call back into the Spool.
+	HeartbeatAttrs func() map[string]any
 
 	dial func() (net.Conn, error) // tests only; nil dials Socket
 }
@@ -110,6 +117,7 @@ type SpoolStats struct {
 type Spool struct {
 	cfg  SpoolConfig
 	boot string
+	born time.Time // monotonic start of uptime_ms; zero for a Spool built without NewSpool
 
 	mu     sync.Mutex // orders seq with queue order; guards closed
 	seq    uint64
@@ -176,6 +184,7 @@ func NewSpool(cfg SpoolConfig) (*Spool, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	cfg.Stamp = maps.Clone(cfg.Stamp)
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return nil, err
@@ -190,6 +199,7 @@ func NewSpool(cfg SpoolConfig) (*Spool, error) {
 	s := &Spool{
 		cfg:      cfg,
 		boot:     hex.EncodeToString(b[:]),
+		born:     time.Now(), // wall clock with monotonic reading: Now may be a test clock
 		queue:    make(chan []byte, cfg.QueueSize),
 		stop:     make(chan struct{}),
 		beatStop: make(chan struct{}),
@@ -214,7 +224,36 @@ func (s *Spool) Emit(e Event) {
 		e.Timestamp = s.cfg.Now()
 	}
 	e.BodySHA256, e.ChunkIndex, e.ChunkCount = "", 0, 0
-	s.put("event", e)
+	e.Attrs = mergeStamp(e.Attrs, s.cfg.Stamp)
+	s.put("event", e, isHealth(e))
+}
+
+// isHealth reports whether e may use the reserved part of the queue: the
+// heartbeat stream and the lifecycle actions of the runtime stream.
+func isHealth(e Event) bool {
+	switch e.Stream {
+	case StreamHeartbeat:
+		return true
+	case StreamRuntime:
+		return e.Action == "start" || e.Action == "stop" || e.Action == "stopped"
+	}
+	return false
+}
+
+// Reserved part of the queue that only health records may use.
+const (
+	spoolReserveRecords = 4
+	spoolReserveBytes   = 64 << 10
+)
+
+// reserve returns the records and bytes that payload may not take. A queue
+// too small for a whole record in reserve has none, bytes included.
+func reserve(queueSize, queueBytes int) (records int, bytes int64) {
+	records = min(spoolReserveRecords, queueSize/4)
+	if records == 0 {
+		return 0, 0
+	}
+	return records, int64(min(spoolReserveBytes, queueBytes/4))
 }
 
 func (s *Spool) Count(name string, value float64, attrs map[string]string) {
@@ -229,12 +268,13 @@ func (s *Spool) metric(kind, name string, value float64, attrs map[string]string
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		return // JSONLog and NewRelic skip these too
 	}
-	s.put("metric", MetricRecord{Name: name, Kind: kind, Value: value, At: s.cfg.Now(), Attrs: SafeLabels(attrs)})
+	s.put("metric", MetricRecord{Name: name, Kind: kind, Value: value, At: s.cfg.Now(), Attrs: SafeLabels(attrs)}, false)
 }
 
 // put encodes v outside the lock, then takes a seq and queues the line under
-// it, so queue order matches seq order.
-func (s *Spool) put(field string, v any) {
+// it, so queue order matches seq order. A payload record (health false) is
+// refused when it would leave less than the reserve free.
+func (s *Spool) put(field string, v any, health bool) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
@@ -260,7 +300,11 @@ func (s *Spool) put(field string, v any) {
 		s.drop(true)
 		return
 	}
-	if s.bytes.Load()+int64(size) > int64(s.cfg.QueueBytes) {
+	keepRecords, keepBytes := 0, int64(0)
+	if !health {
+		keepRecords, keepBytes = reserve(s.cfg.QueueSize, s.cfg.QueueBytes)
+	}
+	if s.bytes.Load()+int64(size)+keepBytes > int64(s.cfg.QueueBytes) || len(s.queue)+keepRecords >= cap(s.queue) {
 		s.drop(false)
 		return
 	}
@@ -480,12 +524,37 @@ func (s *Spool) heartbeat() {
 		case <-s.beatStop:
 			return
 		case <-t.C:
-			st := s.Stats()
-			s.Emit(Event{Stream: StreamHeartbeat, Action: "bait_heartbeat", Result: "ok", Attrs: map[string]any{
-				"queue_len": len(s.queue), "queue_bytes": s.bytes.Load(),
-				"dropped_total": st.Dropped, "errors_total": st.Errors, "reconnects": st.Reconnects,
-			}})
+			attrs := map[string]any{}
+			if s.cfg.HeartbeatAttrs != nil {
+				maps.Copy(attrs, s.cfg.HeartbeatAttrs())
+			}
+			maps.Copy(attrs, s.Counters())
+			attrs["queue_len"], attrs["queue_bytes"] = len(s.queue), s.bytes.Load()
+			s.Emit(Event{Stream: StreamHeartbeat, Action: "bait_heartbeat", Result: "ok", Attrs: attrs})
 		}
+	}
+}
+
+// StopHeartbeat stops the heartbeat and returns after its goroutine has
+// ended, so no bait_heartbeat is emitted afterwards. It is safe to call more
+// than once, with the heartbeat disabled, and before Close.
+func (s *Spool) StopHeartbeat() {
+	s.beatOnce.Do(func() { close(s.beatStop) })
+	<-s.beatDone
+}
+
+// Counters returns the cumulative counters that bait_heartbeat carries.
+// local_dropped_total is not a spool counter: the caller adds it.
+func (s *Spool) Counters() map[string]any {
+	st := s.Stats()
+	var up int64
+	if !s.born.IsZero() {
+		up = time.Since(s.born).Milliseconds()
+	}
+	return map[string]any{
+		"written_total": st.Written, "dropped_total": st.Dropped, "oversize_total": st.Oversize,
+		"lost_total": st.Lost, "resent_total": st.Resent, "errors_total": st.Errors,
+		"reconnects": st.Reconnects, "uptime_ms": up,
 	}
 }
 
@@ -504,8 +573,7 @@ func (s *Spool) Stats() SpoolStats {
 func (s *Spool) Close(ctx context.Context) error {
 	// Stop the heartbeat first and outside the lock: it calls put, which
 	// takes the lock.
-	s.beatOnce.Do(func() { close(s.beatStop) })
-	<-s.beatDone
+	s.StopHeartbeat()
 	s.mu.Lock()
 	if !s.closed {
 		s.closed = true

@@ -37,6 +37,9 @@ const (
 	maxPayloadBytes = 950_000 // New Relic rejects bodies over 1MB
 	closeGrace      = time.Second
 
+	// MaxAccountingEvents is the most events one accounting POST carries.
+	MaxAccountingEvents = 40
+
 	// New Relic drops a record with more than 254 attributes, names over 255
 	// characters or string values over 4094 characters.
 	maxAttrKey    = 255
@@ -90,7 +93,12 @@ type NRConfig struct {
 	Backoff           []time.Duration
 	MaxRetryAfter     time.Duration         // cap on a 429 Retry-After wait; default 30s
 	HeartbeatAttrs    func() map[string]any // merged into each heartbeat, must not block
-	OnError           func(error)
+	// AccountingReport, when set, is called once at start and once per
+	// heartbeat interval, and its events go out in one extra POST to LogURL:
+	// one attempt, at most MaxAccountingEvents events, no retry and no queue.
+	// It must not block. Without a heartbeat interval no report is sent.
+	AccountingReport func(now time.Time) []Event
+	OnError          func(error)
 }
 
 // Stats is a snapshot of shipper counters. Sent counts log events and metrics
@@ -488,6 +496,13 @@ func (n *NewRelic) run() {
 			defer wg.Done()
 			n.heartbeatLoop()
 		}()
+		if n.cfg.AccountingReport != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				n.accountingLoop()
+			}()
+		}
 	}
 	n.ship()
 	wg.Wait()
@@ -526,6 +541,75 @@ func (n *NewRelic) heartbeatLoop() {
 		metric, _ := json.Marshal(map[string]any{"name": "attackbox.heartbeat", "type": "gauge", "value": 1, "timestamp": now.UnixMilli()})
 		common, _ := json.Marshal(map[string]any{"attributes": n.cfg.Common})
 		n.postOnce(n.cfg.MetricURL, envelope(common, "metrics", metric), 1)
+	}
+}
+
+// accountingLoop sends one accounting report at start and one per heartbeat
+// interval. It is the only sender and runs apart from the heartbeat, so a
+// stalled POST delays nothing else and nothing queues behind it: a tick that
+// fires during a POST waits in the ticker's one-slot channel, and a report is
+// built only when it is about to go out. Close cuts a POST in flight.
+func (n *NewRelic) accountingLoop() {
+	ctx, cancel := context.WithCancel(n.ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-n.quit:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	t := time.NewTicker(n.cfg.HeartbeatInterval)
+	defer t.Stop()
+	for ctx.Err() == nil {
+		n.sendAccounting(ctx)
+		select {
+		case <-ctx.Done():
+		case <-t.C:
+		}
+	}
+}
+
+// sendAccounting posts one report in a single attempt. Rows that do not fit
+// the event or payload bound are left out, last first. Reports are replaceable
+// snapshots, so their failures do not count as durable delivery losses.
+func (n *NewRelic) sendAccounting(ctx context.Context) {
+	events := n.cfg.AccountingReport(n.cfg.Now())
+	common, _ := json.Marshal(map[string]any{"attributes": n.cfg.Common})
+	size := len(envelope(common, "logs"))
+	var items [][]byte
+	for _, e := range events[:min(len(events), MaxAccountingEvents)] {
+		item, err := logItem(e)
+		if err != nil {
+			continue
+		}
+		if size+len(item)+1 > n.cfg.MaxPayloadBytes { // +1 for the comma
+			break
+		}
+		size += len(item) + 1
+		items = append(items, item)
+	}
+	if len(items) < len(events) {
+		n.accountingError(errors.New("newrelic: accounting report cut to its event and payload bounds"))
+	}
+	if len(items) == 0 {
+		return
+	}
+	body, err := gzipBody(envelope(common, "logs", items...))
+	if err == nil {
+		if _, _, err = n.try(ctx, n.cfg.LogURL, body); err == nil {
+			return
+		}
+	}
+	if ctx.Err() != nil { // Close cut the POST; the report was not durable anyway
+		return
+	}
+	n.accountingError(fmt.Errorf("newrelic: accounting report: %w", err))
+}
+
+func (n *NewRelic) accountingError(err error) {
+	if n.cfg.OnError != nil {
+		n.cfg.OnError(errors.New(n.keyRe.ReplaceAllString(err.Error(), "[redacted]")))
 	}
 }
 
@@ -869,7 +953,7 @@ func gzipBody(payload []byte) ([]byte, error) {
 func (n *NewRelic) postOnce(endpoint string, payload []byte, items int) {
 	body, err := gzipBody(payload)
 	if err == nil {
-		if _, _, err = n.try(endpoint, body); err == nil {
+		if _, _, err = n.try(n.ctx, endpoint, body); err == nil {
 			n.sent.Add(int64(items))
 			return
 		}
@@ -888,7 +972,7 @@ func (n *NewRelic) post(endpoint string, payload []byte) (transient bool, err er
 	for attempt := 0; ; attempt++ {
 		var retry bool
 		var after time.Duration
-		retry, after, err = n.try(endpoint, body)
+		retry, after, err = n.try(n.ctx, endpoint, body)
 		if err == nil {
 			return false, nil
 		}
@@ -918,8 +1002,8 @@ func (e *statusError) Error() string {
 
 // try makes one POST. retry reports whether the failure is worth another go;
 // after is the server's Retry-After on a 429, or zero.
-func (n *NewRelic) try(endpoint string, body []byte) (retry bool, after time.Duration, err error) {
-	req, err := http.NewRequestWithContext(n.ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+func (n *NewRelic) try(ctx context.Context, endpoint string, body []byte) (retry bool, after time.Duration, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return false, 0, errors.New("newrelic: build request failed")
 	}
@@ -928,7 +1012,7 @@ func (n *NewRelic) try(endpoint string, body []byte) (retry bool, after time.Dur
 	req.Header.Set("Content-Encoding", "gzip")
 	resp, err := n.client.Do(req)
 	if err != nil {
-		return n.ctx.Err() == nil, 0, fmt.Errorf("newrelic: transport error: %w", err)
+		return ctx.Err() == nil, 0, fmt.Errorf("newrelic: transport error: %w", err)
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))

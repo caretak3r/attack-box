@@ -17,6 +17,9 @@ import (
 	"testing"
 	"time"
 
+	"attackbox/internal/responder"
+	"attackbox/internal/secret"
+	"attackbox/internal/server"
 	"attackbox/internal/telemetry"
 )
 
@@ -276,9 +279,18 @@ func (n *nrIntake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func startApp(t *testing.T, env map[string]string) (*app, *syncBuf, context.CancelFunc, chan error) {
 	t.Helper()
+	return startAppWith(t, env, nil)
+}
+
+// startAppWith is startApp with a hook that may change the loaded config.
+func startAppWith(t *testing.T, env map[string]string, tweak func(*config)) (*app, *syncBuf, context.CancelFunc, chan error) {
+	t.Helper()
 	cfg, err := loadConfig(envOf(env))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if tweak != nil {
+		tweak(&cfg)
 	}
 	logs := &syncBuf{}
 	a, err := newApp(cfg, logs)
@@ -826,4 +838,378 @@ func TestPartialBindClosesSpool(t *testing.T) {
 	}
 	peer.ln.Close()
 	peer.wg.Wait() // returns only once the spool closed its connection
+}
+
+var (
+	provKeys    = []string{"persona_version", "policy_version", "redaction_version", "fp_epoch", "fp_scope"}
+	counterKeys = []string{
+		"written_total", "dropped_total", "oversize_total", "lost_total", "resent_total",
+		"errors_total", "reconnects", "local_dropped_total", "uptime_ms",
+	}
+)
+
+// wantProvenance checks the five stamps on the attributes of one decoded event.
+func wantProvenance(t *testing.T, what string, attrs map[string]any, epoch, scope string) {
+	t.Helper()
+	want := map[string]any{
+		"persona_version":   float64(server.PersonaVersion),
+		"policy_version":    float64(responder.PolicyVersion),
+		"redaction_version": float64(secret.RedactionVersion),
+		"fp_epoch":          epoch,
+		"fp_scope":          scope,
+	}
+	for _, k := range provKeys {
+		if attrs[k] != want[k] {
+			t.Errorf("%s: %s = %v, want %v", what, k, attrs[k], want[k])
+		}
+	}
+}
+
+// wantCounters checks the cumulative counters of bait_heartbeat and stopped.
+func wantCounters(t *testing.T, what string, attrs map[string]any) {
+	t.Helper()
+	for _, k := range counterKeys {
+		if _, ok := attrs[k]; !ok {
+			t.Errorf("%s: counter %s missing from %v", what, k, attrs)
+		}
+	}
+}
+
+// spoolEnv is a spool-mode environment with a secret file.
+func spoolEnv(t *testing.T, sock string) map[string]string {
+	t.Helper()
+	keyFile := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(keyFile, bytes.Repeat([]byte{9}, 48), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return map[string]string{
+		"ATTACKBOX_SPOOL_SOCKET": sock,
+		"ATTACKBOX_OPENAI_ADDR":  "127.0.0.1:0",
+		"ATTACKBOX_TIMING":       "false",
+		"ATTACKBOX_SECRET_FILE":  keyFile,
+	}
+}
+
+// waitFor polls cond for up to five seconds.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// hasStream reports whether any key of m is "<stream>/<action>" for stream.
+// The edge actions depend on the request, so tests match on the stream.
+func hasStream[V any](m map[string]V, stream string) bool {
+	for k := range m {
+		if strings.HasPrefix(k, stream+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAction(recs []telemetry.Record, action string) bool {
+	for _, r := range recs {
+		if r.Event != nil && r.Event.Action == action {
+			return true
+		}
+	}
+	return false
+}
+
+// TestProvenanceSpoolMode checks the five stamps on the spool records, the
+// spool heartbeat and the local log, the counters of heartbeat and stopped, and
+// that nothing follows stopped.
+func TestProvenanceSpoolMode(t *testing.T) {
+	peer, sock := newSpoolPeer(t)
+	var epoch string
+	a, logs, cancel, done := startAppWith(t, spoolEnv(t, sock), func(c *config) {
+		c.beat = 20 * time.Millisecond
+		epoch = telemetry.NewRedactor(c.derive("redact")).Epoch()
+	})
+	if len(epoch) != 8 {
+		t.Fatalf("epoch %q", epoch)
+	}
+	resp, _ := post(t, "http://"+a.addrs()["openai"]+"/v1/chat/completions",
+		`{"model":"qwen3:8b","messages":[{"role":"user","content":"hello"}]}`, nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("chat %d", resp.StatusCode)
+	}
+	waitFor(t, "a spool heartbeat", func() bool { return hasAction(peer.records(t), "bait_heartbeat") })
+	if err := stop(t, cancel, done); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	peer.ln.Close()
+	peer.wg.Wait()
+
+	recs := peer.records(t)
+	seen := map[string]bool{}
+	stoppedAt := -1
+	for i, r := range recs {
+		if r.Metric != nil {
+			for _, k := range provKeys {
+				if _, ok := r.Metric.Attrs[k]; ok {
+					t.Errorf("metric %s carries %s", r.Metric.Name, k)
+				}
+			}
+			if len(telemetry.SafeLabels(r.Metric.Attrs)) != len(r.Metric.Attrs) {
+				t.Errorf("metric %s labels left the closed set: %v", r.Metric.Name, r.Metric.Attrs)
+			}
+			continue
+		}
+		e := r.Event
+		what := e.Stream + "/" + e.Action
+		seen[what] = true
+		wantProvenance(t, "spool "+what, e.Attrs, epoch, "configured")
+		switch e.Action {
+		case "bait_heartbeat":
+			wantCounters(t, "spool "+what, e.Attrs)
+			if stoppedAt >= 0 {
+				t.Errorf("bait_heartbeat at record %d follows stopped at %d", i, stoppedAt)
+			}
+		case "stopped":
+			stoppedAt = i
+			wantCounters(t, "spool "+what, e.Attrs)
+			if e.Attrs["forced"] != false || e.Result != "ok" {
+				t.Errorf("graceful stopped: forced %v result %q", e.Attrs["forced"], e.Result)
+			}
+		}
+	}
+	for _, w := range []string{"runtime/start", "runtime/stop", "runtime/stopped", "heartbeat/bait_heartbeat"} {
+		if !seen[w] {
+			t.Errorf("no %s on the socket; saw %v", w, seen)
+		}
+	}
+	if !hasStream(seen, telemetry.StreamEdge) {
+		t.Errorf("no edge event on the socket; saw %v", seen)
+	}
+	if stoppedAt != len(recs)-1 {
+		t.Errorf("stopped at record %d of %d, want the last", stoppedAt, len(recs))
+	}
+
+	localSeen := map[string]bool{}
+	for _, l := range logs.lines(t) {
+		if l["stream"] == "metric" {
+			for _, k := range provKeys {
+				if _, ok := l[k]; ok {
+					t.Errorf("local metric carries %s", k)
+				}
+			}
+			continue
+		}
+		what := l["stream"].(string) + "/" + l["action"].(string)
+		localSeen[what] = true
+		wantProvenance(t, "local "+what, l, epoch, "configured")
+		if l["action"] == "stopped" {
+			wantCounters(t, "local "+what, l)
+			if l["forced"] != false || l["local_dropped"] != l["local_dropped_total"] {
+				t.Errorf("local stopped: forced %v local_dropped %v total %v", l["forced"], l["local_dropped"], l["local_dropped_total"])
+			}
+		}
+	}
+	for _, w := range []string{"runtime/start", "runtime/stop", "runtime/stopped"} {
+		if !localSeen[w] {
+			t.Errorf("no %s in the local log; saw %v", w, localSeen)
+		}
+	}
+	if !hasStream(localSeen, telemetry.StreamEdge) {
+		t.Errorf("no edge event in the local log; saw %v", localSeen)
+	}
+}
+
+// TestProvenanceDirectNR checks the stamps on events and on the heartbeat that
+// the New Relic client builds for itself, and that metrics keep their labels.
+// No secret file is set, so the scope is boot.
+func TestProvenanceDirectNR(t *testing.T) {
+	intake := &nrIntake{posts: map[string][][]byte{}}
+	nr := httptest.NewServer(intake)
+	defer nr.Close()
+	var epoch string
+	a, logs, cancel, done := startAppWith(t, map[string]string{
+		"ATTACKBOX_NR_LICENSE_KEY": testNRKey,
+		"ATTACKBOX_NR_LOG_URL":     nr.URL + "/log/v1",
+		"ATTACKBOX_NR_METRIC_URL":  nr.URL + "/metric/v1",
+		"ATTACKBOX_OPENAI_ADDR":    "127.0.0.1:0",
+		"ATTACKBOX_TIMING":         "false",
+	}, func(c *config) {
+		c.beat = 20 * time.Millisecond
+		epoch = telemetry.NewRedactor(c.derive("redact")).Epoch()
+	})
+	get(t, "http://"+a.addrs()["openai"]+"/v1/models")
+	shipped := func() map[string]map[string]any {
+		intake.mu.Lock()
+		defer intake.mu.Unlock()
+		out := map[string]map[string]any{}
+		for _, p := range intake.posts["/log/v1"] {
+			var env []struct {
+				Logs []struct {
+					Attributes map[string]any `json:"attributes"`
+				} `json:"logs"`
+			}
+			if err := json.Unmarshal(p, &env); err != nil {
+				t.Errorf("log post is not JSON: %v", err)
+				continue
+			}
+			for _, c := range env {
+				for _, l := range c.Logs {
+					out[l.Attributes["stream"].(string)+"/"+l.Attributes["action"].(string)] = l.Attributes
+				}
+			}
+		}
+		return out
+	}
+	waitFor(t, "a direct heartbeat", func() bool { return shipped()["heartbeat/heartbeat"] != nil })
+	if err := stop(t, cancel, done); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	items := shipped()
+	var edge bool
+	for w, attrs := range items {
+		edge = edge || strings.HasPrefix(w, telemetry.StreamEdge+"/")
+		wantProvenance(t, "nr "+w, attrs, epoch, "boot")
+	}
+	for _, w := range []string{"runtime/start", "runtime/stop", "heartbeat/heartbeat"} {
+		if items[w] == nil {
+			t.Errorf("no %s shipped; saw %d kinds", w, len(items))
+		}
+	}
+	if !edge {
+		t.Error("no edge event shipped")
+	}
+	if beat := items["heartbeat/heartbeat"]; beat != nil {
+		if _, ok := beat["local_dropped_total"]; !ok {
+			t.Errorf("nr heartbeat has no local_dropped_total: %v", beat)
+		}
+	}
+	var stopped bool
+	for _, l := range logs.lines(t) {
+		if l["action"] == "stopped" {
+			stopped = true
+			wantProvenance(t, "local stopped", l, epoch, "boot")
+			if _, ok := l["local_dropped_total"]; !ok || l["forced"] != false {
+				t.Errorf("local stopped: local_dropped_total %v forced %v", l["local_dropped_total"], l["forced"])
+			}
+		}
+	}
+	if !stopped {
+		t.Error("no local stopped")
+	}
+	intake.mu.Lock()
+	defer intake.mu.Unlock()
+	for _, p := range intake.posts["/metric/v1"] {
+		for _, k := range provKeys {
+			if bytes.Contains(p, []byte(k)) {
+				t.Errorf("metric post carries %s: %.200s", k, p)
+			}
+		}
+	}
+}
+
+// gatedWriter blocks every write until gate is closed.
+type gatedWriter struct {
+	syncBuf
+	gate chan struct{}
+}
+
+func (g *gatedWriter) Write(p []byte) (int, error) {
+	<-g.gate
+	return g.syncBuf.Write(p)
+}
+
+// TestProvenanceOnLocalDropped checks that local_dropped, which the queue
+// writes itself, passes through the stamp.
+func TestProvenanceOnLocalDropped(t *testing.T) {
+	cfg, err := loadConfig(envOf(map[string]string{"ATTACKBOX_NR_DISABLED": "true", "ATTACKBOX_OPENAI_ADDR": "127.0.0.1:0"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := &gatedWriter{gate: make(chan struct{})}
+	a, err := newApp(cfg, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The writer is stuck on the first event, so the queue fills and the rest
+	// is dropped.
+	for i := 0; i < 5000; i++ {
+		a.local.Emit(telemetry.Event{Stream: telemetry.StreamRuntime, Action: "fill"})
+	}
+	if a.local.Dropped() == 0 {
+		t.Fatal("nothing dropped")
+	}
+	close(out.gate)
+	a.closeListeners()
+	_ = a.closeLocal() // reports the drops
+	var found bool
+	for _, l := range out.lines(t) {
+		if l["action"] == "local_dropped" {
+			found = true
+			wantProvenance(t, "local_dropped", l, telemetry.NewRedactor(cfg.derive("redact")).Epoch(), "boot")
+		}
+	}
+	if !found {
+		t.Fatal("no local_dropped event")
+	}
+}
+
+// TestForcedShutdown checks that a hold that outlives the grace period sets
+// forced on stopped, on the socket and in the local log, and that stopped is
+// still the last record.
+func TestForcedShutdown(t *testing.T) {
+	peer, sock := newSpoolPeer(t)
+	env := spoolEnv(t, sock)
+	env["ATTACKBOX_SHUTDOWN_TIMEOUT"] = "200ms"
+	a, logs, cancel, done := startAppWith(t, env, func(c *config) { c.beat = 20 * time.Millisecond })
+	// The body never arrives, so the connection stays active and Shutdown gives up.
+	conn, err := net.Dial("tcp", a.addrs()["openai"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusContinue {
+		t.Fatalf("waiting for the body read: got %s", resp.Status)
+	}
+	if err := stop(t, cancel, done); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	peer.ln.Close()
+	peer.wg.Wait()
+
+	recs := peer.records(t)
+	last := recs[len(recs)-1].Event
+	if last == nil || last.Action != "stopped" {
+		t.Fatalf("last record = %+v, want stopped", recs[len(recs)-1])
+	}
+	if last.Attrs["forced"] != true || last.Result != "error" {
+		t.Errorf("spool stopped: forced %v result %q", last.Attrs["forced"], last.Result)
+	}
+	for i, r := range recs[:len(recs)-1] {
+		if r.Event != nil && r.Event.Action == "stopped" {
+			t.Errorf("second stopped at record %d", i)
+		}
+	}
+	var local map[string]any
+	for _, l := range logs.lines(t) {
+		if l["action"] == "stopped" {
+			local = l
+		}
+	}
+	if local == nil || local["forced"] != true || local["result"] != "error" {
+		t.Fatalf("local stopped = %v", local)
+	}
 }

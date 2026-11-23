@@ -14,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"attackbox/internal/telemetry"
 )
 
 // Ingest limits and defaults.
@@ -53,7 +55,8 @@ type IngestConfig struct {
 	Now         func() time.Time
 	OnError     func(error) // connection-level failures; must not block
 
-	sleep func(context.Context, time.Duration) error // tests only
+	sleep   func(context.Context, time.Duration) error // tests only
+	maxRows int                                        // tests only: cap of one Accounting report
 }
 
 func (c *IngestConfig) setDefaults() error {
@@ -83,6 +86,9 @@ func (c *IngestConfig) setDefaults() error {
 	}
 	if c.sleep == nil {
 		c.sleep = sleepCtx
+	}
+	if c.maxRows == 0 {
+		c.maxRows = telemetry.MaxAccountingEvents
 	}
 	if c.IdleTimeout < 0 || c.LineTimeout < 0 || c.MaxBatch < 0 || c.MaxInvalid < 0 {
 		return errors.New("shipper ingest: timeouts and limits must be positive")
@@ -164,14 +170,18 @@ type roleState struct {
 	slots  chan struct{}
 	bucket *bucket
 
-	mu    sync.Mutex
-	boots map[string]*bootMark
-	stats RoleStats
+	mu         sync.Mutex
+	boots      map[string]*bootMark
+	waiting    []*bootMark // evicted without a final row, still reported
+	born       uint64      // creation counter for bootAcct.born
+	unreported uint64      // evicted boots that found no waiting slot
+	stats      RoleStats
 }
 
 type bootMark struct {
 	high uint64
 	used uint64 // recency stamp for eviction
+	acct bootAcct
 }
 
 // NewIngest validates cfg and binds every endpoint socket. The parent
@@ -352,7 +362,7 @@ func (in *Ingest) serveConn(c *net.UnixConn, rs *roleState) {
 	for {
 		items, more, err := cn.batch()
 		if len(items) > 0 {
-			if aerr := in.append(rs, items); aerr != nil {
+			if aerr := in.append(rs, items, cn.take()); aerr != nil {
 				return
 			}
 		}
@@ -370,7 +380,10 @@ func (in *Ingest) serveConn(c *net.UnixConn, rs *roleState) {
 	}
 }
 
-func (in *Ingest) append(rs *roleState, items []Item) error {
+// append writes one batch durably. sights holds the evidence of each item, in
+// item order; boot accounting takes it only after the queue returned, so a
+// record counts as admitted once it passed the durable stage and not before.
+func (in *Ingest) append(rs *roleState, items []Item, sights []sighting) error {
 	seqs, err := in.cfg.Queue.Append(items)
 	queued, full := uint64(0), uint64(0)
 	for _, s := range seqs {
@@ -383,16 +396,18 @@ func (in *Ingest) append(rs *roleState, items []Item) error {
 	if err != nil {
 		in.setFatal(err)
 		// Items rejected before the failure are not durable either.
+		rs.failBatch(sights)
 		return err
 	}
 	now := in.cfg.Now()
-	rs.count(func(s *RoleStats) {
-		s.Queued += queued
-		s.QueueFull += full
-		if queued > 0 {
-			s.LastRecord = now
-		}
-	})
+	rs.mu.Lock()
+	rs.stats.Queued += queued
+	rs.stats.QueueFull += full
+	if queued > 0 {
+		rs.stats.LastRecord = now
+	}
+	rs.land(sights, seqs, now, in.cfg.IdleTimeout)
+	rs.mu.Unlock()
 	return nil
 }
 
@@ -402,7 +417,27 @@ type conn struct {
 	c       *net.UnixConn
 	br      *bufio.Reader
 	boot    string
+	bref    *bootMark // table entry of boot; nil until its first line passed admission
 	invalid int
+	pend    []sighting // evidence of the admitted lines of the current batch
+}
+
+// take hands the evidence of the batch just read to append.
+func (cn *conn) take() []sighting {
+	p := cn.pend
+	cn.pend = nil
+	return p
+}
+
+// refuse counts a line that admission refused. A connection whose boot is
+// known also charges the line to that boot.
+func (cn *conn) refuse(f func(*RoleStats)) {
+	cn.rs.mu.Lock()
+	f(&cn.rs.stats)
+	if cn.bref != nil {
+		cn.bref.acct.rejected++
+	}
+	cn.rs.mu.Unlock()
 }
 
 // batch reads at least one line, then keeps reading while a complete line is
@@ -438,26 +473,30 @@ func (cn *conn) batch() (items []Item, more bool, err error) {
 
 func (cn *conn) admit(line []byte, oversize bool) (Item, bool, error) {
 	if oversize {
-		cn.rs.count(func(s *RoleStats) { s.Lines++; s.Oversize++ })
+		cn.refuse(func(s *RoleStats) { s.Lines++; s.Oversize++ })
 		return Item{}, false, cn.reject()
 	}
 	cn.rs.count(func(s *RoleStats) { s.Lines++ })
-	a, err := Admit(cn.rs.ep.Role, line, cn.in.cfg.Now())
+	now := cn.in.cfg.Now()
+	a, err := Admit(cn.rs.ep.Role, line, now)
 	if err != nil {
 		reason := RejectReason(err)
-		cn.rs.count(func(s *RoleStats) { s.Rejected[reason]++ })
+		cn.refuse(func(s *RoleStats) { s.Rejected[reason]++ })
 		return Item{}, false, cn.reject()
 	}
 	if cn.boot == "" {
 		cn.boot = a.Boot
 	} else if a.Boot != cn.boot {
-		cn.rs.count(func(s *RoleStats) { s.Rejected["boot"]++; s.Closed++ })
+		cn.refuse(func(s *RoleStats) { s.Rejected["boot"]++; s.Closed++ })
 		return Item{}, false, errClose
 	}
 	cn.invalid = 0
-	if !cn.rs.mark(a.Boot, a.Seq) {
+	b, fresh := cn.rs.track(a.Boot, a.Seq, now)
+	cn.bref = b
+	if !fresh {
 		return Item{}, false, nil
 	}
+	cn.pend = append(cn.pend, sightOf(a, b, now))
 	return Item{Role: a.Role, Data: a.Data}, true, nil
 }
 
@@ -532,9 +571,10 @@ func (cn *conn) setReadDeadline(t time.Time) {
 	cn.c.SetReadDeadline(t)
 }
 
-// mark records seq for boot and reports whether it is new. A seq at or below
-// the boot's high-water mark is a duplicate from a resent batch.
-func (rs *roleState) mark(boot string, seq uint64) bool {
+// track records seq for boot and reports whether it is new, with the boot's
+// table entry. A seq at or below the boot's high-water mark is a duplicate
+// from a resent batch and is charged to the boot. It stamps the arrival time.
+func (rs *roleState) track(boot string, seq uint64, now time.Time) (*bootMark, bool) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	var stamp uint64
@@ -543,6 +583,9 @@ func (rs *roleState) mark(boot string, seq uint64) bool {
 	}
 	b, ok := rs.boots[boot]
 	if !ok {
+		// A boot that comes back has a fresh row; the evicted one must not
+		// report a stale final verdict next to it.
+		rs.waiting = slices.DeleteFunc(rs.waiting, func(w *bootMark) bool { return w.acct.id == boot })
 		if len(rs.boots) >= maxBoots {
 			var oldest string
 			for k, v := range rs.boots {
@@ -550,21 +593,25 @@ func (rs *roleState) mark(boot string, seq uint64) bool {
 					oldest = k
 				}
 			}
+			rs.evict(rs.boots[oldest])
 			delete(rs.boots, oldest)
 		}
-		b = &bootMark{}
+		rs.born++
+		b = &bootMark{acct: bootAcct{id: boot, born: rs.born}}
 		rs.boots[boot] = b
 	}
 	b.used = stamp + 1
+	b.acct.arrived = now
 	switch {
 	case seq <= b.high:
 		rs.stats.Duplicates++
-		return false
+		b.acct.duplicates++
+		return b, false
 	case b.high > 0 && seq > b.high+1:
 		rs.stats.Gaps += seq - b.high - 1
 	}
 	b.high = seq
-	return true
+	return b, true
 }
 
 func (rs *roleState) count(f func(*RoleStats)) {

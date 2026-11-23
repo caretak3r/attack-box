@@ -174,7 +174,7 @@ func (s *Server) ollamaPS(c *call) { c.json(map[string]any{"models": []any{}}) }
 
 // ollamaBody reads a JSON object body for the management endpoints.
 func (c *call) ollamaBody() (map[string]json.RawMessage, bool) {
-	raw, err := decodeObject(c.body)
+	raw, err := c.decodeBody()
 	if err != nil {
 		c.failParse(err)
 		return nil, false

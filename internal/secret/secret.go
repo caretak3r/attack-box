@@ -250,7 +250,21 @@ func tokenLike(v string) bool {
 // credential after JSON unescaping, quote removal and auth-scheme removal, so
 // the same token sent as a header and as a JSON field correlates.
 func Scrub(s string, fp Fingerprinter) string {
+	s, _ = ScrubCount(s, fp)
+	return s
+}
+
+// RedactionVersion names the redaction behavior of Scrub. Raise it, and the
+// digest in its pin test, when a rule changes what the scrubber writes.
+const RedactionVersion = 1
+
+// ScrubCount is Scrub plus the number of replacements it made, literal
+// "[redacted]" markers included. Marker text that the input already held is
+// not counted: only a credential that the scrubber replaced is.
+func ScrubCount(s string, fp Fingerprinter) (string, int) {
+	n := 0
 	mark := func(v string) string {
+		n++
 		if fp != nil {
 			if f := fp(v); fpRe.MatchString(f) {
 				return "[redacted:" + f + "]"
@@ -342,12 +356,13 @@ func Scrub(s string, fp Fingerprinter) string {
 		}
 		return mark(m)
 	})
-	return replaceSub(gluedSKRe, s, func(sub []string) string {
+	s = replaceSub(gluedSKRe, s, func(sub []string) string {
 		if keep(sub[2]) || !looksLikeKey(sub[2]) {
 			return sub[0]
 		}
 		return sub[1] + mark(sub[2])
 	})
+	return s, n
 }
 
 // looksLikeKey tells a random key body from a hyphenated word that happens to

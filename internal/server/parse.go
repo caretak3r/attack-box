@@ -83,6 +83,18 @@ func decodeObject(b []byte) (map[string]json.RawMessage, error) {
 	return m, nil
 }
 
+// decodeBody is the one top-level object decode of the request body. It also
+// records the outcome for the log; later validation of the fields does not
+// undo a successful decode.
+func (c *call) decodeBody() (map[string]json.RawMessage, error) {
+	raw, err := decodeObject(c.body)
+	c.parse = parseOK
+	if err != nil {
+		c.parse = parseFailed
+	}
+	return raw, err
+}
+
 func str(raw json.RawMessage) string {
 	var s string
 	if json.Unmarshal(raw, &s) != nil {
@@ -141,7 +153,7 @@ func contentText(raw json.RawMessage) string {
 
 // parseInference normalizes an inference body for the responder.
 func (s *Server) parseInference(c *call, k kind) (*inferReq, error) {
-	raw, err := decodeObject(c.body)
+	raw, err := c.decodeBody()
 	if err != nil {
 		return nil, err
 	}

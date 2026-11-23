@@ -27,7 +27,7 @@ FACET source
 SINCE 10 minutes ago
 ```
 
-Expected: Two sources (`shipper`, `bait`), both updated within the last 90 seconds.
+Expected: `shipper` and `bait` update within 90 seconds. `shipper_accounting` also appears when accounting reports arrive. It does not replace the regular shipper heartbeat.
 
 ### Verify Metrics Flowing
 

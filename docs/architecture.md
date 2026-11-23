@@ -157,11 +157,15 @@ Source: `/Users/rohit/attack-box/internal/responder/issuance.go`, `/Users/rohit/
 
 Six streams exist: `edge`, `transcript`, `probe`, `runtime`, `egress`, and `heartbeat`. Edge events contain bounded request/response observations. Transcript events include probe text; they are not an independent complete wire transcript. Host adapters supply separate runtime and egress observations.
 
-The bait scrubs secrets and bounds captured bodies. The shipper validates and scrubs admitted content again. Heuristic redaction can miss free-text secrets, unusual credential names, and encoded values. Stored content is a transformed observation. A body hash can identify redacted content; it cannot recover omitted bytes or prove authenticity. Parsing, truncation, redaction, and chunking must remain explicit in future evidence contracts.
+The bait scrubs secrets in its bounded summaries. Heuristic redaction can miss free-text secrets, unusual credential names, and encoded values. The optional [application capture](live-evidence.md) is separate and is not redacted.
 
 The bait spool has a 32 MiB byte ceiling, a default 10,000-item queue, a 2 MiB record limit, and a default five-second write timeout. The asynchronous event sink also has a count limit; it is not an end-to-end byte-budget guarantee. A successful Unix-socket write does not acknowledge durable disk commit. Loss before shipper admission can remain unknown after a crash.
 
-Future I02 adds stage-specific provenance, schema versions, boot/sequence reconciliation, protected health capacity, and explicit unknown-loss intervals. It must not describe existing one-way delivery as end-to-end durable.
+The final request and response summaries identify their coverage with `capture_state`. Request `parse_state` records the result of object decoding, not field validation. `declared_bytes` is the client claim. `observed_bytes` counts request bytes read and can be a lower bound. `captured_bytes` counts bytes in the transformed summary before chunking. `body_utf8_replaced` and `redactions` describe the scanned window.
+
+`input_fp` is a keyed fingerprint of the request bytes read. `input_fp_scope=prefix` identifies an incomplete read. Compare fingerprints only within the same `fp_epoch` and scope. `body_sha256` identifies the retained text for chunk verification. Neither hash proves sender identity or that capture was complete.
+
+Bait events carry `persona_version`, `policy_version`, `redaction_version`, `fp_epoch`, and `fp_scope`. The spool reserves bounded space for health records without changing FIFO order.
 
 Source: `/Users/rohit/attack-box/internal/server/log.go`, `/Users/rohit/attack-box/internal/secret/secret.go`, `/Users/rohit/attack-box/internal/telemetry/spool.go`, and `/Users/rohit/attack-box/internal/telemetry/async.go`.
 
@@ -176,6 +180,8 @@ Source: `/Users/rohit/attack-box/internal/server/log.go`, `/Users/rohit/attack-b
 The directory is mode 0710. Socket mode 0220 permits connection; peer credentials and the selected socket assign the producer role. A producer cannot choose a role by setting a JSON field. Runtime and egress endpoints are optional in the binary but enabled by the supplied deployment setup.
 
 Validation applies role-specific stream/action and metric allowlists, reserved-attribute removal, UTF-8 checks, JSON structure limits, and body limits. Limits include a 2 MiB wire line, 1 MiB body, 8 MiB admitted payload, and 16 MiB expansion bound. Unknown JSON fields and trailing data are rejected. Timestamps outside the accepted window (24 hours old through five minutes ahead) are replaced with current time and flagged.
+
+Producers write wire version `v=1`. The shipper rejects unsupported versions and sets `schema_version` and `ingest_ts` after admission. If it replaces the producer timestamp, it preserves the original as `producer_ts`. `sensor_id` and `deployment_id` come from shipper configuration, not from producer data.
 
 Wire record IDs use `<16-lowercase-hex-boot>-<positive-sequence>`. Forwarded IDs use `<role>-<boot>-<sequence>`. Deduplicate chunks by record ID and chunk index. Reassemble only within that identity and validate expected count and content hash. Hash alone is not a transcript identity.
 
@@ -200,6 +206,8 @@ The `checkpoint` file records generation, segment, offset, and acknowledged sequ
 The default unacknowledged queue limit is 256 MiB. Role reservations are bait 60%, runtime 20%, and egress 20%. Full queues reject new records; they do not evict unacknowledged data. Physical disk use can exceed the logical unacknowledged limit due to retained segments and quarantine files. Monitor filesystem usage separately.
 
 The drain reads up to 200 records or 512 KiB, delivers in order, and checkpoints confirmed deliveries after 200 records or one second. Authentication, endpoint, transport and outage failures block later records. HTTP 413 first splits encoded batches. Record-level HTTP 400, 413 or 422 failures isolate the source record. The drain can advance past that record only after it stores the exact queue bytes and SHA-256 in `/var/lib/attackbox-shipper/queue/quarantine`. The quarantine is bounded to 64 MiB and 4096 files. It never evicts records. A full or damaged quarantine stops the drain. Replayed entries use deterministic filenames. A server-wide 400 response can fill this store; it is not treated as successful remote delivery. Monitor `quarantine_records` and `quarantine_bytes`. Empty polls wait 100 ms; blocked delivery retries after 250 ms. Remote API acceptance is not proof of query availability.
+
+The shipper sends bounded `ingest_stats` and `producer_boot` reports outside the durable queue. `loss_scope=committed` covers only stages through durable admission. `none_known` does not establish delivery or query availability. A forced stop, missing prefix, or unexplained gap can leave loss `unknown`.
 
 Recovery truncates a torn final frame in the newest segment. Other corruption preserves the valid prefix and quarantines the segment. Missing or inconsistent checkpoint state causes uncertain replay. Logs can repeat. Metrics in the uncertain range are suppressed and `attackbox.metric_replay_gap` records the gap. An I/O error can leave the queue broken until restart and recovery; do not delete queue files to clear it.
 

@@ -44,7 +44,7 @@ func (s *Server) finish(c *call) {
 		"route":                   c.endpoint,
 		"headers":                 headers,
 		"credential_fingerprints": creds,
-		"body_bytes":              len(c.body),
+		"observed_bytes":          len(c.body),
 		"response_bytes":          c.w.n,
 		"latency_ms":              now.Sub(c.start).Milliseconds(),
 		"host":                    truncRunes(red.Text(c.r.Host), 256),
@@ -55,6 +55,9 @@ func (s *Server) finish(c *call) {
 	}
 	if c.tooLarge {
 		attrs["body_limit_exceeded"] = true
+	}
+	if n, ok := c.declaredBytes(); ok {
+		attrs["declared_bytes"] = n
 	}
 	if c.panicked {
 		attrs["panic"] = true
@@ -84,12 +87,23 @@ func (s *Server) finish(c *call) {
 	}
 
 	attrs["direction"] = "request"
-	body, cut := s.logBody(c.body, int64(len(c.body)))
-	if cut {
+	pv := s.preview(c.body, int64(len(c.body)))
+	attrs["capture_state"] = c.captureState(pv.cut)
+	attrs["parse_state"] = c.parse.name()
+	attrs["captured_bytes"] = len(pv.text)
+	attrs["body_utf8_replaced"] = pv.replaced
+	attrs["redactions"] = pv.redactions
+	if pv.cut {
 		attrs["body_truncated"] = true
-		// The keyed fingerprint of the whole body links repeats of one
-		// oversized payload without logging the part past the cap.
-		attrs["body_fingerprint"] = red.Fingerprint(string(c.body))
+	}
+	if len(c.body) > 0 {
+		// The keyed fingerprint of every byte read links repeats of one
+		// payload without logging the part past the cap.
+		attrs["input_fp"] = red.FingerprintBytes(c.body)
+		attrs["input_fp_scope"] = "full"
+		if c.read == readLimit || c.read == readError {
+			attrs["input_fp_scope"] = "prefix"
+		}
 	}
 	resource := truncRunes(red.Text(c.r.URL.Path), maxResourceLen)
 	ua := truncRunes(red.Text(c.ua), maxUALen)
@@ -112,7 +126,7 @@ func (s *Server) finish(c *call) {
 		Status:    status,
 		ProbeID:   probeID,
 		Attrs:     attrs,
-		Body:      body,
+		Body:      pv.text,
 	})
 	if c.w.n > 0 {
 		s.emitResponse(c, now, sessionID, ua, resource, result, status, probeID)
@@ -278,16 +292,21 @@ const logRedactMargin = 4 << 10
 // emitResponse writes the response body as its own edge event, so request and
 // response each get the full MaxLogBody budget and their own chunk sequence.
 func (s *Server) emitResponse(c *call, now time.Time, sessionID, ua, resource, result string, status int, probeID string) {
-	body, cut := s.logBody(c.w.head, c.w.n)
+	pv := s.preview(c.w.head, c.w.n)
 	attrs := map[string]any{
-		"route":          c.endpoint,
-		"direction":      "response",
-		"response_bytes": c.w.n,
+		"route":              c.endpoint,
+		"direction":          "response",
+		"response_bytes":     c.w.n,
+		"capture_state":      "complete",
+		"captured_bytes":     len(pv.text),
+		"body_utf8_replaced": pv.replaced,
+		"redactions":         pv.redactions,
 	}
 	if ct := c.w.Header().Get("Content-Type"); ct != "" {
 		attrs["content_type"] = truncRunes(ct, 128)
 	}
-	if cut {
+	if pv.cut {
+		attrs["capture_state"] = "log_prefix"
 		attrs["body_truncated"] = true
 	}
 	c.emit(telemetry.Event{
@@ -304,8 +323,40 @@ func (s *Server) emitResponse(c *call, now time.Time, sessionID, ua, resource, r
 		Status:    status,
 		ProbeID:   probeID,
 		Attrs:     attrs,
-		Body:      body,
+		Body:      pv.text,
 	})
+}
+
+// captureState says how much of the request body the record holds. The read
+// outcome decides it; the preview only tells a complete body from a prefix
+// that the log limit cut.
+func (c *call) captureState(cut bool) string {
+	switch c.read {
+	case readNone:
+		return "none"
+	case readLimit:
+		return "body_limit_exceeded"
+	case readError:
+		return "read_error"
+	case readDone:
+		if cut {
+			return "log_prefix"
+		}
+		return "complete"
+	}
+	return "not_read"
+}
+
+// declaredBytes is the length the client claimed, when it claimed one: a
+// Content-Length greater than zero, or an explicit Content-Length of zero. A
+// chunked body, or no header at all, claims nothing.
+func (c *call) declaredBytes() (int64, bool) {
+	n := c.r.ContentLength
+	if n > 0 {
+		return n, true
+	}
+	_, sent := c.r.Header["Content-Length"]
+	return 0, n == 0 && sent
 }
 
 // logRawLimit is how many raw body bytes a log event needs: MaxLogBody plus
@@ -315,26 +366,44 @@ func (s *Server) logRawLimit() int {
 	return s.cfg.MaxLogBody + logRedactMargin + utf8.UTFMax
 }
 
-// logBody returns the redacted body for the log, at most MaxLogBody bytes, and
-// whether it was cut. b holds the first bytes of a body of total bytes; at
-// least logRawLimit of them when the body is that long. The raw body is cut
-// first so the redactor never scans a megabyte for a log line that keeps a
-// fraction of it.
-func (s *Server) logBody(b []byte, total int64) (string, bool) {
+// preview is the log text of one body and what the transform did to it.
+type preview struct {
+	text       string
+	cut        bool // text is a prefix of the redacted body
+	replaced   bool // invalid UTF-8 in the scanned part became U+FFFD
+	redactions int  // replacements the scrubber made in the scanned part
+}
+
+// preview turns a body into its log text, at most MaxLogBody bytes. b holds
+// the first bytes of a body of total bytes; at least logRawLimit of them when
+// the body is that long. The raw body is cut first, on a rune start, so the
+// redactor never scans a megabyte for a log line that keeps a fraction of it
+// and a cut rune is not counted as malformed. Invalid UTF-8 is replaced
+// before the redactor runs, and the limit applies to the final text.
+func (s *Server) preview(b []byte, total int64) preview {
 	limit := s.cfg.MaxLogBody
 	keep := limit + logRedactMargin
-	cut := total > int64(keep)
+	p := preview{cut: total > int64(keep)}
 	var raw string
-	if cut {
+	if p.cut {
 		raw = truncBytes(string(b[:min(len(b), s.logRawLimit())]), keep)
 	} else {
 		raw = string(b)
 	}
-	body := s.cfg.Redactor.Text(raw)
-	if len(body) > limit {
-		body, cut = truncBytes(body, limit), true
+	if !utf8.ValidString(raw) {
+		raw, p.replaced = strings.ToValidUTF8(raw, "�"), true
 	}
-	return body, cut
+	p.text, p.redactions = s.cfg.Redactor.TextCount(raw)
+	if len(p.text) > limit {
+		p.text, p.cut = truncBytes(p.text, limit), true
+	}
+	return p
+}
+
+// logBody returns the preview text and whether it was cut.
+func (s *Server) logBody(b []byte, total int64) (string, bool) {
+	p := s.preview(b, total)
+	return p.text, p.cut
 }
 
 func resultFor(status int) string {

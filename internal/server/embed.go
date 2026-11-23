@@ -88,7 +88,7 @@ type embedRequest struct {
 // field: "input" or, for the legacy Ollama call, "prompt".
 func (c *call) parseEmbed(field string) (*embedRequest, bool) {
 	s := c.s
-	raw, err := decodeObject(c.body)
+	raw, err := c.decodeBody()
 	if err != nil {
 		c.failParse(err)
 		return nil, false

@@ -37,7 +37,11 @@ var infoHeaders = map[string]bool{
 
 // Redactor strips credentials from headers and text. Credentials are replaced
 // by keyed fingerprints so reuse stays correlatable without storing the value.
-type Redactor struct{ key []byte }
+type Redactor struct {
+	key      []byte
+	replaced bool
+	epoch    string
+}
 
 // MinRedactorKey is the shortest key NewRedactor accepts as given.
 const MinRedactorKey = 32
@@ -45,22 +49,39 @@ const MinRedactorKey = 32
 // NewRedactor uses key for fingerprints. A key shorter than MinRedactorKey
 // would make fingerprints of short credentials brute-forceable, so it is
 // replaced by a random key (fingerprints then correlate only within this
-// process).
+// process). KeyReplaced reports which case happened.
 func NewRedactor(key []byte) *Redactor {
-	if len(key) < MinRedactorKey {
+	replaced := len(key) < MinRedactorKey
+	if replaced {
 		key = make([]byte, MinRedactorKey)
 		rand.Read(key) // never fails since Go 1.24
 	}
-	return &Redactor{key: append([]byte(nil), key...)}
+	r := &Redactor{key: append([]byte(nil), key...), replaced: replaced}
+	m := hmac.New(sha256.New, r.key)
+	m.Write([]byte("attackbox/fp-epoch"))
+	r.epoch = hex.EncodeToString(m.Sum(nil))[:8]
+	return r
 }
+
+// KeyReplaced reports whether NewRedactor discarded the key it was given.
+func (r *Redactor) KeyReplaced() bool { return r.replaced }
+
+// Epoch names the fingerprint key: 8 hex characters that are safe to log.
+// Fingerprints compare only between records of one epoch.
+func (r *Redactor) Epoch() string { return r.epoch }
 
 // Fingerprint is "hmac256:" plus the first 16 hex chars of HMAC-SHA256(key, v).
 func (r *Redactor) Fingerprint(v string) string {
-	if v == "" {
+	return r.FingerprintBytes([]byte(v))
+}
+
+// FingerprintBytes uses the same fingerprint format for an existing byte slice.
+func (r *Redactor) FingerprintBytes(v []byte) string {
+	if len(v) == 0 {
 		return ""
 	}
 	m := hmac.New(sha256.New, r.key)
-	m.Write([]byte(v))
+	m.Write(v)
 	return "hmac256:" + hex.EncodeToString(m.Sum(nil))[:16]
 }
 
@@ -140,6 +161,9 @@ func splitScheme(v string) (scheme, token string) {
 // secret.Scrub; each becomes a keyed fingerprint. Decoy canaries stay visible
 // so their reuse is detectable.
 func (r *Redactor) Text(s string) string { return secret.Scrub(s, r.Fingerprint) }
+
+// TextCount is Text plus the number of replacements the scrubber made.
+func (r *Redactor) TextCount(s string) (string, int) { return secret.ScrubCount(s, r.Fingerprint) }
 
 // truncate cuts s to at most n runes.
 func truncate(s string, n int) string {
