@@ -11,7 +11,7 @@ The default target is `https://127.0.0.1:8443`. Only HTTP or HTTPS origins with 
 
 Requests run in order. Each request has a 20-second deadline. The full run has a 120-second deadline. The largest request is 1,048,577 bytes. Each response is limited to 2 MiB plus one detection byte. Output contains hashes and lengths, not response bodies. The output file must not exist; it is created with mode `0600`.
 
-The check targets the OpenAI persona and model `qwen3:8b`. Other personas can omit the expected response ID header. A changed model list or request body limit requires a separate reviewed fixture change. Do not treat a failed check as a successful attack.
+The check targets the OpenAI persona. Use `-model` to select an advertised model. The default is `qwen3:8b`; the VPS profile uses `gpt-4o`. Other personas can omit the expected response ID header. A changed request body limit requires a separate fixture change. Do not treat a failed check as a successful attack.
 
 ## Cases and expected evidence
 
@@ -60,10 +60,10 @@ First confirm that the reviewed raw-evidence service and shipper are installed a
 Build a Linux binary from the reviewed candidate, then copy it to a temporary path on the host through the existing SSH access. Keep public ingress closed. Run it on that host:
 
 ```sh
-/tmp/attackbox-scenarios -target https://127.0.0.1:8443 -self-signed -run-id preflight-001 -output /tmp/attackbox-preflight-001.jsonl
+/tmp/attackbox-scenarios -target https://127.0.0.1:8443 -self-signed -proxy -model gpt-4o -run-id preflight-001 -output /tmp/attackbox-preflight-001.jsonl
 ```
 
-The default endpoint passes through the local proxy. Do not expose a new port for this check. Keep `/tmp/attackbox-preflight-001.jsonl` as the response manifest. A second run needs a new file and run ID. Remove the temporary binary after the check.
+The default endpoint passes through the local proxy. nginx rejects the encoded traversal with 400 and the oversized body with 413 before Go receives them. Use `-proxy` to check the expected nginx HTML rejections with no application request ID. These are edge-path results; verify their Docker journal records separately. Omit `-proxy` for a direct handler check. Run the full ten-case handler check through an SSH loopback forward to the existing internal bait address, with no public listener. Do not expose a new port for this check. Keep `/tmp/attackbox-preflight-001.jsonl` as the response manifest. A second run needs a new file and run ID. Remove the temporary binary after the check.
 
 Exit 0 means all response checks passed. A timeout, wrong status, missing server ID, invalid response envelope, incomplete SSE terminator, or response size limit returns exit 1. Configuration errors return exit 2. The command always writes `logging_verified: false`: only independent evidence checks can establish logging and delivery.
 
@@ -74,17 +74,17 @@ Exit 0 means all response checks passed. A timeout, wrong status, missing server
 Select the correct New Relic account and sensor. Find ordinary events for the run:
 
 ```sql
-FROM Log SELECT count(*), uniqueCount(request_id)
+FROM Log, Log_AttackEvidence SELECT count(*), uniqueCount(request_id)
 WHERE `service.name` = 'attackbox'
   AND sensor_id = 'REPLACE_SENSOR_ID'
   AND user_agent LIKE 'attackbox-synthetic-preflight-001-%'
 FACET stream SINCE 15 minutes ago LIMIT MAX
 ```
 
-Expect ten distinct request IDs across the full result. Transcripts and probe records apply only to inference cases; do not expect every stream for every request. Use the IDs in `/tmp/attackbox-preflight-001.jsonl` to check all ten, including errors and the oversized request. Substitute one ID below:
+For a direct handler run, expect ten distinct request IDs. With `-proxy`, expect eight application request IDs; inspect the two nginx rejections in the Docker journal view by edge ID and event time. Transcripts and probe records apply only to inference cases. Use `/tmp/attackbox-preflight-001.jsonl` to reconcile each case. Substitute an application request ID below:
 
 ```sql
-FROM Log SELECT *
+FROM Log, Log_AttackEvidence SELECT *
 WHERE `service.name` = 'attackbox'
   AND sensor_id = 'REPLACE_SENSOR_ID'
   AND request_id = 'REPLACE_LOG_REQUEST_ID'

@@ -178,8 +178,8 @@ alerts:
 
   - name: "AttackBox - Canary Credential Presented"
     type: NRQL
-    description: "A delivered synthetic credential was presented as a credential. History-only, echoed and undelivered values do not trigger. Enable after the scalar field is deployed and tested in this account."
-    enabled: false
+    description: "A delivered synthetic credential was presented as a credential. History-only, echoed and undelivered values do not trigger. Positive credential and negative history-only controls verified in account 0 on 2026-11-23."
+    enabled: true
     violation_time_limit_seconds: 3600
     nrql:
       query: "FROM Log, Log_AttackEvidence, Log_Security, Log_Operations SELECT count(*) WHERE sensor_id = 'srv-000000' AND stream = 'probe' AND action = 'decision' AND canary_credential_presented = 1"

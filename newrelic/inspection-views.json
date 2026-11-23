@@ -308,13 +308,16 @@
       "tableConfiguration": [
         "timestamp",
         "CONTAINER_NAME",
-        "logtype",
+        "MESSAGE.status",
+        "MESSAGE.request",
+        "MESSAGE.user_agent",
+        "MESSAGE.bait_request_id",
         "message"
       ],
       "timeRange": {
         "duration": 1800000
       },
-      "description": "Prepared native journal route: proxy access/TLS/parser logs and Docker daemon messages. Populates after paired deployment."
+      "description": "Native Docker journal route. JSON access fields use the MESSAGE prefix; plain diagnostics use message."
     }
   ]
 }

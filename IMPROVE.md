@@ -54,7 +54,6 @@ Effort: S = one bounded change; M = several related changes; L = a new subsystem
 | ID | Priority | Improvement | Effort | Risk | Confidence |
 |---|---|---|---|---|---|
 | I01 | P0 | Expose and verify the discovery profile | M | Medium | High |
-| I02 | P0 | Record evidence provenance and collection limits | M | Medium | High |
 | I04 | P1 | Separate passive responses from active probes | M | Medium | High |
 | I05 | P1 | Add coherent simulated task and resource state | L | High | High |
 | I06 | P1 | Make tool, JSON, and streaming behavior consistent | L | High | High |
@@ -67,6 +66,8 @@ Effort: S = one bounded change; M = several related changes; L = a new subsystem
 | I13 | P2 | Add isolated agent-protocol scenarios | L | High | High |
 | I14 | P2 | Evaluate optional language generation offline | M | High | High |
 
+I02 is implemented in `0ac3844` and deployed with `238b714`. The approved contract is in `/Users/rohit/attack-box/research/i02-evidence-provenance.md`. Proof is in `/Users/rohit/attack-box/reports/releases/20261123-readiness/acceptance.md`. References to I02 below name this completed dependency.
+
 ### I01 — Expose and verify the discovery profile
 
 **Evidence:** `/Users/rohit/attack-box/compose.yaml:60`, `/Users/rohit/attack-box/compose.yaml:193`, `/Users/rohit/attack-box/docker/nginx/nginx.conf:64`, and `/Users/rohit/attack-box/deploy/nftables/attackbox.nft`.
@@ -78,24 +79,6 @@ Use one consistent product version and model catalog per persona. The shared com
 **Accept when:** an independent test host reaches each intended API, receives the correct models and response format, and cannot reach management ports. The same deployed sandbox cannot initiate internet or metadata connections. Log the active ports, profile version, and observation interval. Syntax-only Compose tests do not meet this gate.
 
 Test IPv4 and IPv6 separately, including direct access that bypasses the proxy. Bind any forwarded identity or correlation metadata to the configured proxy peer, not to the whole container subnet. Validate the closed-ingress build first; opening public ingress is the final deployment action. Recovery uses a tested provider-console path.
-
-### I02 — Record provenance and collection limits
-
-**Evidence:** `/Users/rohit/attack-box/internal/telemetry/event.go`, `/Users/rohit/attack-box/internal/server/log.go:78`, `/Users/rohit/attack-box/internal/server/log.go:277`, and `/Users/rohit/attack-box/internal/shipper/record.go`.
-
-Add a versioned evidence contract. Each observation needs sensor ID, deployment ID, process boot ID, producer role, request ID, event time, ingest time, persona version, response-policy version, and redaction version. Keep attacker-declared identity separate from server-assigned identity. Do not accept provenance fields from request metadata.
-
-Record capture state explicitly: complete within the accepted limit, body limit exceeded, log prefix only, parse failure, unsupported content, sampled out, or queue loss. Record captured bytes separately from declared content length. Mark the full byte count as unknown when the server stops reading. The current oversized-request fingerprint covers the retained request prefix once the request-body limit is reached; do not label it a full original-payload hash.
-
-Keep separate fingerprints for the observed input bytes, redacted content, and normalized analysis representation. Use keyed hashes for sensitive input correlation. Record key epochs and transformation versions. A digest of redacted content proves consistency of that content, not authenticity of the request or sender. Shipper roles establish local producer identity, not integrity after host-root compromise.
-
-Record evidence stages separately: observed by the process, admitted to a queue, written to the socket, committed to the shipper queue, accepted by the remote API, and verified available for analysis. `/Users/rohit/attack-box/internal/telemetry/spool.go` uses a one-way protocol; a successful socket write does not acknowledge durable receipt. Do not claim end-to-end durability from the disk queue alone. If durable producer receipts are added, specify bounded retransmission, receiver acknowledgement after disk commit, and replay identity before changing the wire contract.
-
-Reconcile producer boot/sequence ranges and cumulative counters at each available stage. Reserve bounded health-report capacity separately from payload records. Counter reports can themselves be lost; after saturation followed by a crash, mark the unreconciled interval and missing count unknown. Never infer zero loss from the absence of a drop event. Use off-host receipt times and expected deployment manifests to detect gaps. Host-root compromise can forge local events, counters, keys, and heartbeats; external receipt proves receipt, not truth. Mark the affected interval suspect and retain already-received evidence outside the decoy's deletion authority.
-
-Use monotonic durations for local ordering and UTC times for cross-system comparison. Record clock quality and restart boundaries. Do not repair uncertain cross-host order by inventing timestamps. A rejected schema version must produce a protected aggregate rejection signal; it must not silently disappear from the denominator.
-
-**Accept when:** partial requests, invalid UTF-8, redaction expansion, chunked events, replayed delivery, and queue overflow preserve honest completeness flags where records survive. Saturation followed by producer termination before its next heartbeat produces an unknown-loss interval, not a zero-loss report. Unknown schema versions fail with a bounded reason. New attributes survive shipper validation without silent loss. Existing producer-role isolation tests remain green.
 
 ### I04 — Separate passive responses from active probes
 

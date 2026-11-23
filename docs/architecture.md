@@ -264,5 +264,9 @@ The proxy writes JSON access records to stdout and TLS/parser diagnostics to std
 
 Each access record includes a proxy request ID, client address, raw request line, response status, byte counts, timing and TLS fields. `bait_request_id` comes from the upstream response header, not a client-supplied header. It is empty for requests that nginx rejects before forwarding. Error records remain text. These records contain metadata; they do not contain a full rejected request body or raw TLS packets. Request lines can contain submitted credentials. Treat all fields as inert evidence.
 
-The prepared firewall pins the gVisor proxy to `172.30.0.3` and bait to `172.30.0.2`. It permits new proxy-to-bait TCP traffic on 8080 before denying other container-originated forwarding. Container-to-host TCP/UDP is denied. Link-scoped IPv6 neighbor discovery remains allowed. External proxy-port exceptions run after container denials. The Docker rules and provider firewall remain separate controls. The Falco health listener binds to `127.0.0.1` in bootstrap.
+The host firewall pins the gVisor proxy and bait to configured addresses. It permits new proxy connections to the bait on TCP 8080 and denies other container-originated forwarding. Docker and provider firewalls remain separate controls.
 
+
+### Native edge route identity
+
+The proxy writes access JSON and parser diagnostics to Docker journald. The Infrastructure agent reads the `docker` systemd journal route. Each project-managed route includes the trusted sensor and deployment IDs, so partition rules and saved views select it. JSON access fields use the New Relic `MESSAGE.*` prefix. This path captures rejection metadata, not raw bodies rejected by nginx. The Go evidence stream captures bounded application-level bytes separately.
