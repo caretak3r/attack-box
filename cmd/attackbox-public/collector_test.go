@@ -55,6 +55,7 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 			return
 		}
 		got <- &req
+		w.Header().Set("Content-Type", "application/x-protobuf")
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer mock.Close()
@@ -91,7 +92,8 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 		}
 	}()
 	for range 100 {
-		if _, err := net.DialTimeout("unix", cfg.socket, 100*time.Millisecond); err == nil {
+		if conn, err := net.DialTimeout("unix", cfg.socket, 100*time.Millisecond); err == nil {
+			_ = conn.Close()
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -102,10 +104,8 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 		t.Fatal(err)
 	}
 	addr := listener.Addr().String()
-	_ = listener.Close()
-	a, err := newApp(cfg, func() (net.Listener, error) {
-		return net.Listen("tcp4", addr)
-	})
+	defer listener.Close()
+	a, err := newApp(cfg, func() (net.Listener, error) { return listener, nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,8 +169,14 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 
 	seen := make(map[string]bool)
 	health := false
-	for len(got) > 0 {
-		req := <-got
+	expected := []string{"/v1/models", "/v1/chat/completions", "/v1/completions", "/openai/deployments/{deployment}/chat/completions"}
+	for !health || len(seen) < len(expected) {
+		var req *collector.ExportTraceServiceRequest
+		select {
+		case req = <-got:
+		case <-ctx.Done():
+			t.Fatalf("collector deadline: health=%t routes=%v", health, seen)
+		}
 		for _, r := range req.ResourceSpans {
 			for _, s := range r.ScopeSpans {
 				for _, span := range s.Spans {
@@ -213,10 +219,6 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 			}
 		}
 	}
-	if !health {
-		t.Error("missing health span")
-	}
-	expected := []string{"/v1/models", "/v1/chat/completions", "/v1/completions", "/openai/deployments/{deployment}/chat/completions"}
 	for _, route := range expected {
 		if !seen[route] {
 			t.Errorf("missing route %q", route)

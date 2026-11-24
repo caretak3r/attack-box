@@ -96,7 +96,10 @@ func TestGatewayHTTPSAndTracing(t *testing.T) {
 
 	ctx, stop := context.WithCancel(context.Background())
 	finished := make(chan error, 1)
-	go func() { finished <- a.run(ctx) }()
+	go func() {
+		defer close(finished)
+		finished <- a.run(ctx)
+	}()
 	defer func() {
 		stop()
 		if err := <-finished; err != nil {
@@ -214,10 +217,12 @@ func TestStartupRequiresTrustedPrerequisites(t *testing.T) {
 	cfg, _, _, dir := publicTestConfig(t)
 	cfg.socket = "/nonexistent.sock"
 	if _, err := newApp(cfg, func() (net.Listener, error) { return nil, nil }); err == nil {
+		t.Fatal("server admitted a missing collector socket")
 	}
 	cfg.socket = filepath.Join(dir, "otel.sock")
 	cfg.cert = "/nonexistent"
 	if _, err := newApp(cfg, func() (net.Listener, error) { return nil, nil }); err == nil {
+		t.Fatal("server admitted a missing certificate")
 	}
 }
 

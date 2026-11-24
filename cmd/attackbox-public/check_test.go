@@ -28,9 +28,9 @@ func TestHealthcheckValidatesCertificate(t *testing.T) {
 		_ = <-finished
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	probeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := healthcheck(ctx, cfg.cert, addr); err != nil {
+	if err := healthcheck(probeCtx, cfg.cert, addr); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -1,8 +1,6 @@
 package publicedge
 
 import (
-	"bytes"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -163,11 +161,11 @@ func TestGatewayReadObjectRejectsInvalid(t *testing.T) {
 }
 
 func TestGatewayReadObjectRejectsOversized(t *testing.T) {
-	req := httptest.NewRequest("POST", "/", io.NopCloser(bytes.NewReader(make([]byte, 65*1024))))
-	req.ContentLength = 65 * 1024
-	req.Body = http.MaxBytesReader(httptest.NewRecorder(), req.Body, gatewayBodyLimit)
-	_, status := gatewayReadObject(req)
-	if status != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d", status)
+	req := httptest.NewRequest("POST", "/v1/completions", strings.NewReader(`{"prompt":"`+strings.Repeat("x", gatewayBodyLimit)+`"}`))
+	req.ContentLength = -1
+	w := httptest.NewRecorder()
+	NewGateway(nil).ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for an oversized chunked body, got %d", w.Code)
 	}
 }

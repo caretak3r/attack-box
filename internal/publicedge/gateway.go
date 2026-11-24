@@ -1,8 +1,10 @@
 package publicedge
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -166,6 +168,10 @@ func gatewayReadObject(r *http.Request) (map[string]json.RawMessage, int) {
 			return obj, 0
 		}
 	}
+	var limit *http.MaxBytesError
+	if errors.As(err, &limit) {
+		return nil, http.StatusRequestEntityTooLarge
+	}
 	return nil, http.StatusBadRequest
 }
 
@@ -222,24 +228,27 @@ func gatewayCompletion(chat bool) http.HandlerFunc {
 }
 
 func gatewayArray(raw json.RawMessage) bool {
-	var arr []json.RawMessage
-	return json.Unmarshal(raw, &arr) == nil && len(arr) > 0
+	raw = bytes.TrimSpace(raw)
+	return len(raw) > 2 && raw[0] == '[' && len(bytes.TrimSpace(raw[1:len(raw)-1])) != 0
 }
 
 func gatewayText(raw json.RawMessage) bool {
-	var s string
-	return json.Unmarshal(raw, &s) == nil && s != ""
+	raw = bytes.TrimSpace(raw)
+	return len(raw) > 2 && raw[0] == '"'
 }
 
 func gatewayStream(raw json.RawMessage) (bool, bool) {
 	if raw == nil {
 		return false, true
 	}
-	var b bool
-	if json.Unmarshal(raw, &b) == nil {
-		return b, true
+	switch string(bytes.TrimSpace(raw)) {
+	case "true":
+		return true, true
+	case "false":
+		return false, true
+	default:
+		return false, false
 	}
-	return false, false
 }
 
 func gatewayModelMatches(raw json.RawMessage) bool {
