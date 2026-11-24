@@ -1,8 +1,8 @@
 # Overnight findings — 24 November 2026
 
-State: **running**. Samples: **3**. Latest observation: **2026-11-24T03:08:18Z**.
+State: **running**. Samples: **4**. Latest observation: **2026-11-24T03:13:19Z**.
 
-Observed window: 2026-11-24T02:53:16Z to 2026-11-24T03:08:18Z. Planned final collection: 05:58 Eastern / 10:58 UTC.
+Observed window: 2026-11-24T02:53:16Z to 2026-11-24T03:13:19Z. Planned final collection: 05:58 Eastern / 10:58 UTC.
 
 Public ingress was closed at setup. This watcher does not re-check the provider firewall. These counts describe activity, not confirmed attacks. Private-source requests and blocked egress can be normal service traffic. Synthetic labels can be forged.
 
@@ -14,20 +14,20 @@ Only numeric aggregates and fixed labels are published. Raw requests, responses,
 
 The first sample includes a five-minute baseline. Failed-service counts are sample occurrences. Falco parse errors can repeat old tail records; they are not unique events.
 
-- `failed_service_sample_occurrences`: 3
-- `falco_time_unparsed`: 3
-- `falco_unparsed`: 3
-- `http_private_source`: 60
-- `http_status:200`: 60
-- `http_total`: 60
-- `kernel:OUTPUT-DROP:`: 559
-- `route:/v1/models`: 60
+- `failed_service_sample_occurrences`: 4
+- `falco_time_unparsed`: 4
+- `falco_unparsed`: 4
+- `http_private_source`: 80
+- `http_status:200`: 80
+- `http_total`: 80
+- `kernel:OUTPUT-DROP:`: 742
+- `route:/v1/models`: 80
 
 ## Collection warnings
 
 Counts below are occurrences across samples.
 
-- `falco_1000_row_tail_bound`: 3
+- `falco_1000_row_tail_bound`: 4
 
 ## Latest health and telemetry snapshot
 
@@ -35,7 +35,7 @@ Counters below are cumulative source counters, not window totals. Component valu
 
 | Metric | Value |
 | --- | ---: |
-| `MemAvailable_KiB` | 7.14536e+06 |
+| `MemAvailable_KiB` | 7.145308e+06 |
 | `MemTotal_KiB` | 8.12576e+06 |
 | `SwapFree_KiB` | 8.388604e+06 |
 | `attackbox_component_observed{component="attackbox-bait"}` | 1 |
@@ -92,15 +92,15 @@ Counters below are cumulative source counters, not window totals. Component valu
 | `attackbox_container_restarts{component="attackbox-proxy"}` | 0 |
 | `attackbox_container_runtime_approved{component="attackbox-bait"}` | 1 |
 | `attackbox_container_runtime_approved{component="attackbox-proxy"}` | 1 |
-| `attackbox_inventory_snapshot_age_seconds` | 23.874254623 |
+| `attackbox_inventory_snapshot_age_seconds` | 22.699246712 |
 | `attackbox_inventory_snapshot_valid` | 1 |
-| `egress_cursor_age_seconds` | 0 |
-| `falco_cursor_age_seconds` | 33176 |
-| `falco_source_age_seconds` | 33176 |
-| `load_1m` | 0.37 |
+| `egress_cursor_age_seconds` | 1 |
+| `falco_cursor_age_seconds` | 33477 |
+| `falco_source_age_seconds` | 33477 |
+| `load_1m` | 0.05 |
 | `otelcol_exporter_queue_capacity` | 3.3554432e+07 |
-| `otelcol_exporter_queue_size` | 1403 |
-| `otelcol_exporter_sent_spans` | 32076 |
+| `otelcol_exporter_queue_size` | 0 |
+| `otelcol_exporter_sent_spans` | 32366 |
 | `otelcol_receiver_refused_spans` | 0 |
 | `root_disk_used_percent` | 12 |
 | `shipper_checkpoint_age_seconds` | 0 |
