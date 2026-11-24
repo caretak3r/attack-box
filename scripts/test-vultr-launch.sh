@@ -126,7 +126,7 @@ EOF
 
 # run [VAR=value ...] -- ARGS...: run the sandbox copy of the script with a clean environment; sets OUT and RC.
 run() {
-  local envs=(APPROVE="$(git -C "$T" rev-parse HEAD)")
+  local envs=(APPROVE="$(git -C "$T" rev-parse HEAD)" NEW_RELIC_ACCOUNT_ID=1)
   while [ "$1" != -- ]; do envs+=("$1"); shift; done
   shift
   OUT=$(cd "$T" && env -i HOME="$T/home" PATH="$T/bin:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" \

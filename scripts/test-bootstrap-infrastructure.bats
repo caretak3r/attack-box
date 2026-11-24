@@ -67,6 +67,7 @@ SH
   printf '#!/bin/sh\nexit 0\n' >"$FIXTURE/bin/chown"
   chmod +x "$FIXTURE/bin/"* "$FIXTURE/usr/local/sbin/attackbox-deploy" "$FIXTURE/usr/bin/newrelic-infra"
   export PATH="$FIXTURE/bin:$PATH"
+  export NEW_RELIC_ACCOUNT_ID=1
   export SUBJECT="$FIXTURE/scripts/bootstrap-infrastructure.sh"
 }
 
