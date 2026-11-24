@@ -52,6 +52,8 @@ Captured text is untrusted data at every boundary. Do not render it as active HT
 
 ## Current response path
 
+An optional operator-side Go watcher takes bounded read-only SSH snapshots and writes a local overnight report. It is separate from the production telemetry path and does not run on the VPS or verify New Relic receipt. Procedure and limits: `/Users/rohit/attack-box/docs/overnight-watch.md`.
+
 The HTTP layer parses bounded requests, selects the persona, derives session context, and invokes the responder. The server takes an admission tick when a request arrives, before it reads the body. The responder attributes a reply only to a probe response that the server fully sent before that admission. It scores only new material. In all other cases it records an `attribution` observation and does not guess. The responder also records declarations and classifies intent. After three issued questions it can release one fake payout. Other branches select an intent probe or the registration sequence: model question, harness question, assigned behavioral probe, then a neutral completion. Intent probes can continue after payout.
 
 Probe output is assistant text. The code does not implement a real tool executor. Accepting tool definitions does not establish a coherent tool-call lifecycle. General requests can receive registration questions. The current classifier uses fixed keyword rules. These are known response-quality limits, not proof of attacker intent.
@@ -282,3 +284,7 @@ The host firewall pins the gVisor proxy and bait to configured addresses. It per
 ### Native edge route identity
 
 The proxy writes access JSON and parser diagnostics to Docker journald. The Infrastructure agent reads the `docker` systemd journal route. Each project-managed route includes the trusted sensor and deployment IDs, so partition rules and saved views select it. JSON access fields use the New Relic `MESSAGE.*` prefix. This path captures rejection metadata, not raw bodies rejected by nginx. The Go evidence stream captures bounded application-level bytes separately.
+
+### Overnight findings publication
+
+The local Go watcher reads bounded SSH snapshots from the host. A second local Go process reads the private sample file and atomic report. It renders fixed labels and numeric aggregates into a separate findings-only Git repository. Only that repository is committed and pushed. Raw evidence remains on the existing private collection paths. The publisher checks staged paths and commit history, drops inherited Git overrides, retries failed pushes and stops after the final report or at the watch deadline. This path requires the operator Mac and GitHub access. It does not verify New Relic receipt or change public ingress. Setup, limits and verification are in `/Users/rohit/attack-box/docs/overnight-watch.md`.

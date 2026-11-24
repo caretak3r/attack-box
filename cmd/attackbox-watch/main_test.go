@@ -77,9 +77,10 @@ func TestKernelPrefixesAndDockerIdentity(t *testing.T) {
 	from := time.Unix(100, 0)
 	until := from.Add(time.Minute)
 	data := "@@kernel\n" + journal(from.Add(time.Second), "METADATA-BLOCK: IN=x") + journal(from.Add(time.Second), "METADATA-BLOCK-OUT: OUT=x")
+	data += journal(from.Add(time.Second), "CONTAINER-EGRESS-BLOCK: IN=x")
 	data += "@@proxy\n" + strings.ReplaceAll(journal(from.Add(time.Second), `{"status":200,"client_ip":"192.0.2.1","request":"GET / HTTP/1.1"}`), `"CONTAINER_NAME":"attackbox-proxy"`, `"CONTAINER_NAME":"untrusted-container"`) + "@@end\n"
 	s := parse([]byte(data), from, until)
-	if s.Counts["kernel:METADATA-BLOCK:"] != 1 || s.Counts["kernel:METADATA-BLOCK-OUT:"] != 1 || s.Counts["http_total"] != 0 || s.Counts["docker_non_proxy_rows"] != 1 {
+	if s.Counts["kernel:METADATA-BLOCK:"] != 1 || s.Counts["kernel:METADATA-BLOCK-OUT:"] != 1 || s.Counts["kernel:CONTAINER-EGRESS-BLOCK:"] != 1 || s.Counts["http_total"] != 0 || s.Counts["docker_non_proxy_rows"] != 1 {
 		t.Fatalf("prefix or identity: %+v", s.Counts)
 	}
 }

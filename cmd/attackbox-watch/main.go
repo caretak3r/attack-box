@@ -88,7 +88,15 @@ func parse(data []byte, from, until time.Time) sample {
 	for scan.Scan() {
 		line := scan.Text()
 		if strings.HasPrefix(line, "@@") {
-			section = strings.TrimPrefix(line, "@@")
+			marker := strings.TrimPrefix(line, "@@")
+			switch marker {
+			case "memory", "load", "disk", "metrics", "otel", "failed", "files", "proxy", "kernel", "falco", "end",
+				"failure_memory", "failure_load", "failure_disk", "failure_metrics", "failure_otel", "failure_failed", "failure_files", "failure_proxy", "failure_kernel", "failure_falco":
+				section = marker
+			default:
+				s.Counts["unknown_section_marker"]++
+				continue
+			}
 			if strings.HasPrefix(section, "failure_") {
 				s.Warnings = append(s.Warnings, section)
 			}
@@ -178,7 +186,7 @@ func parse(data []byte, from, until time.Time) sample {
 			}
 			msg := stringValue(j["MESSAGE"])
 			if section == "kernel" {
-				for _, prefix := range []string{"OUTPUT-DROP:", "CONTAINER-EGRESS:", "METADATA-BLOCK:", "METADATA-BLOCK-OUT:"} {
+				for _, prefix := range []string{"OUTPUT-DROP:", "CONTAINER-EGRESS-BLOCK:", "METADATA-BLOCK:", "METADATA-BLOCK-OUT:"} {
 					if strings.Contains(msg, prefix) {
 						s.Counts["kernel:"+prefix]++
 					}
@@ -322,6 +330,7 @@ func report(out string, samples []sample, start, deadline time.Time, state strin
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Overnight watch\n\nState: %s. Start: %s. Deadline: %s. Samples: %d.\n\n", state, start.Format(time.RFC3339), deadline.Format(time.RFC3339), len(samples))
 	b.WriteString("Read-only SSH observations of attackbox. No probes, remediation, attacker contact or VPS configuration changes. New Relic receipt and provider firewall are not checked by this watcher. Counts describe observed activity, not confirmed attacks. Synthetic labels can be forged. Public ingress was closed at setup; re-check before interpreting silence.\n\nCollection runs on the operator Mac and requires power and connectivity. Gaps, capped journals and source rotation can hide events. A stale idle-source cursor alone does not prove failure. Raw paths, query strings, headers and payloads are not stored in this report.\n\n## Activity totals\n\n")
+	b.WriteString("The first snapshot includes a five-minute baseline before the start time. Failed-unit counts are sample occurrences. Falco parse-error counts can include repeated reads of old tail records; they are not unique attack events.\n\n")
 	keys := make([]string, 0, len(counts))
 	for k := range counts {
 		keys = append(keys, k)
@@ -387,6 +396,9 @@ func run() error {
 	for {
 		until := time.Now().UTC().Truncate(time.Second)
 		s := collect(from, until)
+		if len(samples) > 0 && until.Sub(from) > *interval+time.Minute {
+			s.Warnings = append(s.Warnings, "collection_gap_exceeds_interval")
+		}
 		samples = append(samples, s)
 		if err := json.NewEncoder(f).Encode(s); err != nil {
 			return err
