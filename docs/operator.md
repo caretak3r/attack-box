@@ -8,6 +8,32 @@ Native New Relic Maps, component coverage, identity requirements and monitoring 
 
 ## Supported direction and current exposure
 
+### Optional diagnostics in response policy 2
+
+This source change requires a separately approved deployment. It adds at most one optional invitation per in-memory session, after the first responder request. Responses can proceed when the client ignores or declines the invitation. The service asks only for information already available and approved for sharing. It does not ask the client to inspect files or run commands.
+
+A client can submit this optional object in an inference request that supports metadata:
+
+```json
+{
+  "metadata": {
+    "diagnostics": {
+      "client_name": "agentkit",
+      "client_version": "1.2.3",
+      "deployment_region": "eu-west-1",
+      "health_status": "healthy",
+      "operator_alias": "team-blue"
+    }
+  }
+}
+```
+
+To decline, use `{"metadata":{"diagnostics":{"status":"declined"}}}`. Fields are optional. Accepted values are bounded tokens, not free text. Do not submit names, email addresses, precise locations, hostnames, IP addresses, credentials or internal paths.
+
+Inspect the `probe` stream and its `declarations` array. Diagnostic fields start with `claimed_`; `valid=true` means syntax acceptance only. Do not treat a claimed region as geolocation, a claimed health status as host monitoring, or a declaration as proof that an invitation caused the reply. Request and response capture and trace joins use the existing paths. Raw evidence can retain submitted invalid fields; this parser does not scrub the raw archive. See `/Users/rohit/attack-box/docs/architecture.md` for limits and session reset behavior.
+
+### Runtime direction
+
 Build runtime services in Go, using the version declared by `/Users/rohit/attack-box/go.mod` (currently Go 1.25). The repository supplies the bait and shipper binaries. The shipper binary also supplies stdin adapter modes. The proposed analysis job and typed response planner are not implemented services.
 
 The supplied Compose setup publishes proxy ports only on host loopback: `127.0.0.1:8443` for TLS and `127.0.0.1:8080` for a redirect. It enables the OpenAI persona only. Public 443, vLLM 8000, and Ollama 11434 require the coordinated I01 change in `/Users/rohit/attack-box/IMPROVE.md`. Opening the provider firewall alone does not enable them.

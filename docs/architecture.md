@@ -60,6 +60,18 @@ Selected timeout probes use silent holds or idle frames. Ordinary suspicious req
 
 Source: `/Users/rohit/attack-box/internal/responder/responder.go`, `/Users/rohit/attack-box/internal/responder/probes.go`, `/Users/rohit/attack-box/internal/server/server.go`, and `/Users/rohit/attack-box/cmd/attackbox/main.go`.
 
+### Optional diagnostic claims
+
+Response policy 2 adds one optional diagnostic invitation per in-memory session. It can appear from the second responder request, on a harness-registration or intent response. It does not add diagnostic text to error, hold, or behavioral probes. The invitation is added before issuance hashes and response capture. An attempted invitation consumes the allowance even if delivery fails. A new session after expiry, eviction, identity change or restart has a new allowance.
+
+The client can ignore the invitation or send `metadata.diagnostics.status` as `declined`. A decline suppresses the other diagnostic fields on that request. The existing `metadata.status=identification-declined` also suppresses invitations. A valid diagnostic claim suppresses further invitations in the session. None of these actions changes permissions or blocks the response sequence. Model, harness and operator-alias registration text also permits omission.
+
+Only five string fields in `metadata.diagnostics` are accepted: `client_name`, `client_version`, `deployment_region`, `health_status`, and `operator_alias`. Values contain 1–64 ASCII letters, digits, hyphens or underscores; only versions can also contain dots. IP literals are rejected. Health values are `healthy`, `degraded`, `unavailable` or `unknown`. Unknown keys, nested values, invalid tokens and values changed by secret scrubbing are not promoted into diagnostic declarations. These checks do not establish that an arbitrary token is non-personal or true.
+
+Accepted values use the existing declaration envelope with `claimed_` field prefixes. A decline uses `claimed_diagnostics_status`. `valid=true` means that syntax passed; it does not verify an owner, region, host condition or response to a particular invitation. These are client claims, including when supplied before any invitation. Existing strict probe attribution remains separate. Values use the existing declaration count limits and never become metric dimensions or span attributes. No command, file inspection, network request or client tool call is generated.
+
+The raw evidence route still retains submitted bytes within its existing limits, including fields rejected by this parser. Diagnostic validation is not raw-log redaction. Source: `/Users/rohit/attack-box/internal/responder/diagnostics.go`.
+
 ## Probe issuance and reply attribution
 
 Each session holds a bounded registry of issuance records. One record describes one probe response that the server chose for one request. It stores the session, probe ID, probe request ID, issue time, expiry, expected reply channel, delivery state, and at most one reply request ID. It stores digests, not text: the response digest, the digest of the exact bytes sent, a rolling digest of the probe request history, and digests of standing metadata. For a JSON-mode response of 4 KiB or less, it also keeps the wrapped text. The session keeps one bounded snapshot of the indirect-injection gate text. A newer indirect-injection gate supersedes the older one.

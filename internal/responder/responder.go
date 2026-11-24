@@ -137,7 +137,7 @@ func (r *Responder) Decide(key string, req Request) Decision {
 	r.record(sess, decls)
 	d.Class = class
 
-	p := r.next(sess, d.Class.Task, d.Declarations)
+	p := inviteDiagnostics(sess, r.next(sess, d.Class.Task, d.Declarations), d.Declarations)
 	if p.Question() {
 		sess.Questions++
 	}
@@ -242,6 +242,7 @@ func (r *Responder) declarations(req Request, now time.Time) []Declaration {
 		}
 	}
 	add("user", req.User, true)
+	out = append(out, r.diagnosticDeclarations(md, now)...)
 	return out
 }
 

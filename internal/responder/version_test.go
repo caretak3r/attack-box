@@ -10,6 +10,7 @@ import (
 // policyDigests maps PolicyVersion to the digest of policyDigest's output.
 var policyDigests = map[int]string{
 	1: "d7a0eccd3e00e36c85c036bd69f49a4f11c6043fca52bebcbb4e0fd97eca9a2c",
+	2: "3656a670b01da86f4852df25cea222c42e02b6496490d41f85d3e964f12a9db0",
 }
 
 // policyDigest hashes what the policy writes for fixed inputs: every probe
@@ -41,6 +42,7 @@ func policyDigest(t *testing.T) string {
 	}
 	put("payout", PayoutProbe(sess))
 	put("completion", CompletionProbe(sess))
+	put("diagnostics/invitation", diagnosticInvitation)
 
 	for _, rl := range rules {
 		for _, term := range rl.terms {

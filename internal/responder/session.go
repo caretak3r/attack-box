@@ -67,13 +67,14 @@ type Session struct {
 	// session never stalls the store.
 	LastSeen time.Time
 
-	Requests     int
-	Questions    int
-	Gate         int
-	InvalidModel int
-	Paid         bool
-	Declarations []Declaration
-	ProbeHistory []string
+	Requests        int
+	Questions       int
+	Gate            int
+	InvalidModel    int
+	Paid            bool
+	Declarations    []Declaration
+	ProbeHistory    []string
+	diagnosticsDone bool // Invitation attempted, valid claim supplied, or declined.
 
 	// Reply attribution, all bounded (see issuance.go): the newest probe
 	// issuances, digests of messages already seen, and per-canary delivery.
