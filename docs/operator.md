@@ -169,7 +169,7 @@ sudo bash /opt/attackbox-src/scripts/deploy-ubuntu.sh --verify
 
 With no mode flag the script performs preflight. `--dry-run` reports proposed setup actions; it is not a runtime rehearsal. `--apply` installs dependencies, users, firewall policy, gVisor, service units, container artifacts, and binaries. It builds before applying the final restrictive egress policy. `--refresh-sets` refreshes allowed endpoint addresses; stale entries remain until ruleset reload or reboot. The script installs its refresh entry point at `/usr/local/sbin/attackbox-deploy`.
 
-The installer creates the redaction secret and a self-signed TLS certificate if missing. It preserves existing files. Container secret files under `/opt/attackbox/secrets` must be owned by UID/GID 65532 with mode 0400. Local Compose file-secret ownership settings do not replace host file ownership. The self-signed certificate is suitable for private validation; a public TLS profile needs an explicit certificate provisioning and renewal procedure that preserves the egress boundary.
+The installer creates a redaction secret and a self-signed TLS certificate for private checks. It preserves a complete existing key and certificate pair. The host files under `/opt/attackbox/secrets` need owner `65532:65532` and mode `0400`. Compose file-secret settings do not replace host permissions.
 
 The runtime files are `/opt/attackbox/compose.yaml` and `/opt/attackbox/compose.gvisor.yaml`. The host binary is `/usr/local/bin/attackbox-shipper`. Bait runs in its container. Both containers use runsc; verify its configured host-UDS support and the bait socket from the real deployed runtime.
 
@@ -182,6 +182,29 @@ The runtime files are `/opt/attackbox/compose.yaml` and `/opt/attackbox/compose.
 | `/var/lib/attackbox-shipper/queue` | Owner `abx-ship`, 0700 | Queue segments, checkpoint, and quarantined data |
 
 A read-only socket mount does not prohibit connection or writes through the socket. Peer credentials and shipper validation enforce producer access.
+
+### Use a trusted certificate with DuckDNS
+
+Use the operator Mac for [DNS-01 validation](https://letsencrypt.org/docs/challenge-types/#dns-01-challenge). The DuckDNS token and the ACME account key stay off the decoy. The TLS private key stays on the VPS. No public listener or firewall change is necessary.
+
+1. Register a dedicated hostname at [DuckDNS](https://www.duckdns.org/about.jsp). Set its A record to the VPS IPv4 address. DuckDNS shares [one TXT record](https://www.duckdns.org/spec.jsp) across the hostname and its descendants. Do not use that record for another service.
+2. On the Mac, install lego 5 with `brew install lego`. Save the DuckDNS account token at the hidden prompt:
+
+   ```sh
+   security add-generic-password -a "$(id -un)" -s attackbox-duckdns -w
+   ```
+
+3. Read the [Let's Encrypt Subscriber Agreement](https://letsencrypt.org/repository/). If you accept it, run the command below from the checkout. Replace `your-label` with your registered label. The certificate makes this name public in Certificate Transparency logs.
+
+   ```sh
+   LEGO_ACCEPT_TOS=true bash scripts/duckdns-tls.sh your-label.duckdns.org
+   ```
+
+4. Schedule `bash scripts/duckdns-tls.sh your-label.duckdns.org` daily on the Mac with `launchd`. Use absolute paths in the job. Include Homebrew in `PATH`. If you copy the helpers outside the checkout, set `VULTR_STATE_DIR` to the launcher's state directory. Keep `duckdns-tls.sh`, `install-proxy-chain.sh`, and `vultr-launch.sh` together.
+
+The helper installs only the public chain. It restarts only nginx when the served chain needs to change. It checks the hostname, system trust, and leaf fingerprint on `127.0.0.1:8443`. If the new chain fails that check, it restores the previous certificate. An unchanged chain needs no restart.
+
+Renewal needs the operator's login session, an accessible Keychain, and pinned SSH access. After VPS lockdown, use an approved management path for certificate delivery. Do not reopen SSH for renewal.
 
 ## Private checks and public-exposure gate
 
