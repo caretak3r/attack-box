@@ -15,7 +15,7 @@ bind=9.9.9.9
 sequence=0
 commit=0123456789012345678901234567890123456789
 sha=0123456789012345678901234567890123456789012345678901234567890123
-ssh='{"id":81,"ip_type":"v4","action":"accept","protocol":"tcp","port":"22","subnet":"192.0.2.10","subnet_size":32,"source":"","notes":"bootstrap ssh; lockdown removes it"}'
+ssh='{"id":81,"ip_type":"v4","type":"v4","direction":"in","loadbalancer_id":"","action":"accept","protocol":"tcp","port":"22","subnet":"192.0.2.10","subnet_size":32,"source":"192.0.2.10/32","notes":"bootstrap ssh; lockdown removes it"}'
 new_case() {
   case_dir=$root/$1
   mkdir -m 700 -- "$case_dir"
@@ -42,10 +42,18 @@ api() {
       esac
       jq -cn --arg ip "$ip" --arg fw "$attached" '{instance:{id:"instance-1", main_ip:$ip, firewall_group_id:$fw}}' ;;
     'GET /firewalls/fw-1')
-      size=$(jq length "$inventory") || return 1
-      if [[ $fault == shared ]]; then members=2; fi
-      if [[ $fault == countdrift ]]; then size=$((size+1)); fi
-      jq -cn --argjson m "$members" --argjson n "$size" '{firewall_group:{id:"fw-1",instance_count:$m,rule_count:$n}}' ;;
+      if [[ $fault == countdrift ]]; then
+        printf '%s\n' '{"firewall_group":{"id":"fw-1","rule_count":2}}'
+      else
+        printf '%s\n' '{"firewall_group":{"id":"fw-1"}}'
+      fi ;;
+    'GET /instances?per_page=500')
+      result='{"instances":[{"id":"instance-1","firewall_group_id":"fw-1"}],"meta":{"total":1,"links":{"prev":"","next":""}}}'
+      case $fault in
+        shared) jq '.instances += [{id:"other",firewall_group_id:"fw-1"}] | .meta.total=2' <<<"$result" ;;
+        unseenattachment) jq '.meta.links.next="cursor"' <<<"$result" ;;
+        *) printf '%s\n' "$result" ;;
+      esac ;;
     'GET /firewalls/fw-1/rules?per_page=500')
       result=$(jq -c '{firewall_rules:., meta:{total:length,links:{prev:"",next:""}}}' "$inventory") || return 1
       case $fault in
@@ -69,7 +77,7 @@ api() {
       printf '%s\n' "$body" >>"$posts"
       jq -e '.phase == "intent" and .rule_id == null' "$journal" >/dev/null || return 1
       if [[ $fault == noresponse ]]; then return 1; fi
-      change_rules --argjson body "$body" '. + [($body + {id:93,action:"accept"})]' || return 1
+      change_rules --argjson body "$body" '. + [($body + {id:93,action:"accept",direction:"in",type:"v4",loadbalancer_id:"",source:"0.0.0.0/0"})]' || return 1
       case $fault in
         lost|lostoffline) return 1 ;;
         wrongid) printf '%s\n' '{"firewall_rule":{"id":96}}' ;;
@@ -124,13 +132,14 @@ reject open_case 443 82
 reject open_case 443 81 192.0.2.11/32
 no_write
 
-for scenario in wrongip wrongfw shared countdrift missingmeta truncated nextpage prevpage dupkey multijson prepostdrift; do
+for scenario in wrongip wrongfw shared unseenattachment countdrift missingmeta truncated nextpage prevpage dupkey multijson prepostdrift; do
   new_case "$scenario"; fault=$scenario
   reject open_case; no_write
 done
 for drift in \
   '[]' '.+[.[0]]' '.[0].source="alias"' '.[0].id="81"' '.[0].id=0' '.[0].subnet_size=24' \
   '.[0].notes=""' '.[0].protocol="udp"' '.[0].action="drop"' '.[0].ip_type="v6"' \
+  '.[0].direction="out"' '.[0].type="v6"' '.[0].loadbalancer_id="other"' \
   '.+[ (.[0] | .id=94 | .port="443" | .subnet="0.0.0.0" | .subnet_size=0 | .notes="elsewhere") ]'; do
   new_case "drift-$((++sequence))"
   change_rules "$drift"; reject open_case; no_write

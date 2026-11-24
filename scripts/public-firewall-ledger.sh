@@ -72,6 +72,12 @@ def parse(text):
 def rid(value):
     return type(value) is int and 0 < value <= 9007199254740991
 
+def complete(reply, name):
+    rows, meta = reply[name], reply["meta"]
+    require(type(rows) is list and len(rows) <= 500 and type(meta["total"]) is int and
+            meta["total"] == len(rows) and meta["links"]["next"] == meta["links"]["prev"] == "")
+    return rows
+
 def check_state(s):
     require(set(s) == set("version instance firewall ip commit bundle_sha token ssh_id management phase rule_id".split()))
     require(type(s["version"]) is int and s["version"] == 2)
@@ -120,19 +126,24 @@ def check():
                 (s["instance"], s["firewall"], s["ip"]))
     elif op == "group":
         row = reply["firewall_group"]
-        require(row["id"] == s["firewall"] and type(row["instance_count"]) is int and
-                row["instance_count"] == 1 and type(row["rule_count"]) is int and
-                row["rule_count"] in (1, 2))
-        print(row["rule_count"])
+        require(row["id"] == s["firewall"])
+        if "instance_count" in row:
+            require(type(row["instance_count"]) is int and row["instance_count"] == 1)
+        if "rule_count" in row:
+            require(type(row["rule_count"]) is int and row["rule_count"] in (1, 2))
+        print(row.get("rule_count", 0))
+    elif op == "attachments":
+        rows = complete(reply, "instances")
+        ids = [r["id"] for r in rows]
+        require(all(type(i) is str and i for i in ids) and len(set(ids)) == len(ids))
+        require([r["id"] for r in rows if r["firewall_group_id"] == s["firewall"]] == [s["instance"]])
     elif op == "post":
         n = reply["firewall_rule"]["id"]
         require(rid(n))  # Record even a conflicting SSH ID; inventory will forbid DELETE.
         print(n)
     elif op == "rules":
-        rows, meta = reply["firewall_rules"], reply["meta"]
-        require(type(rows) is list and type(meta["total"]) is int and
-                meta["total"] == len(rows) == int(args[1]) and
-                meta["links"]["next"] == meta["links"]["prev"] == "")
+        rows = complete(reply, "firewall_rules")
+        require(len(rows) in (1, 2) and int(args[1]) in (0, len(rows)))
         ssh = dict(public, action="accept", id=s["ssh_id"], port="22",
                    subnet=s["management"].split("/")[0], subnet_size=32,
                    notes="bootstrap ssh; lockdown removes it")
@@ -140,6 +151,11 @@ def check():
         for row in rows:
             n = row["id"]
             require(rid(n) and type(row["subnet_size"]) is int)
+            require(row.pop("direction", "in") == "in" and row.pop("type", "v4") == "v4" and
+                    row.pop("loadbalancer_id", "") == "")
+            cidr = s["management"] if n == s["ssh_id"] else "0.0.0.0/0"
+            require(row["source"] in ("", cidr))
+            row["source"] = ""
             if row == ssh:
                 require(not found_ssh)
                 found_ssh = True
@@ -165,6 +181,7 @@ _public_fw_snapshot() {
   local state=$1 instance=$2 fw=$3 count
   api GET "/instances/$instance" | _public_fw_check instance "$state" || return 1
   count=$(api GET "/firewalls/$fw" | _public_fw_check group "$state") || return 1
+  api GET '/instances?per_page=500' | _public_fw_check attachments "$state" || return 1
   api GET "/firewalls/$fw/rules?per_page=500" | _public_fw_check rules "$state" "$count"
 }
 
