@@ -1,18 +1,69 @@
-# Overnight findings — 24 November 2026
+# Security watch debrief — 24 November 2026
 
-State: **running**. Samples: **4**. Latest observation: **2026-11-24T03:13:19Z**.
+**Watch: running · 4 snapshots · last observation Nov 23 22:13:19 EST / 03:13:19 UTC**
 
-Observed window: 2026-11-24T02:53:16Z to 2026-11-24T03:13:19Z. Planned final collection: 05:58 Eastern / 10:58 UTC.
+Coverage: Nov 23 21:53:16 EST / 02:53:16 UTC to Nov 23 22:13:19 EST / 03:13:19 UTC. Planned final collection: 05:58 Eastern / 10:58 UTC. The first snapshot includes a five-minute baseline.
 
-Public ingress was closed at setup. This watcher does not re-check the provider firewall. These counts describe activity, not confirmed attacks. Private-source requests and blocked egress can be normal service traffic. Synthetic labels can be forged.
+## Assessment
 
-The local read-only collector requires Mac power and network access. It does not contact attackers or change the VPS. New Relic receipt is not checked. Source caps, rotation and failed collections can hide events. Read the latest observation time: a stopped collector can leave a running state.
+**No public-source requests were recorded in the collected HTTP evidence.** The proxy recorded 80 requests, including 80 from private, loopback or link-local addresses. These observations do not establish an attack or compromise.
 
-Only numeric aggregates and fixed labels are published. Raw requests, responses, addresses, identifiers and captured instructions stay out of Git.
+Public ingress was closed at setup. The watcher does not re-check the provider firewall. Silence during this watch is therefore not evidence that an internet-facing service resisted attack.
+
+## What took place
+
+The proxy recorded **80 HTTP requests**: 0 with public-source addresses, 80 with private/local addresses and 0 with unparseable source addresses.
+
+The model-list endpoint received **80 requests**. This endpoint lists the models that the simulated AI service advertises. Requests here can be inventory checks or reconnaissance; the route alone does not show the caller's purpose.
+
+**Working interpretation:** all recorded HTTP activity targeted the model list from private/local addresses. This is consistent with routine service polling. The samples do not verify who made the requests or why.
+
+## Service response and containment
+
+Recorded HTTP outcomes: **80 successful responses (2xx)**, 0 redirects (3xx), 0 client-error responses (4xx), and 0 server-error responses (5xx). A 2xx status does not prove an exploit worked. This summary does not inspect response bodies or link status totals to individual routes.
+
+Firewall logs contained **742 host-output deny records**, **0 container-egress deny records**, and **0 metadata-access deny records**. These are logged packet denials, not unique sessions or attackers. They can include routine blocked traffic. The aggregates do not link a deny record to an HTTP request or prove that all unwanted traffic was blocked.
+
+No timestamped Falco events were counted inside the collection windows. The bounded file tail can miss events, so this does not rule out process activity.
+
+## Host and logging health
+
+At the latest snapshot, **12 of 12 expected components reported running**; running-state values were available for 12. Running state does not prove full application or logging health.
+
+Root disk use was **12%**. Available memory was **6.81 GiB**. 
+
+The telemetry exporter reported a queue size of **0** at the latest snapshot. A nonzero queue can be transient; one sample does not prove a delivery fault. The watcher does not query New Relic for receipt. Export counters and a running collector are not end-to-end delivery proof.
+
+Failed systemd units were reported **4 times across snapshots**. One persistent failure can appear repeatedly. These counts are not distinct outages and do not identify a security incident.
+
+## Evidence gaps and next checks
+
+- The runtime-sensor read reached its 1,000-row tail limit in 4 snapshots. Older events can fall outside the view.
+- Some runtime-sensor rows could not be parsed or timed. Re-reading an old tail can count the same problem again.
+- Collection warnings are present. Their exact labels and occurrence counts are in the technical evidence below.
+- Confirm current ingress policy before describing this as a public attack campaign.
+- Use the original private logs and New Relic traces to establish actor sequences, payloads, exact responses and any exploit outcome. This aggregate report cannot establish them.
+- Check the latest observation time. The collector requires Mac power and connectivity; a stopped process can leave a running state.
+
+## Recent observation timeline
+
+Each row is one collection window. Rows are not linked attacker sessions. The table shows the latest 12 windows; totals above cover the full watch.
+
+| Window end (EST / UTC) | Observed activity | Collection status |
+| --- | --- | --- |
+| Nov 23 21:58:16 EST / 02:58:16 UTC | 20 HTTP requests (0 public-source); 183 host-output denies; 0 container-egress denies; 0 metadata denies; 0 runtime events | 1 collection/health warnings |
+| Nov 23 22:03:17 EST / 03:03:17 UTC | 20 HTTP requests (0 public-source); 181 host-output denies; 0 container-egress denies; 0 metadata denies; 0 runtime events | 1 collection/health warnings |
+| Nov 23 22:08:18 EST / 03:08:18 UTC | 20 HTTP requests (0 public-source); 195 host-output denies; 0 container-egress denies; 0 metadata denies; 0 runtime events | 1 collection/health warnings |
+| Nov 23 22:13:19 EST / 03:13:19 UTC | 20 HTTP requests (0 public-source); 183 host-output denies; 0 container-egress denies; 0 metadata denies; 0 runtime events | 1 collection/health warnings |
+
+This debrief uses fixed narrative rules and numeric observations. It does not execute captured text, contact observed sources or change the VPS. Raw requests, response bodies, addresses, identities and captured instructions are excluded from the public report.
+
+<details>
+<summary>Technical evidence: exact counters, collection warnings and latest metrics</summary>
 
 ## Activity totals
 
-The first sample includes a five-minute baseline. Failed-service counts are sample occurrences. Falco parse errors can repeat old tail records; they are not unique events.
+Failed-service counts are sample occurrences. Falco parse errors can include repeated old records. These are not unique attacks.
 
 - `failed_service_sample_occurrences`: 4
 - `falco_time_unparsed`: 4
@@ -104,3 +155,5 @@ Counters below are cumulative source counters, not window totals. Component valu
 | `otelcol_receiver_refused_spans` | 0 |
 | `root_disk_used_percent` | 12 |
 | `shipper_checkpoint_age_seconds` | 0 |
+
+</details>
