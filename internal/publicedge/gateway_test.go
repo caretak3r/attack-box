@@ -109,6 +109,14 @@ func TestGatewayRejectsInvalidRequest(t *testing.T) {
 	}
 }
 
+func TestGatewayDoesNotRedirectUntrustedTargets(t *testing.T) {
+	w := httptest.NewRecorder()
+	NewGateway(nil).ServeHTTP(w, httptest.NewRequest("GET", "/v1//models?note=synthetic-marker", nil))
+	if w.Code != http.StatusBadRequest || w.Header().Get("Location") != "" || strings.Contains(w.Body.String(), "synthetic-marker") {
+		t.Fatal("noncanonical target was redirected or reflected")
+	}
+}
+
 func TestGatewayRejectsLargeBody(t *testing.T) {
 	g := NewGateway(nil)
 	body := strings.Repeat("x", 65*1024)

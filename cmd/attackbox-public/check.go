@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-func healthcheck(ctx context.Context, certPath string) error {
+func healthcheck(ctx context.Context, certPath, address string) error {
 	certPEM, err := os.ReadFile(certPath)
 	if err != nil {
 		return errors.New("public certificate is unavailable")
@@ -50,7 +50,7 @@ func healthcheck(ctx context.Context, certPath string) error {
 		{"POST", "/v1/completions", `{"model":"local-instruct-8b","prompt":"test"}`, `"cmpl-`, true},
 		{"POST", "/openai/deployments/local-instruct-8b/chat/completions", `{"messages":[{"role":"user","content":"test"}]}`, `"chatcmpl-`, true},
 	} {
-		req, err := http.NewRequestWithContext(ctx, check.method, "https://127.0.0.1:"+internalPort+check.path, strings.NewReader(check.body))
+		req, err := http.NewRequestWithContext(ctx, check.method, "https://"+address+check.path, strings.NewReader(check.body))
 		if err != nil {
 			return fmt.Errorf("invalid local probe: %w", err)
 		}

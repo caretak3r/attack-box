@@ -59,7 +59,7 @@ func main() {
 	if len(os.Args) == 2 && os.Args[1] == "--healthcheck" {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		if err := healthcheck(ctx, os.Getenv("ATTACKBOX_PUBLIC_TLS_CERT")); err != nil {
+		if err := healthcheck(ctx, os.Getenv("ATTACKBOX_PUBLIC_TLS_CERT"), "127.0.0.1:"+internalPort); err != nil {
 			fmt.Fprintln(os.Stderr, "attackbox-public healthcheck:", err)
 			os.Exit(1)
 		}

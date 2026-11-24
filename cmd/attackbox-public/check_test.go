@@ -14,10 +14,8 @@ func TestHealthcheckValidatesCertificate(t *testing.T) {
 		t.Fatal(err)
 	}
 	addr := listener.Addr().String()
-	_ = listener.Close()
-	a, err := newApp(cfg, func() (net.Listener, error) {
-		return net.Listen("tcp4", addr)
-	})
+	defer listener.Close()
+	a, err := newApp(cfg, func() (net.Listener, error) { return listener, nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,10 +28,9 @@ func TestHealthcheckValidatesCertificate(t *testing.T) {
 		_ = <-finished
 	}()
 
-	time.Sleep(100 * time.Millisecond)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := healthcheck(ctx, cfg.cert); err != nil {
+	if err := healthcheck(ctx, cfg.cert, addr); err != nil {
 		t.Fatal(err)
 	}
 }

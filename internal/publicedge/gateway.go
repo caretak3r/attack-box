@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -77,7 +78,7 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	if r.Method == http.MethodConnect || r.URL.IsAbs() || r.URL.Path == "" || r.URL.Path[0] != '/' {
+	if r.Method == http.MethodConnect || r.URL.IsAbs() || r.URL.Path == "" || r.URL.Path[0] != '/' || path.Clean(r.URL.Path) != r.URL.Path {
 		gatewayReply(w, http.StatusBadRequest, "text/plain; charset=utf-8", "invalid request target\n")
 		return
 	}
