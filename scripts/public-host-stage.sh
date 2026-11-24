@@ -777,13 +777,13 @@ owned_unit_state() {
   if [[ $id == "$unit" && -z $dropins ]] && has_marker "file.$key.installed"; then
     if [[ $status == 0 && $load == loaded && $fragment == "$path" && $reload == no && -f $path && ! -L $path ]]; then
       case $active in
-        active|activating|deactivating|reloading|inactive|failed|refreshing|maintenance) printf '%s\n' "$active"; return ;;
+        active|activating|deactivating|reloading|inactive|failed|refreshing|maintenance) printf '%s\n' "$active" || return 1; return 0 ;;
       esac
     elif has_marker "file.$key.removing" && [[ ! -e $path && ! -L $path && ( $active == inactive || $active == failed ) &&
         ( ( ( $status == 0 || $status == 4 ) && $load == not-found && -z $fragment ) ||
           ( $status == 0 && $load == loaded && $fragment == "$path" ) ) ]]; then
-      printf '%s\n' "$active"
-      return
+      printf '%s\n' "$active" || return 1
+      return 0
     fi
   fi
   printf 'public-host-stage: refuse unverified systemd unit: %s\n' "$unit" >&2
