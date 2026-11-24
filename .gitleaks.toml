@@ -1,0 +1,57 @@
+# Secret allowlist for gitleaks.
+#
+# Uses the default gitleaks rule set. This file only allowlists synthetic
+# fixtures that already exist in the test suite. Never add a live credential
+# here; rotate it instead.
+#
+# Allowlisting by path is deliberately narrow: only the redaction package and
+# fuzz corpus embed fake PEM/JWT blocks on purpose. Everywhere else, only the
+# exact synthetic values listed below are exempt, so a real key pasted into
+# another test file is still caught.
+
+title = "attackbox"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic redaction fixtures and documentation placeholders"
+
+paths = [
+  '''(^|/)internal/secret/''',
+  '''(^|/)internal/secret/testdata/''',
+]
+
+# Exact synthetic values used across the test suite. None are real credentials.
+regexes = [
+  '''sk-proj-test[A-Za-z0-9]*''',
+  '''sk-[A-Za-z0-9]{6,}test[A-Za-z0-9]*''',
+  # jwt.io's published demo token.
+  '''eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIn0\..*''',
+]
+
+# Synthetic test inputs verified before public history export.
+
+[[allowlists]]
+condition = 'AND'
+regexTarget = 'secret'
+paths = ['''(?:^|/)cmd/attackbox\-shipper/main_test\.go$''', '''(?:^|/)cmd/attackbox\-shipper/rejection_test\.go$''', '''(?:^|/)internal/telemetry/newrelic_test\.go$''', '''(?:^|/)scripts/test\-vultr\-launch\.sh$''']
+regexes = ['''^0123456789abcdef0123456789abcdef01234567$''']
+
+[[allowlists]]
+condition = 'AND'
+regexTarget = 'secret'
+paths = ['''(?:^|/)cmd/attackbox/main_test\.go$''', '''(?:^|/)internal/telemetry/newrelic_test\.go$''']
+regexes = ['''^0123456789abcdef0123456789abcdef0123NRAL$''']
+
+[[allowlists]]
+condition = 'AND'
+regexTarget = 'secret'
+paths = ['''(?:^|/)cmd/attackbox/main_test\.go$''']
+regexes = ['''^0123456789abcdef0123456789abcdefNRAL$''']
+
+[[allowlists]]
+condition = 'AND'
+regexTarget = 'secret'
+paths = ['''(?:^|/)internal/telemetry/redact_test\.go$''']
+regexes = ['''^eyJhbGciOi\.payload\.sig$''']

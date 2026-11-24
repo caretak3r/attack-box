@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Pre-push gate: scan the exact tree that each pushed ref would expose.
+#
+# Catches the "it was committed long ago and I never touched it" case that the
+# pre-commit hook cannot see.
+set -euo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+zero=0000000000000000000000000000000000000000
+remote=${1:-origin}
+blocklist="$repo_root/secrets/blocklist.txt"
+failed=0
+
+while read -r local_ref local_sha _remote_ref remote_sha; do
+  [ -n "${local_sha:-}" ] || continue
+  case "$local_sha" in *[!0]*) ;; *) continue ;; esac   # deleted ref
+
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/attackbox-push.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT
+
+  if ! git archive "$local_sha" | tar -x -C "$tmp" 2>/dev/null; then
+    echo "pre-push: cannot read $local_ref at $local_sha" >&2
+    failed=1
+    continue
+  fi
+
+  if [ -f "$blocklist" ]; then
+    export SECRETS_BLOCKLIST="$blocklist"
+  fi
+
+  findings_file=$(mktemp "${TMPDIR:-/tmp}/attackbox-findings.XXXXXX")
+  if ! ( cd "$tmp" && "$repo_root/scripts/scan-secrets.sh" path . >"$findings_file" 2>&1 ); then
+    echo "pre-push: blocked content in $local_ref ($local_sha)" >&2
+    grep -E "blocked|Blocked" "$findings_file" | head -20 | sed "s/^/  /" >&2 || true
+    failed=1
+  fi
+  rm -f "$findings_file"
+
+  rm -rf "$tmp"
+  trap - EXIT
+done
+
+if [ "$failed" -ne 0 ]; then
+  cat >&2 <<'EOF'
+
+Push refused: a pushed ref contains a credential or a private identifier.
+Delete the value from the tree, commit, and push again. If a real credential
+was already pushed anywhere, rotate it first.
+EOF
+  exit 1
+fi
+
+echo "pre-push: no blocked content in $remote refs"

@@ -1,2 +1,28 @@
+# Credentials and local state. Nothing here belongs in a commit.
 .env
+.env.*
+!.env.example
 .vultr/
+
+# Secrets live on disk only. The README documents the required files.
+secrets/*
+!secrets/README.md
+!secrets/.gitignore
+
+# Local agent and tool state
+.beads/
+.claude/
+.gnhf/
+.lavish/
+
+# Raw evidence, session transcripts, generated reports
+reports/
+context-log*.md
+
+# Build, test and profiling output
+__pycache__/
+*.pyc
+*.prof
+*.tar.gz
+site/.next/
+site/node_modules/
