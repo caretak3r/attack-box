@@ -15,6 +15,7 @@ const withNextra = nextra({
 export default withNextra({
   agentRules: false,
   reactStrictMode: true,
+  basePath: process.env.PAGES_BASE_PATH ?? '',
   output: 'export',
   images: { unoptimized: true },
   trailingSlash: true,
