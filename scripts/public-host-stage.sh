@@ -708,6 +708,8 @@ prevalidate_rollback() {
   has_marker bundle_sha || { printf 'public-host-stage: public ledger lacks bundle identity\n' >&2; return 1; }
   [[ $(marker_value bundle_sha) =~ ^[0-9a-f]{64}$ && $(marker_value bundle_sha) == "$approve" ]] || { printf 'public-host-stage: rollback approval does not match installed bundle\n' >&2; return 1; }
   prevalidate_file_state || return 1
+  if has_marker collector_start.intent; then owned_unit_state attackbox-public-otel.service otel_unit >/dev/null || return 1; fi
+  if has_marker public_start.intent; then owned_unit_state attackbox-public.service public_unit >/dev/null || return 1; fi
   prevalidate_dir_state || return 1
   if has_marker account.uid; then
     uid=$(marker_value account.uid); gid=$(marker_value account.gid)
@@ -761,6 +763,33 @@ prevalidate_rollback() {
   return 0
 }
 
+# The installer/rollback checked the fragment's ledger hash. Reject a different loaded definition.
+owned_unit_state() {
+  local unit=$1 key=$2 path=/etc/systemd/system/$1 properties field value
+  local id= load= active= fragment=unknown dropins=unknown reload= status=0
+  properties=$(systemctl show --all --property=Id,LoadState,ActiveState,FragmentPath,DropInPaths,NeedDaemonReload "$unit") || status=$?
+  while IFS='=' read -r field value; do
+    case $field in
+      Id) id=$value ;; LoadState) load=$value ;; ActiveState) active=$value ;;
+      FragmentPath) fragment=$value ;; DropInPaths) dropins=$value ;; NeedDaemonReload) reload=$value ;;
+    esac
+  done <<<"$properties"
+  if [[ $id == "$unit" && -z $dropins ]] && has_marker "file.$key.installed"; then
+    if [[ $status == 0 && $load == loaded && $fragment == "$path" && $reload == no && -f $path && ! -L $path ]]; then
+      case $active in
+        active|activating|deactivating|reloading|inactive|failed|refreshing|maintenance) printf '%s\n' "$active"; return ;;
+      esac
+    elif has_marker "file.$key.removing" && [[ ! -e $path && ! -L $path && ( $active == inactive || $active == failed ) &&
+        ( ( ( $status == 0 || $status == 4 ) && $load == not-found && -z $fragment ) ||
+          ( $status == 0 && $load == loaded && $fragment == "$path" ) ) ]]; then
+      printf '%s\n' "$active"
+      return
+    fi
+  fi
+  printf 'public-host-stage: refuse unverified systemd unit: %s\n' "$unit" >&2
+  return 1
+}
+
 stop_public_resources() {
   local failed=0 project image bind host campaign output collector_state project_failed result
   if has_marker public_start.intent; then
@@ -795,26 +824,34 @@ stop_public_resources() {
     fi
   fi
   if has_marker collector_start.intent; then
-    collector_state=$(systemctl show --property=ActiveState --value attackbox-public-otel.service 2>/dev/null) || collector_state=unknown
+    collector_state=$(owned_unit_state attackbox-public-otel.service otel_unit) || return 1
     if [[ $collector_state != inactive && $collector_state != failed ]]; then
-      printf 'public-host-stage: dependency-owned public Collector did not stop with the application\n' >&2
-      failed=1
-    else
-      mark collector_service.stopped || failed=1
+      systemctl stop attackbox-public-otel.service || { printf 'public-host-stage: failed to stop public Collector\n' >&2; return 1; }
+      collector_state=$(owned_unit_state attackbox-public-otel.service otel_unit) || return 1
+      [[ $collector_state == inactive || $collector_state == failed ]] || { printf 'public-host-stage: public Collector is not stopped\n' >&2; return 1; }
     fi
+    mark collector_service.stopped || failed=1
   fi
   (( failed == 0 ))
 }
 
 cleanup_collector_runtime() {
   local uid=$1 failed=0 rc nft_output
-  if has_marker collector_start.intent && [[ -x /usr/local/libexec/attackbox-public-otel-socket ]]; then
+  if ! has_marker account.removing && has_marker collector_start.intent && [[ -x /usr/local/libexec/attackbox-public-otel-socket ]]; then
     if ! /usr/local/libexec/attackbox-public-otel-socket cleanup; then printf 'public-host-stage: public Collector UID cleanup failed\n' >&2; failed=1; fi
   fi
   if nft_output=$(LC_ALL=C nft get element inet attackbox collector_uids "{ $uid }" 2>&1); then
     printf 'public-host-stage: public Collector UID remains in nft set\n' >&2; failed=1
   elif [[ $nft_output != $'Error: Could not process rule: No such file or directory\n'* ]] || ! nft list set inet attackbox collector_uids >/dev/null; then
     printf 'public-host-stage: cannot inspect public Collector UID membership\n' >&2; failed=1
+  fi
+  if has_marker account.removing; then
+    # Runtime cleanup finished before account removal. Never adopt a recreated runtime directory.
+    local dir
+    for dir in /run/attackbox-public-otel /run/attackbox-public-otel-state; do
+      [[ ! -e $dir && ! -L $dir ]] || { printf 'public-host-stage: removed runtime directory was recreated: %s\n' "$dir" >&2; return 1; }
+    done
+    return "$failed"
   fi
   if [[ -e /run/attackbox-public-otel || -L /run/attackbox-public-otel ]]; then
     if [[ -d /run/attackbox-public-otel && ! -L /run/attackbox-public-otel && $(stat -c '%u' /run/attackbox-public-otel) == "$uid" ]]; then
@@ -1110,6 +1147,8 @@ run_stage() {
   mark image.loaded || fail 'cannot record loaded image ownership'
 
   systemctl daemon-reload
+  owned_unit_state attackbox-public.service public_unit >/dev/null || fail 'public application unit identity mismatch'
+  owned_unit_state attackbox-public-otel.service otel_unit >/dev/null || fail 'public Collector unit identity mismatch'
   mark collector_start.intent || fail 'cannot record dependency-owned Collector start intent'
   mark public_start.intent || fail 'cannot record public application start intent'
   if ! systemctl enable --now attackbox-public.service; then capture_project_inventory || true; fail 'public service failed to start'; fi

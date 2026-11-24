@@ -394,15 +394,16 @@ case "$1" in
     esac
     ;;
   cat) exit 1 ;;
-  daemon-reload) ;;
+  daemon-reload) [[ ! -e /tmp/mock/fail-reload ]] ;;
   enable)
     [[ ${2:-} == --now && ${3:-} == attackbox-public.service ]]
     touch /tmp/mock/otel-active /tmp/mock/nft-public
-    install -d -o 998 -g 998 -m 2710 /run/attackbox-public-otel
+    install -d -o 998 -g 65532 -m 2710 /run/attackbox-public-otel
     install -d -o 0 -g 0 -m 700 /run/attackbox-public-otel-state
     install -o 0 -g 0 -m 600 /dev/null /run/attackbox-public-otel-state/lock
     printf '998\n' >/run/attackbox-public-otel-state/uid
     chmod 0600 /run/attackbox-public-otel-state/uid
+    if [[ -e /tmp/mock/fail-dependency ]]; then touch /tmp/mock/otel-restarting; exit 1; fi
     NOTIFY_SOCKET=/tmp/mock-notify /usr/local/libexec/attackbox-public-compose up >/tmp/mock/helper.log 2>&1 &
     printf '%s\n' "$!" >/tmp/mock/helper-pid
     for ((attempt=0; attempt<100; attempt++)); do
@@ -415,12 +416,18 @@ case "$1" in
     [[ ! -e /tmp/mock/fail-public-start ]]
     ;;
   stop)
+    printf '%s\n' "${2:-}" >>/tmp/mock/stops
+    if [[ ${2:-} == attackbox-public-otel.service ]]; then
+      [[ -e /tmp/mock/ignore-otel-stop ]] || rm -f /tmp/mock/otel-restarting /tmp/mock/otel-active
+      exit 0
+    fi
     [[ ${2:-} == attackbox-public.service ]]
     /usr/local/libexec/attackbox-public-compose down
     if [[ -f /tmp/mock/helper-pid ]]; then
       wait "$(cat /tmp/mock/helper-pid)" 2>/dev/null || true
     fi
-    rm -f /tmp/mock/helper-pid /tmp/mock/public-active /tmp/mock/otel-active
+    rm -f /tmp/mock/helper-pid /tmp/mock/public-active
+    [[ -e /tmp/mock/otel-restarting ]] || rm -f /tmp/mock/otel-active
     ;;
   disable) [[ ${2:-} == attackbox-public.service ]] ;;
   show)
@@ -428,8 +435,23 @@ case "$1" in
       [[ ! -e /tmp/mock/systemd-api-error ]] || exit 1
       if [[ -e /tmp/mock/legacy-unit ]]; then printf 'loaded\n'; else printf 'not-found\n'; fi
     else
-      [[ ${!#} == attackbox-public-otel.service ]]
-      if [[ -e /tmp/mock/otel-active ]]; then printf 'active\n'; else printf 'inactive\n'; fi
+      [[ $2 == --all && $3 == --property=Id,LoadState,ActiveState,FragmentPath,DropInPaths,NeedDaemonReload ]]
+      unit=${!#}; path=/etc/systemd/system/$unit; load=loaded; active=inactive; dropins=; reload=no
+      [[ -f $path ]] || { load=not-found; path=; }
+      case $unit in
+        attackbox-public.service) [[ ! -e /tmp/mock/public-active ]] || active=active ;;
+        attackbox-public-otel.service)
+          [[ ! -e /tmp/mock/otel-active ]] || active=active
+          [[ ! -e /tmp/mock/otel-restarting ]] || active=activating
+          [[ ! -e /tmp/mock/foreign-fragment ]] || path=/usr/lib/systemd/system/attackbox-otel.service
+          [[ ! -e /tmp/mock/foreign-dropin ]] || dropins=/run/systemd/system/attackbox-public-otel.service.d/extra.conf
+          [[ ! -e /tmp/mock/stale-fragment ]] || reload=yes
+          ;;
+        *) exit 1 ;;
+      esac
+      printf 'Id=%s\nLoadState=%s\nActiveState=%s\nFragmentPath=%s\nDropInPaths=%s\nNeedDaemonReload=%s\n' \
+        "$unit" "$load" "$active" "$path" "$dropins" "$reload"
+      [[ $load != not-found ]] || exit 4
     fi
     ;;
   *) exit 1 ;;
@@ -560,6 +582,42 @@ if [[ -e /var/lib/attackbox-public || -e /etc/attackbox-public || -e /tmp/mock/a
   fail 'partial stage did not roll back public objects'
 fi
 [[ -f /opt/attackbox/private-marker && -f /tmp/mock/nft-private ]] || fail 'partial rollback changed private state'
+
+# A dependency can fail before the application starts, yet remain in auto-restart.
+: >/tmp/mock/stops
+touch /tmp/mock/fail-dependency
+expect_failure 'public service failed to start' bash "$script" stage "${common[@]}" --approve "$bundle_sha"
+[[ ! -e /var/lib/attackbox-public && ! -e /tmp/mock/otel-restarting &&
+   $(cat /tmp/mock/stops) == $'attackbox-public.service\nattackbox-public-otel.service' ]] || fail 'automatic rollback left the restarting dependency'
+: >/tmp/mock/stops
+touch /tmp/mock/ignore-otel-stop
+expect_failure 'public service failed to start' bash "$script" stage "${common[@]}" --approve "$bundle_sha"
+[[ $failure_output == *'public Collector is not stopped'* && -f /var/lib/attackbox-public/ledger/bundle_sha &&
+   -f /tmp/mock/otel-restarting && ! -e /var/lib/attackbox-public/ledger/collector_service.stopped ]] || fail 'unconfirmed Collector stop lost rollback ownership'
+[[ $(cat /tmp/mock/stops) == $'attackbox-public.service\nattackbox-public-otel.service' ]] || fail 'wrong units stopped on dependency failure'
+rm /tmp/mock/ignore-otel-stop /tmp/mock/fail-dependency
+: >/tmp/mock/stops
+for foreign in foreign-fragment foreign-dropin stale-fragment; do
+  touch "/tmp/mock/$foreign"
+  expect_failure 'refuse unverified systemd unit' bash "$script" rollback --approve "$bundle_sha"
+  [[ ! -s /tmp/mock/stops && -e /tmp/mock/otel-restarting ]] || fail 'rollback stopped an unverified Collector'
+  rm "/tmp/mock/$foreign"
+done
+otel_unit=/etc/systemd/system/attackbox-public-otel.service
+printf '\n# changed\n' >>"$otel_unit"
+expect_failure 'refuse changed owned file' bash "$script" rollback --approve "$bundle_sha"
+[[ ! -s /tmp/mock/stops ]] || fail 'rollback stopped a Collector with a changed ledger hash'
+install -m 0644 "/root/release/deploy/systemd/${otel_unit##*/}" "$otel_unit"
+touch /tmp/mock/fail-reload
+expect_failure 'systemd reload failed during rollback' bash "$script" rollback --approve "$bundle_sha"
+[[ $(cat /tmp/mock/stops) == attackbox-public-otel.service && ! -e /tmp/mock/otel-restarting && ! -e $otel_unit ]] || fail 'retry did not stop only the owned Collector'
+rm /tmp/mock/fail-reload
+mkdir -m 0700 /run/attackbox-public-otel
+expect_failure 'removed runtime directory was recreated' bash "$script" rollback --approve "$bundle_sha"
+rmdir /run/attackbox-public-otel
+bash "$script" rollback --approve "$bundle_sha" >/dev/null
+[[ $(cat /tmp/mock/stops) == attackbox-public-otel.service && ! -e /var/lib/attackbox-public ]] || fail 'repeat rollback tried to stop a missing unit'
+
 for check in 'extra-publication:ports are not bound exactly' 'foreign-mount:public mounts must contain only' \
   'wrong-isolation:live public isolation differs' 'live-untrusted:live public HTTPS failed'; do
   touch "/tmp/mock/${check%%:*}"
@@ -578,6 +636,29 @@ project=$(cat /etc/attackbox-public/project-id)
 if setpriv --reuid=65532 --regid=65532 --clear-groups -- head -c 1 /etc/attackbox-public/tls/privkey.pem >/dev/null 2>&1; then
   fail 'host bait UID can read the staged TLS key by its host path'
 fi
+otel_user=(setpriv --reuid=998 --regid=998 --clear-groups --)
+config=/etc/attackbox-public-otel/config.yaml
+[[ $(stat -c '%u:%g:%a' "${config%/*}") == 0:0:700 && $(stat -c '%u:%g:%a' "$config") == 0:0:644 &&
+   $(stat -c '%u:%g:%a' "${config%/*}/license.key") == 0:0:600 ]] || fail 'Collector credential source permissions changed'
+if "${otel_user[@]}" head -c 1 "$config" >/dev/null 2>&1; then fail 'Collector can read its config through the host path'; fi
+# Model PID 1 delivering the synthetic config; use the actual unit argv under the service UID.
+cred_dir=$(mktemp -d /run/test-otel-creds.XXXXXXXX)
+cred=$(awk -F'[:=]' -v config="$config" '$1 == "LoadCredential" && $3 == config {print $2}' "$otel_unit")
+[[ $cred =~ ^[a-zA-Z0-9_.-]+$ && $cred != . && $cred != .. ]] || fail 'unit does not deliver the staged Collector config'
+install -o 998 -g 998 -m 0400 "$config" "$cred_dir/$cred"
+chown 998:998 "$cred_dir"; chmod 0500 "$cred_dir"
+read -r binary argument extra < <(sed -n 's/^ExecStart=//p' "$otel_unit")
+[[ -z $extra && $argument == --config=* ]] || fail 'missing Collector config argument'
+"${otel_user[@]}" test -x "$binary" || fail 'Collector executable is inaccessible'
+consumer=${argument#--config=}
+"${otel_user[@]}" cat "${consumer//%d/$cred_dir}" | cmp - "$config" || fail 'Collector cannot read the delivered config'
+rm -- "$cred_dir/$cred"; rmdir -- "$cred_dir"
+socket=/run/attackbox-public-otel/otlp.sock
+"${otel_user[@]}" perl -MSocket -e 'socket(my $s, AF_UNIX, SOCK_STREAM, 0) or die $!; bind($s, sockaddr_un($ARGV[0])) or die $!' "$socket"
+read -r helper action < <(sed -n 's/^ExecStartPost=//p' "$otel_unit")
+"${otel_user[@]}" "$helper" "$action" || fail 'unprivileged socket readiness failed'
+[[ $(stat -c '%u:%g:%a' "$socket") == 998:65532:220 ]] || fail 'ready socket is not writable by the bait group'
+rm -- "$socket"
 # shortcut: hard links test inode permissions only, verify bind mounts with gVisor on Linux.
 ln /etc/attackbox-public/tls/fullchain.pem /tmp/mounted-cert
 ln /etc/attackbox-public/tls/privkey.pem /tmp/mounted-key

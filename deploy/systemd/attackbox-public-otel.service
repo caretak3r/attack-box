@@ -10,13 +10,11 @@ Wants=network-online.target
 Type=simple
 User=abx-public-otel
 Group=abx-public-otel
-RuntimeDirectory=attackbox-public-otel
-RuntimeDirectoryMode=0710
-RuntimeDirectoryPreserve=yes
 EnvironmentFile=/etc/attackbox-public-otel/environment
 LoadCredential=newrelic_license_key:/etc/attackbox-public-otel/license.key
+LoadCredential=config.yaml:/etc/attackbox-public-otel/config.yaml
 ExecStartPre=+/usr/local/libexec/attackbox-public-otel-socket prepare
-ExecStart=/usr/local/libexec/attackbox-public-otel --config=/etc/attackbox-public-otel/config.yaml
+ExecStart=/usr/local/libexec/attackbox-public-otel --config=%d/config.yaml
 ExecStartPost=/usr/local/libexec/attackbox-public-otel-socket ready
 ExecStopPost=+/usr/local/libexec/attackbox-public-otel-socket cleanup
 UMask=0077
@@ -29,7 +27,8 @@ TasksMax=100
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/run/attackbox-public-otel
+# The privileged prepare helper creates the setgid socket directory before ExecStart.
+ReadWritePaths=-/run/attackbox-public-otel
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes
