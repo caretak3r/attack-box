@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Pre-commit gate: refuse a commit that stages credentials or private IDs.
+set -euo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+# Block local-only paths even if a future .gitignore edit lets them through.
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+if [ -n "$staged" ]; then
+  blocked=$(printf '%s\n' "$staged" | grep -E \
+    '^(\.env($|\.)|\.vultr/|secrets/|reports/|context-log.*\.md$|\.beads/|\.claude/|\.gnhf/|\.lavish/)|(^|/)__pycache__/|\.pyc$' \
+    | grep -v -E '^secrets/(README\.md|\.gitignore)$' || true)
+  if [ -n "$blocked" ]; then
+    echo "Blocked: local-only path staged for commit:" >&2
+    printf '  %s\n' "$blocked" >&2
+    echo "Unstage it: git restore --staged <path>" >&2
+    exit 1
+  fi
+fi
+
+exec "$repo_root/scripts/scan-secrets.sh" staged
