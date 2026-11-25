@@ -115,7 +115,7 @@ paths=(
   cmd/attackbox-public/main.go cmd/attackbox-public/main_test.go
   cmd/attackbox-public/check.go cmd/attackbox-public/check_test.go cmd/attackbox-public/collector_test.go
   internal/observability/tracing.go internal/observability/tracing_test.go
-  internal/publicedge/gateway.go internal/publicedge/gateway_test.go
+  internal/publicedge/gateway.go internal/publicedge/gateway_test.go internal/publicedge/capture.go internal/publicedge/capture_test.go
   scripts/public-firewall-ledger.sh scripts/test-public-firewall-ledger.sh
   deploy/public-compose.sh deploy/public-otel/config.yaml deploy/public-otel/prepare-socket.sh deploy/public-otel/collector_integration_test.go
   deploy/otel/version.env deploy/systemd/attackbox-public-otel.service deploy/systemd/attackbox-public.service

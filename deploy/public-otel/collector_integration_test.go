@@ -122,11 +122,17 @@ func TestPublicCollectorSanitizesAndBindsIdentity(t *testing.T) {
 		return &trace.Span{Name: name, TraceId: bytes.Repeat([]byte{id}, 16), SpanId: bytes.Repeat([]byte{id}, 8), StartTimeUnixNano: now, EndTimeUnixNano: now + 1000, Kind: trace.Span_SPAN_KIND_CLIENT, TraceState: "private-marker", Status: &trace.Status{Message: "private-marker"}, Attributes: attrs, Events: []*trace.Span_Event{{Name: "private-marker", TimeUnixNano: now}}}
 	}
 	contentType := str("attackbox.request.content_type", "application/json")
-	goodHTTP := span("public.request", 1, num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/v1/completions"), str("http.request.method", "POST"), num("http.response.status_code", 200), contentType, str("client.address", "192.0.2.1"), str("request.body", "private-marker"))
+	queryParams := num("attackbox.request.query_params", 2)
+	goodHTTP := span("public.request", 1, num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/v1/completions"), str("http.request.method", "POST"), num("http.response.status_code", 200), contentType, queryParams, str("client.address", "192.0.2.1"), str("request.body", "private-marker"))
+	goodFamily := span("public.request", 40, num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/litellm/anthropic/v1/messages"), str("http.request.method", "POST"), num("http.response.status_code", 200), contentType, queryParams, str("client.address", "192.0.2.1"))
+	goodProbe := span("public.request", 41, num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/unmatched"), str("http.request.method", "GET"), num("http.response.status_code", 404), contentType, num("attackbox.request.query_params", 0), str("attackbox.probe.class", "env_file"), str("client.address", "192.0.2.1"))
+	badFamily := span("public.request", 42, num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/v1/private-marker/models"), str("http.request.method", "GET"), num("http.response.status_code", 200), contentType, queryParams)
+	noQuery := span("public.request", 43, num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/v1/models"), str("http.request.method", "GET"), num("http.response.status_code", 200), contentType)
+	badCapture := span("public.health", 44, num("server.port", 443), str("attackbox.captured_requests", "private-marker"))
 	badRoute := span("public.request", 2, num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/private-marker"), str("http.request.method", "GET"), num("http.response.status_code", 200), contentType)
 	badPort := span("public.request", 3, num("server.port", 80), str("attackbox.persona", "cloud-gateway"), str("http.route", "/v1/models"), str("http.request.method", "GET"), num("http.response.status_code", 200), contentType)
 	badAddress := span("public.request", 4, num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/v1/models"), str("http.request.method", "GET"), num("http.response.status_code", 200), contentType, str("client.address", "private-marker"))
-	health := span("public.health", 5, num("server.port", 443), num("attackbox.accepted_requests", 1), num("attackbox.rate_limited_requests", 0), num("attackbox.pre_http_connections", 3), num("attackbox.rejected_connections", 0), num("attackbox.otel_dropped_spans_total", 0), num("attackbox.otel_export_failed_spans_total", 0), contentType, str("client.address", "198.51.100.2"))
+	health := span("public.health", 5, num("server.port", 443), num("attackbox.accepted_requests", 1), num("attackbox.rate_limited_requests", 0), num("attackbox.pre_http_connections", 3), num("attackbox.rejected_connections", 0), num("attackbox.captured_requests", 1), num("attackbox.capture_dropped", 0), num("attackbox.otel_dropped_spans_total", 0), num("attackbox.otel_export_failed_spans_total", 0), contentType, str("client.address", "198.51.100.2"))
 	goodConn := span("public.connection", 30, num("server.port", 443), str("client.address", "192.0.2.7"), str("attackbox.connection.outcome", "tls_failed"), str("attackbox.tls.sni", "other"), str("request.body", "private-marker"))
 	badOutcome := span("public.connection", 31, num("server.port", 443), str("attackbox.connection.outcome", "private-marker"))
 	noOutcome := span("public.connection", 32, num("server.port", 443))
@@ -139,17 +145,21 @@ func TestPublicCollectorSanitizesAndBindsIdentity(t *testing.T) {
 	resourceSpan := func(service string, spans ...*trace.Span) *trace.ResourceSpans {
 		return &trace.ResourceSpans{SchemaUrl: "private-marker", Resource: &resource.Resource{Attributes: []*common.KeyValue{str("service.name", service), str("secret", "private-marker")}}, ScopeSpans: []*trace.ScopeSpans{{SchemaUrl: "private-marker", Scope: &common.InstrumentationScope{Name: "private-marker", Attributes: []*common.KeyValue{str("secret", "private-marker")}}, Spans: spans}}}
 	}
-	public := []*trace.Span{goodHTTP, badRoute, badPort, badAddress, health, badPersona, badRPCPort, goodConn, badOutcome, noOutcome, badSNI, badCounter}
+	public := []*trace.Span{goodHTTP, badRoute, badPort, badAddress, health, badPersona, badRPCPort, goodConn, badOutcome, noOutcome, badSNI, badCounter, goodFamily, goodProbe, badFamily, noQuery, badCapture}
 	for i, invalid := range []*common.KeyValue{
 		str("client.address", "203.0.113.256"), str("client.address", "192.000.2.1"), str("client.address", "2001:db8::1"),
 		str("client.address", "172.19.0.1"), str("client.address", "100.127.0.1"), str("client.address", "127.0.0.1"),
 		str("client.address", "0.1.2.3"), str("client.address", "240.0.0.1"), num("client.address", 1),
 		str("attackbox.request.content_type", "application/json; token=private-marker"), num("http.request.body.size", -1),
 		str("http.request.body.size", "private-marker"), str("gen_ai.request.model", "private-marker"), str("attackbox.request.stream", "true"),
+		num("attackbox.request.query_params", -1), num("attackbox.request.query_params", 65), str("attackbox.request.query_params", "private-marker"),
+		str("attackbox.probe.class", "private-marker"), num("attackbox.probe.class", 1),
 	} {
 		s := span("public.request", byte(10+i), num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/v1/models"), str("http.request.method", "GET"), num("http.response.status_code", 200), invalid)
-		if invalid.Key != contentType.Key {
-			s.Attributes = append(s.Attributes, contentType)
+		for _, base := range []*common.KeyValue{contentType, queryParams} {
+			if invalid.Key != base.Key {
+				s.Attributes = append(s.Attributes, base)
+			}
 		}
 		public = append(public, s)
 	}
@@ -198,7 +208,7 @@ func TestPublicCollectorSanitizesAndBindsIdentity(t *testing.T) {
 					if s.Name == "public.health" {
 						for _, field := range s.Attributes {
 							switch field.Key {
-							case "server.port", "attackbox.accepted_requests", "attackbox.rate_limited_requests", "attackbox.pre_http_connections", "attackbox.rejected_connections", "attackbox.otel_dropped_spans_total", "attackbox.otel_export_failed_spans_total":
+							case "server.port", "attackbox.accepted_requests", "attackbox.rate_limited_requests", "attackbox.pre_http_connections", "attackbox.rejected_connections", "attackbox.captured_requests", "attackbox.capture_dropped", "attackbox.otel_dropped_spans_total", "attackbox.otel_export_failed_spans_total":
 							default:
 								t.Errorf("request data on health span: %s", field.Key)
 							}
@@ -224,7 +234,7 @@ func TestPublicCollectorSanitizesAndBindsIdentity(t *testing.T) {
 				}
 			}
 		}
-		if len(seen) != 3 || !seen[1] || !seen[5] || !seen[30] {
+		if len(seen) != 5 || !seen[1] || !seen[5] || !seen[30] || !seen[40] || !seen[41] {
 			t.Fatalf("wrong accepted spans: %v", seen)
 		}
 	case <-ctx.Done():

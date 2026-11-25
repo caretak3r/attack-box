@@ -244,13 +244,16 @@ func TestGatewayRequestEvidence(t *testing.T) {
 		status                                  int
 		want                                    []attribute.KeyValue
 	}{
-		{"mapped HEAD", "HEAD", "/v1/models?token=fixture-private", "/v1/models", "[::ffff:203.0.113.42]:443", "", false, 200,
-			[]attribute.KeyValue{attribute.String("client.address", "203.0.113.42"), attribute.Int64("http.request.body.size", 0)}},
+		{"mapped HEAD", "HEAD", "/v1/models?token=fixture-private&b=2", "/v1/models", "[::ffff:203.0.113.42]:443", "", false, 200,
+			[]attribute.KeyValue{attribute.String("client.address", "203.0.113.42"), attribute.Int64("http.request.body.size", 0), attribute.Int("attackbox.request.query_params", 2)}},
 		{"chunked completion", "POST", "/v1/completions", "/v1/completions", peer, completion, true, 200,
-			[]attribute.KeyValue{attribute.String("client.address", "203.0.113.42"), attribute.Int64("http.request.body.size", int64(len(completion))), attribute.String("gen_ai.request.model", gatewayModel), attribute.Bool("attackbox.request.stream", false)}},
+			[]attribute.KeyValue{attribute.String("client.address", "203.0.113.42"), attribute.Int64("http.request.body.size", int64(len(completion))), attribute.String("gen_ai.request.model", gatewayModel), attribute.Bool("attackbox.request.stream", false), attribute.Int("attackbox.request.query_params", 0)}},
 		{"implicit model and stream", "POST", "/v1/completions", "/v1/completions", "172.19.0.1:12345", defaults, false, 200,
-			[]attribute.KeyValue{attribute.Int64("http.request.body.size", int64(len(defaults)))}},
-		{"unread chunked body", "GET", "/fixture-private", "/unmatched", "127.0.0.1:443", "fixture-private", true, 404, nil},
+			[]attribute.KeyValue{attribute.Int64("http.request.body.size", int64(len(defaults))), attribute.Int("attackbox.request.query_params", 0)}},
+		{"unread chunked body", "GET", "/fixture-private", "/unmatched", "127.0.0.1:443", "fixture-private", true, 404,
+			[]attribute.KeyValue{attribute.Int("attackbox.request.query_params", 0), attribute.String("attackbox.probe.class", "other")}},
+		{"family variant", "POST", "/proxy/v1/api/completions?api_key=fixture-private", "/proxy/v1/api/completions", peer, completion, false, 200,
+			[]attribute.KeyValue{attribute.String("client.address", "203.0.113.42"), attribute.Int64("http.request.body.size", int64(len(completion))), attribute.String("gen_ai.request.model", gatewayModel), attribute.Bool("attackbox.request.stream", false), attribute.Int("attackbox.request.query_params", 1)}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := tracetest.NewSpanRecorder()
@@ -279,5 +282,73 @@ func TestGatewayRequestEvidence(t *testing.T) {
 				t.Errorf("request attributes = %v, want %v", got.ToSlice(), want.ToSlice())
 			}
 		})
+	}
+}
+
+func TestGatewayRouteFamilies(t *testing.T) {
+	const chat = `{"model":"local-instruct-8b","messages":[{"role":"user","content":"x"}]}`
+	for _, tc := range []struct {
+		method, path, body, route string
+		status                    int
+		contentType, contains     string
+	}{
+		{"POST", "/v1/api/completions", `{"prompt":"x"}`, "/v1/api/completions", 200, gatewayJSON, `"text_completion"`},
+		{"POST", "/chat/completions", chat, "/chat/completions", 200, gatewayJSON, `"chat.completion"`},
+		{"POST", "/openai/v1/chat/completions", chat, "/openai/v1/chat/completions", 200, gatewayJSON, `"chat.completion"`},
+		{"POST", "/v1/engines/local-instruct-8b/completions", `{"prompt":"x"}`, "/v1/engines/{model}/completions", 200, gatewayJSON, `"text_completion"`},
+		{"POST", "/openai/deployments/gpt-4o/chat/completions", chat, "/openai/deployments/{deployment}/chat/completions", 404, gatewayJSON, "model not found"},
+		{"GET", "/api/v1/models", "", "/api/v1/models", 200, gatewayJSON, `"local-instruct-8b"`},
+		{"POST", "/v1/models", "", "/v1/models", 405, "text/plain; charset=utf-8", "Method Not Allowed"},
+		{"POST", "/v1/embeddings", `{"input":"x"}`, "/v1/embeddings", 200, gatewayJSON, `"embedding"`},
+		{"POST", "/v1/messages", `{"model":"local-instruct-8b","max_tokens":8,"messages":[{"role":"user","content":"x"}]}`, "/v1/messages", 200, gatewayJSON, `"type":"message"`},
+		{"POST", "/v1/messages", `{"model":"local-instruct-8b","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"x"}]}`, "/v1/messages", 200, "text/event-stream", "event: message_stop"},
+		{"POST", "/v1/messages", `{"model":"claude-3","max_tokens":8,"messages":[{"role":"user","content":"x"}]}`, "/v1/messages", 404, gatewayJSON, "not_found_error"},
+		{"POST", "/v1/messages", `{"model":"local-instruct-8b","messages":[{"role":"user","content":"x"}]}`, "/v1/messages", 400, gatewayJSON, "invalid_request_error"},
+		{"GET", "/api/tags", "", "/api/tags", 200, gatewayJSON, `"local-instruct-8b:latest"`},
+		{"POST", "/api/chat", `{"model":"local-instruct-8b","messages":[{"role":"user","content":"x"}]}`, "/api/chat", 200, "application/x-ndjson", `"done":true`},
+		{"POST", "/ollama/api/generate", `{"model":"local-instruct-8b:latest","prompt":"x","stream":false}`, "/ollama/api/generate", 200, gatewayJSON, `"response":"Ready."`},
+		{"POST", "/api/generate", `{"model":"llama3","prompt":"x"}`, "/api/generate", 404, gatewayJSON, "model not found"},
+		{"POST", "/xyz/completions", `{"prompt":"x"}`, "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found"},
+		{"POST", "/v1/v1/v1/v1/v1/completions", `{"prompt":"x"}`, "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found"},
+		{"GET", "/9f1c2e7a", "", "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found"},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			rec := tracetest.NewSpanRecorder()
+			tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+			defer tp.Shutdown(t.Context())
+			r := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			w := httptest.NewRecorder()
+			NewGateway(tp.Tracer("test")).ServeHTTP(w, r)
+			if w.Code != tc.status || w.Header().Get("Content-Type") != tc.contentType || !strings.Contains(w.Body.String(), tc.contains) {
+				t.Fatalf("got %d %q %s", w.Code, w.Header().Get("Content-Type"), w.Body.String())
+			}
+			var route string
+			for _, a := range rec.Ended()[0].Attributes() {
+				if a.Key == "http.route" {
+					route = a.Value.AsString()
+				}
+			}
+			if route != tc.route {
+				t.Fatalf("route = %q, want %q", route, tc.route)
+			}
+		})
+	}
+}
+
+func TestGatewayProbeClass(t *testing.T) {
+	for target, want := range map[string]string{
+		"/": "root", "/.env": "env_file", "/app/.env.production": "env_file", "/.git/config": "vcs",
+		"/wp-login.php": "wordpress", "/actuator/health": "actuator", "/cgi-bin/luci": "cgi", "/phpMyAdmin/": "admin",
+		"/info.php": "php", "/robots.txt": "discovery", "/config.json": "config_file", "/v1/models/gpt-4": "llm_api",
+		"/api/v0/predict": "llm_api", "/index.html": "other", "http://example.test/": "proxy",
+	} {
+		r := httptest.NewRequest("GET", "/", nil)
+		var err error
+		if r.URL, err = r.URL.Parse(target); err != nil {
+			t.Fatal(err)
+		}
+		if got := gatewayProbe(r); got != want {
+			t.Errorf("gatewayProbe(%q) = %q, want %q", target, got, want)
+		}
 	}
 }

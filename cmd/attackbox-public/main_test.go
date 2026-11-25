@@ -346,7 +346,7 @@ func TestNonGatewayRouteRejected(t *testing.T) {
 	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: "localhost", MinVersion: tls.VersionTLS12}}}
 	defer client.CloseIdleConnections()
 
-	for _, path := range []string{"/api/tags", "/health", "/collections", "/v2/models/score"} {
+	for _, path := range []string{"/api/version", "/health", "/collections", "/v2/models/score"} {
 		req, err := http.NewRequestWithContext(ctx, "GET", "https://"+addr+path, nil)
 		if err != nil {
 			t.Fatal(err)

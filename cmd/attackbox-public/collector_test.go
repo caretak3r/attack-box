@@ -28,6 +28,10 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 	}
 	cfg, roots, _, dir := publicTestConfig(t)
 	cfg.socket = filepath.Join(dir, "public-collector.sock")
+	cfg.capture = filepath.Join(dir, "capture")
+	if err := os.Mkdir(cfg.capture, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	got := make(chan *collector.ExportTraceServiceRequest, 128)
 	const privateMarker = "fixture-private-marker"
 	const forgedPeer = "203.0.113.29"
@@ -143,7 +147,7 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 	}{
 		{"GET", "/v1/models", ""},
 		{"POST", "/v1/chat/completions", chatPayload},
-		{"POST", "/v1/completions", `{"model":"local-instruct-8b","prompt":"test"}`},
+		{"POST", "/v1/api/completions", `{"model":"local-instruct-8b","prompt":"test"}`},
 		{"POST", "/openai/deployments/local-instruct-8b/chat/completions", `{"messages":[{"role":"user","content":"test"}]}`},
 	} {
 		req, err := http.NewRequestWithContext(serverCtx, tc.method, "https://"+addr+tc.path+"?token="+privateMarker, strings.NewReader(tc.body))
@@ -191,7 +195,7 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 
 	seen := make(map[string]bool)
 	health, connection := false, false
-	expected := []string{"/v1/models", "/v1/chat/completions", "/v1/completions", "/openai/deployments/{deployment}/chat/completions"}
+	expected := []string{"/v1/models", "/v1/chat/completions", "/v1/api/completions", "/openai/deployments/{deployment}/chat/completions"}
 	for !health || !connection || len(seen) < len(expected) {
 		var req *collector.ExportTraceServiceRequest
 		select {
@@ -204,17 +208,19 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 				for _, span := range s.Spans {
 					if span.Name == "public.health" {
 						health = true
-						var port, preHTTP int64
+						var port, preHTTP, captured int64
 						for _, attr := range span.Attributes {
 							switch attr.Key {
 							case "server.port":
 								port = attr.Value.GetIntValue()
 							case "attackbox.pre_http_connections":
 								preHTTP = attr.Value.GetIntValue()
+							case "attackbox.captured_requests":
+								captured = attr.Value.GetIntValue()
 							}
 						}
-						if port != externalPort || preHTTP != 1 {
-							t.Errorf("health span: port %d, pre-HTTP connections %d", port, preHTTP)
+						if port != externalPort || preHTTP != 1 || captured != 4 {
+							t.Errorf("health span: port %d, pre-HTTP connections %d, captured %d", port, preHTTP, captured)
 						}
 						continue
 					}
@@ -235,7 +241,7 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 						var route, persona, contentType, model string
 						var port int64
 						var stream bool
-						size := int64(-1)
+						size, queryParams := int64(-1), int64(-1)
 						for _, attr := range span.Attributes {
 							switch attr.Key {
 							case "http.route":
@@ -254,13 +260,15 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 								stream = attr.Value.GetBoolValue()
 							case "http.request.body.size":
 								size = attr.Value.GetIntValue()
+							case "attackbox.request.query_params":
+								queryParams = attr.Value.GetIntValue()
 							}
 						}
 						if persona != "cloud-gateway" {
 							t.Errorf("request span: unexpected persona %q", persona)
 						}
-						if port != externalPort {
-							t.Errorf("request span: expected port %d, got %d", externalPort, port)
+						if port != externalPort || queryParams != 1 {
+							t.Errorf("request span: port %d, query params %d", port, queryParams)
 						}
 						if route == "/v1/chat/completions" && (size != int64(len(chatPayload)) || contentType != "application/json" || model != "local-instruct-8b" || !stream) {
 							t.Error("chat span lost structured request fields on its way to the exporter")
@@ -275,5 +283,9 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 		if !seen[route] {
 			t.Errorf("missing route %q", route)
 		}
+	}
+	raw, err := os.ReadFile(filepath.Join(cfg.capture, "capture-"+time.Now().UTC().Format("20060102")+".jsonl"))
+	if err != nil || bytes.Count(raw, []byte("\n")) != 4 || !bytes.Contains(raw, []byte(`"/v1/api/completions?token=`+privateMarker+`"`)) {
+		t.Fatalf("local capture missing raw targets: %v\n%s", err, raw)
 	}
 }

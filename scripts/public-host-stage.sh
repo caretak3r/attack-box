@@ -17,6 +17,8 @@ RENEW_NEW=/etc/attackbox-public/.renew-new.pem
 SYSTEM_CA=/etc/ssl/certs/ca-certificates.crt
 PUBLIC_USER=abx-public-otel
 PUBLIC_GROUP=abx-public-otel
+CAPTURE_ROOT=/var/lib/attackbox-public-capture
+CAPTURE_DIR=$CAPTURE_ROOT/requests
 
 usage() {
   cat >&2 <<'USAGE'
@@ -271,6 +273,24 @@ verify_public_absent() {
   return 0
 }
 
+# Raw request capture outlives releases: stage creates it once, and rollback never removes it.
+verify_capture_dir() {
+  local create=$1
+  safe_root_parent "$CAPTURE_ROOT"
+  if [[ $create == yes && ! -e $CAPTURE_ROOT && ! -L $CAPTURE_ROOT ]]; then
+    mkdir -m 0700 -- "$CAPTURE_ROOT"
+    chown 0:0 "$CAPTURE_ROOT"
+  fi
+  [[ -e $CAPTURE_ROOT || -L $CAPTURE_ROOT ]] || return 0
+  [[ -d $CAPTURE_ROOT && ! -L $CAPTURE_ROOT && $(stat -c '%u:%g:%a' "$CAPTURE_ROOT") == 0:0:700 ]] || fail 'public capture root must be a root-only 0700 directory'
+  if [[ $create == yes && ! -e $CAPTURE_DIR && ! -L $CAPTURE_DIR ]]; then
+    mkdir -m 0700 -- "$CAPTURE_DIR"
+    chown 65532:65532 "$CAPTURE_DIR"
+  fi
+  [[ -e $CAPTURE_DIR || -L $CAPTURE_DIR ]] || return 0
+  [[ -d $CAPTURE_DIR && ! -L $CAPTURE_DIR && $(stat -c '%u:%g:%a' "$CAPTURE_DIR") == 65532:65532:700 ]] || fail 'public capture directory must be 65532:65532 mode 0700'
+}
+
 verify_common_inputs() {
   local command bait_group
   [[ $EUID -eq 0 ]] || fail 'root is required'
@@ -307,6 +327,7 @@ verify_common_inputs() {
   [[ $(getent group | awk -F: '$3 == 65532 {count++; if ($1 == "abx-bait") own++} END {if (count == 1 && own == 1) print "yes"}') == yes ]] || fail 'private abx-bait group must uniquely own GID 65532'
   verify_ports_free
   verify_public_absent
+  verify_capture_dir no
 }
 
 copy_input() {
@@ -559,7 +580,7 @@ verify_public_bindings() {
   actual=$(docker port "$container") || fail 'cannot inspect public port bindings'
   [[ $actual == "8443/tcp -> $public_ip:443" ]] || fail "public ports are not bound exactly to $public_ip:443"
   mounts=$(docker inspect --type container --format '{{range .Mounts}}{{println .Type .Source .Destination .RW}}{{end}}' "$container" | sed '/^$/d' | sort) || fail 'cannot inspect public mounts'
-  [[ $mounts == $'bind /etc/attackbox-public/tls /run/secrets false\nbind /run/attackbox-public-otel /run/attackbox-public-otel false' ]] || fail 'public mounts must contain only read-only public TLS and socket directories'
+  [[ $mounts == $'bind /etc/attackbox-public/tls /run/secrets false\nbind /run/attackbox-public-otel /run/attackbox-public-otel false\nbind /var/lib/attackbox-public-capture/requests /var/lib/attackbox-public-capture true' ]] || fail 'public mounts must contain only read-only public TLS and socket directories and the capture directory'
   network=$(marker_value project.network_id)
   isolation=$(docker inspect --type container --format \
     '{{.HostConfig.Runtime}} {{.HostConfig.LogConfig.Type}} {{.HostConfig.Privileged}} {{.HostConfig.ReadonlyRootfs}} {{.Config.User}} {{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.PidsLimit}} {{range .HostConfig.CapDrop}}{{.}}{{end}} {{if .HostConfig.CapAdd}}extra{{else}}none{{end}} {{range .HostConfig.SecurityOpt}}{{if or (eq . "no-new-privileges:true") (eq . "no-new-privileges")}}nnp{{end}}{{end}} {{range .NetworkSettings.Networks}}{{.NetworkID}}{{end}}' "$container") || fail 'cannot inspect live public isolation'
@@ -1083,6 +1104,7 @@ run_stage() {
   local suffix index uid
   [[ $approve == "$bundle_sha" ]] || fail 'stage requires --approve equal to the exact bundle SHA-256'
   verify_common_inputs
+  verify_capture_dir yes
   mkdir -m 0700 -- "$STATE" || fail 'public state path appeared during preflight'
   chown root:root "$STATE"
   mkdir -m 0700 -- "$LEDGER" "$WORK"

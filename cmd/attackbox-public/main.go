@@ -35,7 +35,7 @@ const connectionSpanRate = 1
 const connectionSpanBurst = 16
 
 type config struct {
-	socket, host, campaign, cert, key string
+	socket, host, campaign, cert, key, capture string
 }
 
 type app struct {
@@ -45,6 +45,7 @@ type app struct {
 	limiter     rateLimit
 	connLimiter rateLimit
 	slots       chan struct{}
+	capture     *publicedge.Capture
 	accepted    atomic.Uint64
 	limited     atomic.Uint64
 	preHTTP     atomic.Uint64
@@ -76,7 +77,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: attackbox-public [--version|--healthcheck]")
 		os.Exit(2)
 	}
-	cfg := config{socket: os.Getenv("ATTACKBOX_PUBLIC_OTEL_SOCKET"), host: os.Getenv("ATTACKBOX_HOST_ID"), campaign: os.Getenv("ATTACKBOX_CAMPAIGN_ID"), cert: os.Getenv("ATTACKBOX_PUBLIC_TLS_CERT"), key: os.Getenv("ATTACKBOX_PUBLIC_TLS_KEY")}
+	cfg := config{socket: os.Getenv("ATTACKBOX_PUBLIC_OTEL_SOCKET"), host: os.Getenv("ATTACKBOX_HOST_ID"), campaign: os.Getenv("ATTACKBOX_CAMPAIGN_ID"), cert: os.Getenv("ATTACKBOX_PUBLIC_TLS_CERT"), key: os.Getenv("ATTACKBOX_PUBLIC_TLS_KEY"), capture: os.Getenv("ATTACKBOX_PUBLIC_CAPTURE_DIR")}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	a, err := newApp(cfg, func() (net.Listener, error) {
@@ -120,6 +121,12 @@ func newApp(cfg config, listen func() (net.Listener, error)) (_ *app, err error)
 	}()
 
 	gateway := publicedge.NewGateway(tracing.Tracer)
+	if cfg.capture != "" {
+		if a.capture, err = publicedge.OpenCapture(cfg.capture); err != nil {
+			return nil, fmt.Errorf("public capture: %w", err)
+		}
+		gateway.Capture = a.capture
+	}
 	listener, err := listen()
 	if err != nil {
 		return nil, fmt.Errorf("public listener: %w", err)
@@ -327,7 +334,8 @@ func (a *app) trackConn(conn net.Conn, state http.ConnState) {
 func (a *app) emitHealth() {
 	_, span := a.tracing.Tracer.Start(context.Background(), "public.health", trace.WithNewRoot())
 	stats := a.tracing.Health()
-	span.SetAttributes(attribute.Int("server.port", externalPort), attribute.Int64("attackbox.accepted_requests", int64(a.accepted.Load())), attribute.Int64("attackbox.rate_limited_requests", int64(a.limited.Load())), attribute.Int64("attackbox.pre_http_connections", int64(a.preHTTP.Load())), attribute.Int64("attackbox.rejected_connections", int64(a.rejected.Load())), attribute.Int64("attackbox.otel_dropped_spans_total", int64(stats["otel_dropped_spans_total"].(uint64))), attribute.Int64("attackbox.otel_export_failed_spans_total", int64(stats["otel_export_failed_spans_total"].(uint64))))
+	recorded, dropped := a.capture.Counts()
+	span.SetAttributes(attribute.Int("server.port", externalPort), attribute.Int64("attackbox.accepted_requests", int64(a.accepted.Load())), attribute.Int64("attackbox.rate_limited_requests", int64(a.limited.Load())), attribute.Int64("attackbox.pre_http_connections", int64(a.preHTTP.Load())), attribute.Int64("attackbox.rejected_connections", int64(a.rejected.Load())), attribute.Int64("attackbox.captured_requests", int64(recorded)), attribute.Int64("attackbox.capture_dropped", int64(dropped)), attribute.Int64("attackbox.otel_dropped_spans_total", int64(stats["otel_dropped_spans_total"].(uint64))), attribute.Int64("attackbox.otel_export_failed_spans_total", int64(stats["otel_export_failed_spans_total"].(uint64))))
 	span.End()
 }
 
@@ -382,6 +390,7 @@ func (a *app) close() error {
 		if a.tracing != nil {
 			a.closeErr = a.tracing.Close()
 		}
+		_ = a.capture.Close()
 	})
 	return a.closeErr
 }

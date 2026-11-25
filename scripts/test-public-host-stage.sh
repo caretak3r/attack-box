@@ -269,7 +269,8 @@ case "$1" in
         esac ;;
       cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)
         if [[ $* == *'.Mounts'* ]]; then
-          printf '%s\n' 'bind /run/attackbox-public-otel /run/attackbox-public-otel false' 'bind /etc/attackbox-public/tls /run/secrets false'
+          printf '%s\n' 'bind /run/attackbox-public-otel /run/attackbox-public-otel false' 'bind /etc/attackbox-public/tls /run/secrets false' \
+            'bind /var/lib/attackbox-public-capture/requests /var/lib/attackbox-public-capture true'
           [[ ! -e /tmp/mock/foreign-mount ]] || printf 'bind /opt/attackbox /unexpected false\n'
         elif [[ $* == *'.HostConfig.LogConfig.Type'* ]]; then
           if [[ -e /tmp/mock/wrong-isolation ]]; then printf 'runc journald\n'; else
@@ -570,6 +571,13 @@ touch /tmp/mock/legacy-unit
 expect_failure 'public service already exists' bash "$script" check "${common[@]}"
 rm /tmp/mock/legacy-unit
 expect_failure 'stage requires --approve' bash "$script" stage "${common[@]}" --approve "$(printf '%064d' 0)"
+[[ ! -e /var/lib/attackbox-public-capture ]] || fail 'refused stage created the capture directory'
+mkdir -m 0755 /var/lib/attackbox-public-capture
+expect_failure 'public capture root must be a root-only 0700 directory' bash "$script" check "${common[@]}"
+chmod 0700 /var/lib/attackbox-public-capture
+mkdir -m 0700 /var/lib/attackbox-public-capture/requests
+expect_failure 'public capture directory must be 65532:65532 mode 0700' bash "$script" check "${common[@]}"
+rmdir /var/lib/attackbox-public-capture/requests /var/lib/attackbox-public-capture
 
 touch /tmp/mock/fail-public-start
 expect_failure 'public service failed to start' bash "$script" stage "${common[@]}" --approve "$bundle_sha"
@@ -665,6 +673,12 @@ ln /etc/attackbox-public/tls/privkey.pem /tmp/mounted-key
 setpriv --reuid=65532 --regid=65532 --clear-groups -- head -c 1 /tmp/mounted-cert >/dev/null
 setpriv --reuid=65532 --regid=65532 --clear-groups -- head -c 1 /tmp/mounted-key >/dev/null
 rm /tmp/mounted-cert /tmp/mounted-key
+[[ $(stat -c '%u:%g:%a' /var/lib/attackbox-public-capture) == 0:0:700 &&
+   $(stat -c '%u:%g:%a' /var/lib/attackbox-public-capture/requests) == 65532:65532:700 ]] || fail 'capture directory ownership is unsafe'
+if setpriv --reuid=65532 --regid=65532 --clear-groups -- ls /var/lib/attackbox-public-capture/requests >/dev/null 2>&1; then
+  fail 'host bait UID can reach raw captures by their host path'
+fi
+printf '{"target":"/fixture"}\n' >/var/lib/attackbox-public-capture/requests/capture-20000101.jsonl
 [[ $(cat /var/lib/attackbox-public/ledger/file.tls_key.gid):$(cat /var/lib/attackbox-public/ledger/file.tls_key.mode) == 65532:440 ]] || fail 'TLS ownership is absent from the ledger'
 ! grep -q ATTACKBOX_PUBLIC_PROJECT /etc/attackbox-public/runtime.env || fail 'runtime environment duplicates canonical project identity'
 [[ -e /tmp/mock/container && -e /tmp/mock/network && -e /tmp/mock/image && -e /tmp/mock/nft-public ]] || fail 'successful stage omitted public resources'
@@ -743,6 +757,7 @@ for path in /usr/local/libexec/attackbox-public-otel /usr/local/libexec/attackbo
 done
 [[ ! -e /tmp/mock/account && ! -e /tmp/mock/group && ! -e /tmp/mock/image && ! -e /tmp/mock/container && ! -e /tmp/mock/network && ! -e /tmp/mock/nft-public ]] || fail 'rollback retained public resources'
 [[ -f /opt/attackbox/private-marker && -f /tmp/mock/nft-private ]] || fail 'rollback changed private UID or path state'
+[[ -f /var/lib/attackbox-public-capture/requests/capture-20000101.jsonl ]] || fail 'rollback removed retained raw captures'
 
 touch /tmp/mock/ambiguous-load /tmp/mock/fail-image-api-after-load
 expect_failure 'verified public image load failed' bash "$script" stage "${common[@]}" --approve "$bundle_sha"

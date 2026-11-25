@@ -27,6 +27,7 @@ services:
       ATTACKBOX_CAMPAIGN_ID: ${ATTACKBOX_CAMPAIGN_ID:?set ATTACKBOX_CAMPAIGN_ID}
       ATTACKBOX_PUBLIC_TLS_CERT: /run/secrets/fullchain.pem
       ATTACKBOX_PUBLIC_TLS_KEY: /run/secrets/privkey.pem
+      ATTACKBOX_PUBLIC_CAPTURE_DIR: /var/lib/attackbox-public-capture
     volumes:
       - type: bind
         source: /run/attackbox-public-otel
@@ -36,6 +37,10 @@ services:
         source: /etc/attackbox-public/tls
         target: /run/secrets
         read_only: true
+      # Raw request lines stay on the host; the app keeps 7 days at up to 16 MiB per day.
+      - type: bind
+        source: /var/lib/attackbox-public-capture/requests
+        target: /var/lib/attackbox-public-capture
     ports:
       - "${ATTACKBOX_PUBLIC_BIND_IP:?set ATTACKBOX_PUBLIC_BIND_IP}:443:8443/tcp"
     healthcheck:

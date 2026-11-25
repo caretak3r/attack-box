@@ -162,13 +162,15 @@ for project in "$project1" "$project2"; do
     jq -er 'select(.services.public as $s |
       ($s.ports | length) == 1 and
       ($s.ports[0] | .host_ip == "93.184.216.34" and (.published|tostring) == "443" and .target == 8443 and .protocol == "tcp") and
-      ([$s.volumes[] | [.type,.source,.target,.read_only]] | sort) ==
-      [["bind","/etc/attackbox-public/tls","/run/secrets",true],["bind","/run/attackbox-public-otel","/run/attackbox-public-otel",true]] and
+      ([$s.volumes[] | [.type,.source,.target,(.read_only // false)]] | sort) ==
+      [["bind","/etc/attackbox-public/tls","/run/secrets",true],["bind","/run/attackbox-public-otel","/run/attackbox-public-otel",true],
+       ["bind","/var/lib/attackbox-public-capture/requests","/var/lib/attackbox-public-capture",false]] and
       $s.logging.driver == "none" and $s.runtime == "runsc" and $s.read_only and $s.user == "65532:65532" and
       ($s.cpus|tonumber) == 2 and ($s.mem_limit|tonumber) == 536870912 and $s.pids_limit == 128 and
       $s.environment.ATTACKBOX_PUBLIC_OTEL_SOCKET == "/run/attackbox-public-otel/otlp.sock" and
       $s.environment.ATTACKBOX_PUBLIC_TLS_CERT == "/run/secrets/fullchain.pem" and
-      $s.environment.ATTACKBOX_PUBLIC_TLS_KEY == "/run/secrets/privkey.pem") | .networks.public.name')
+      $s.environment.ATTACKBOX_PUBLIC_TLS_KEY == "/run/secrets/privkey.pem" and
+      $s.environment.ATTACKBOX_PUBLIC_CAPTURE_DIR == "/var/lib/attackbox-public-capture") | .networks.public.name')
   [[ $network == "${project}_public" ]] || { echo 'public Compose network is not project-scoped' >&2; exit 1; }
 done
 cat > "$tmp/compose.yaml" <<'YAML'
