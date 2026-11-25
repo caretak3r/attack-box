@@ -10,6 +10,7 @@ import (
 func TestPublicPrivacyCoverageAndReceipt(t *testing.T) {
 	raw := []byte(`{"data":{"actor":{"account":{
 	"total":{"results":[{"count":3,"uniqueCount.id":3}]},
+	"unattributed":{"results":[{"count":100,"uniqueCount.id":100}]},
 	"requests":{"results":[{"count":2,"facet":["/unmatched","404","GET"]},{"count":1,"facet":["SECRET<script>","SECRET","SECRET"]}]},
 	"connections":{"results":[{"count":4,"facet":"tls_failed"},{"count":1,"facet":"SECRET"}]},
 	"health":{"results":[{"latest.timestamp":1795617316450,"latest.attackbox.otel_dropped_spans_total":0}]}
@@ -24,7 +25,7 @@ func TestPublicPrivacyCoverageAndReceipt(t *testing.T) {
 			t.Fatal("untrusted label leaked")
 		}
 	}
-	for _, want := range []string{"3 distinct span IDs", "`tls_failed`: 4", "`GET` | `/unmatched` | 404 | 2", "does not retain request or response bodies", "Latest public-service heartbeat received"} {
+	for _, want := range []string{"3 distinct span IDs", "100 additional request spans without a recorded peer", "`tls_failed`: 4", "`GET` | `/unmatched` | 404 | 2", "does not retain request or response bodies", "Latest public-service heartbeat received"} {
 		if !bytes.Contains(b, []byte(want)) {
 			t.Fatal("missing evidence context", want)
 		}

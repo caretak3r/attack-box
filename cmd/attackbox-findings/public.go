@@ -34,10 +34,11 @@ func publicQuery(day, until time.Time) string {
 	window := fmt.Sprintf(" SINCE %d UNTIL %d", start.Unix(), until.Unix())
 	base := "FROM Span SELECT count(*),uniqueCount(id, precision: 50000) WHERE service.name='attackbox-public-443' AND name="
 	queries := map[string]string{
-		"total":       base + "'public.request'" + window,
-		"requests":    base + "'public.request'" + window + " FACET `http.route`,`http.response.status_code`,`http.request.method` LIMIT MAX",
-		"connections": base + "'public.connection'" + window + " FACET `attackbox.connection.outcome` LIMIT MAX",
-		"health":      "FROM Span SELECT latest(timestamp),latest(`attackbox.otel_dropped_spans_total`),latest(`attackbox.otel_export_failed_spans_total`),latest(`attackbox.rate_limited_requests`) WHERE service.name='attackbox-public-443' AND name='public.health' SINCE 10 minutes ago",
+		"total":        base + "'public.request' AND client.address IS NOT NULL" + window,
+		"requests":     base + "'public.request' AND client.address IS NOT NULL" + window + " FACET `http.route`,`http.response.status_code`,`http.request.method` LIMIT MAX",
+		"unattributed": base + "'public.request' AND client.address IS NULL" + window,
+		"connections":  base + "'public.connection'" + window + " FACET `attackbox.connection.outcome` LIMIT MAX",
+		"health":       "FROM Span SELECT latest(timestamp),latest(`attackbox.otel_dropped_spans_total`),latest(`attackbox.otel_export_failed_spans_total`),latest(`attackbox.rate_limited_requests`) WHERE service.name='attackbox-public-443' AND name='public.health' SINCE 10 minutes ago",
 	}
 	account, err := strconv.ParseUint(os.Getenv("NEW_RELIC_ACCOUNT_ID"), 10, 64)
 	if err != nil || account == 0 {
@@ -45,7 +46,7 @@ func publicQuery(day, until time.Time) string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "{actor{account(id:%d){", account)
-	for _, name := range []string{"total", "requests", "connections", "health"} {
+	for _, name := range []string{"total", "requests", "unattributed", "connections", "health"} {
 		q, _ := json.Marshal(queries[name])
 		fmt.Fprintf(&b, "%s:nrql(query:%s,timeout:20){results}", name, q)
 	}
@@ -99,7 +100,7 @@ func renderPublic(raw []byte, day, until time.Time) ([]byte, error) {
 		return nil, errors.New("New Relic query JSON or GraphQL failure")
 	}
 	account := r.Data.Actor.Account
-	for _, name := range []string{"total", "requests", "connections", "health"} {
+	for _, name := range []string{"total", "requests", "unattributed", "connections", "health"} {
 		if _, ok := account[name]; !ok {
 			return nil, errors.New("incomplete New Relic query")
 		}
@@ -112,6 +113,14 @@ func renderPublic(raw []byte, day, until time.Time) ([]byte, error) {
 	unique, uok := number(totals[0], "uniqueCount.id")
 	if !ok || !uok {
 		return nil, errors.New("invalid public request total")
+	}
+	unattributed := account["unattributed"].Results
+	if len(unattributed) != 1 {
+		return nil, errors.New("missing unaddressed request total")
+	}
+	unchecked, ok := number(unattributed[0], "count")
+	if !ok {
+		return nil, errors.New("invalid unaddressed request total")
 	}
 	table := map[string]float64{}
 	var grouped float64
@@ -138,7 +147,7 @@ func renderPublic(raw []byte, day, until time.Time) ([]byte, error) {
 		return nil, errors.New("public request facets do not cover total")
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "# Security debrief — %s\n\nUpdated from New Relic at %s. HTTP and connection totals cover the Eastern calendar day through %s. The end time trails the query by one minute. Later runs re-query the full day to include delayed arrivals.\n\n## What we observed\n\nThe HTTPS decoy on port 443 recorded **%.0f request span records**, representing **%.0f distinct span IDs**. Distinct counts can be estimates above 50,000 IDs. These are telemetry observations, not confirmed attackers or exploits. Operator probes, health checks and other traffic can be present. The captured metadata cannot identify the purpose of a caller.\n\n| Method | Route category | HTTP status | Span records |\n| --- | --- | ---: | ---: |\n", day.Format("2 January 2006"), clockLabel(time.Now().UTC().Truncate(time.Second)), clockLabel(until), total, unique)
+	fmt.Fprintf(&b, "# Security debrief — %s\n\nUpdated from New Relic at %s. HTTP and connection totals cover the Eastern calendar day through %s. The end time trails the query by one minute. Later runs re-query the full day to include delayed arrivals.\n\n## What we observed\n\nThe HTTPS decoy on port 443 recorded **%.0f request span records with a recorded transport peer**, representing **%.0f distinct span IDs**. Distinct counts can be estimates above 50,000 IDs. These are telemetry observations, not confirmed attackers or exploits. Operator probes can be present. The captured metadata cannot identify the purpose of a caller.\n\n**%.0f additional request spans without a recorded peer are excluded from the visitor table.** Older versions exported loopback health checks as request spans and older releases did not record transport peers. Do not classify all of these records as visitors or discard them all as health checks. Current loopback health checks are excluded by the service.\n\n| Method | Route category | HTTP status | Span records |\n| --- | --- | ---: | ---: |\n", day.Format("2 January 2006"), clockLabel(time.Now().UTC().Truncate(time.Second)), clockLabel(until), total, unique, unchecked)
 	keys := make([]string, 0, len(table))
 	for k := range table {
 		keys = append(keys, k)

@@ -103,12 +103,11 @@ func debrief(b *strings.Builder, samples []sample, counts, notices map[string]in
 	}
 	fmt.Fprintf(b, "At the latest snapshot, **%d of %d expected components reported running**; running-state values were available for %d. Running state does not prove full application or logging health.\n\n", running, len(components), observed)
 	if disk, ok := metric(last, "root_disk_used_percent"); ok {
-		fmt.Fprintf(b, "Root disk use was **%.0f%%**. ", disk)
+		fmt.Fprintf(b, "Root disk use was **%.0f%%**.\n\n", disk)
 	}
 	if ram, ok := metric(last, "MemAvailable_KiB"); ok {
-		fmt.Fprintf(b, "Available memory was **%.2f GiB**. ", ram/(1024*1024))
+		fmt.Fprintf(b, "Available memory was **%.2f GiB**.\n\n", ram/(1024*1024))
 	}
-	b.WriteString("\n\n")
 	if queue, ok := metric(last, "otelcol_exporter_queue_size"); ok {
 		fmt.Fprintf(b, "The telemetry exporter reported a queue size of **%g** at the latest snapshot. A nonzero queue can be transient; one sample does not prove a delivery fault. ", queue)
 	}
@@ -131,6 +130,9 @@ func debrief(b *strings.Builder, samples []sample, counts, notices map[string]in
 	}
 	if len(notices) > 0 {
 		b.WriteString("- Collection warnings are present. Their exact labels and occurrence counts are in the technical evidence below.\n")
+	}
+	if notices["component_count_not_12"] > 0 {
+		b.WriteString("- The legacy watcher expects twelve components. The audit filter adds a thirteenth. This count warning alone is not an outage; check individual running-state values.\n")
 	}
 	b.WriteString("- Confirm current ingress policy before describing this as a public attack campaign.\n- Use the original private logs and New Relic traces to establish actor sequences, payloads, exact responses and any exploit outcome. This aggregate report cannot establish them.\n- Check the latest observation time. The collector requires Mac power and connectivity; a stopped process can leave a running state.\n\n")
 	b.WriteString("## Recent observation timeline\n\nEach row is one collection window. Rows are not linked attacker sessions. The table shows the latest 12 windows; totals above cover the full watch.\n\n| Window end (EST / UTC) | Observed activity | Collection status |\n| --- | --- | --- |\n")
