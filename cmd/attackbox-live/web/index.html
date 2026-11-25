@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>AttackBox live</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="bar">
+  <h1>AttackBox live</h1>
+  <ul class="sources" id="sources" aria-label="Data sources"></ul>
+  <div class="controls">
+    <div class="segment" id="windows" role="group" aria-label="Time window"></div>
+    <input type="search" id="q" placeholder="Filter by IP, path, user-agent, status" aria-label="Filter events" autocomplete="off" spellcheck="false">
+    <button type="button" id="pause" aria-pressed="false">Pause</button>
+  </div>
+</header>
+
+<main>
+  <p class="notice" id="offline" hidden role="alert">The dashboard server does not answer. Start <code>attackbox-live</code> again.</p>
+
+  <section class="scope" id="scope" hidden aria-label="Active selection"></section>
+
+  <section class="who" id="who" aria-label="Outside traffic and your own traffic"></section>
+
+  <section class="overview" aria-label="Volume">
+    <dl class="totals" id="totals"></dl>
+    <figure class="timeline">
+      <svg id="timeline" role="img" aria-labelledby="timeline-caption" preserveAspectRatio="none"></svg>
+      <figcaption id="timeline-caption"></figcaption>
+    </figure>
+  </section>
+
+  <section aria-labelledby="flow-title">
+    <h2 id="flow-title">Sources to endpoints</h2>
+    <p class="hint">Line width shows the event count. Select a source or an endpoint to see only its traffic.</p>
+    <div id="flow"></div>
+  </section>
+
+  <div class="split">
+    <section aria-labelledby="ips-title">
+      <h2 id="ips-title">Sources</h2>
+      <div class="scroll"><table id="ips"></table></div>
+    </section>
+    <section aria-labelledby="endpoints-title">
+      <h2 id="endpoints-title">Endpoints</h2>
+      <div class="scroll"><table id="endpoints"></table></div>
+    </section>
+  </div>
+
+  <section aria-labelledby="feed-title">
+    <h2 id="feed-title">Requests and connections</h2>
+    <div class="scroll tall"><table id="feed"></table></div>
+  </section>
+</main>
+
+<aside class="detail" id="detail" hidden aria-labelledby="detail-title"></aside>
+<script src="app.js"></script>
+</body>
+</html>

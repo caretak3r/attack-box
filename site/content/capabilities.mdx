@@ -83,6 +83,7 @@ The bait holds no ingest key in the deployed profile. The shipper owns the key.
 | `attackbox-evidence` | Reconstructs complete request or response bodies from a local New Relic NDJSON export. Verifies chunk hashes. |
 | `attackbox-watch` | Takes bounded read-only snapshots over SSH. Parses systemd status, container health, disk usage, and journal entries. |
 | `attackbox-findings` | Publishes numeric summaries from watch JSON. Aggregates HTTP status codes, Falco events, and kernel audit drops. |
+| `attackbox-live` | Serves a loopback dashboard of public gateway traffic. Shows each request with its source address, a source-to-endpoint flow, and connections that sent no HTTP request. |
 
 Evidence tools parse captured text as data and never execute it.
 
