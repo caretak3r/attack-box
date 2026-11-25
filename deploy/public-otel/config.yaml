@@ -15,7 +15,7 @@ processors:
   filter/public:
     error_mode: propagate
     trace_conditions:
-      - 'span.name != "public.request" and span.name != "public.health"'
+      - 'span.name != "public.request" and span.name != "public.health" and span.name != "public.connection"'
       - 'Len(span.links) > 0'
       - 'spanevent.name == spanevent.name'
       - 'span.attributes["server.port"] == nil or not IsInt(span.attributes["server.port"])'
@@ -39,8 +39,14 @@ processors:
       - 'span.attributes["http.route"] != nil and IsString(span.attributes["http.route"]) and not IsMatch(span.attributes["http.route"], "^(/unmatched|/v1/models|/v1/chat/completions|/v1/completions|/openai/deployments/[{]deployment[}]/chat/completions)$")'
       - 'span.name == "public.request" and (span.attributes["http.response.status_code"] == nil or not IsInt(span.attributes["http.response.status_code"]))'
       - 'span.attributes["http.response.status_code"] != nil and IsInt(span.attributes["http.response.status_code"]) and (span.attributes["http.response.status_code"] < 100 or span.attributes["http.response.status_code"] > 599)'
+      - 'span.name == "public.connection" and not IsString(span.attributes["attackbox.connection.outcome"])'
+      - 'IsString(span.attributes["attackbox.connection.outcome"]) and not IsMatch(span.attributes["attackbox.connection.outcome"], "^(no_data|not_tls|tls_failed|no_request)$")'
+      - 'span.attributes["attackbox.tls.sni"] != nil and not IsString(span.attributes["attackbox.tls.sni"])'
+      - 'IsString(span.attributes["attackbox.tls.sni"]) and not IsMatch(span.attributes["attackbox.tls.sni"], "^(none|match|other)$")'
       - 'span.attributes["attackbox.accepted_requests"] != nil and not IsInt(span.attributes["attackbox.accepted_requests"])'
       - 'span.attributes["attackbox.rate_limited_requests"] != nil and not IsInt(span.attributes["attackbox.rate_limited_requests"])'
+      - 'span.attributes["attackbox.pre_http_connections"] != nil and not IsInt(span.attributes["attackbox.pre_http_connections"])'
+      - 'span.attributes["attackbox.rejected_connections"] != nil and not IsInt(span.attributes["attackbox.rejected_connections"])'
       - 'span.attributes["attackbox.otel_dropped_spans_total"] != nil and not IsInt(span.attributes["attackbox.otel_dropped_spans_total"])'
       - 'span.attributes["attackbox.otel_export_failed_spans_total"] != nil and not IsInt(span.attributes["attackbox.otel_export_failed_spans_total"])'
   transform/public:
@@ -59,7 +65,8 @@ processors:
       - set(scope.version, "${env:ATTACKBOX_PUBLIC_RELEASE_VERSION}")
       - set(scope.schema_url, "")
       - keep_keys(span.attributes, ["server.port", "attackbox.persona", "http.route", "http.request.method", "http.response.status_code", "client.address", "attackbox.request.content_type", "http.request.body.size", "gen_ai.request.model", "attackbox.request.stream"]) where span.name == "public.request"
-      - keep_keys(span.attributes, ["server.port", "attackbox.accepted_requests", "attackbox.rate_limited_requests", "attackbox.otel_dropped_spans_total", "attackbox.otel_export_failed_spans_total"]) where span.name == "public.health"
+      - keep_keys(span.attributes, ["server.port", "attackbox.accepted_requests", "attackbox.rate_limited_requests", "attackbox.pre_http_connections", "attackbox.rejected_connections", "attackbox.otel_dropped_spans_total", "attackbox.otel_export_failed_spans_total"]) where span.name == "public.health"
+      - keep_keys(span.attributes, ["server.port", "client.address", "attackbox.connection.outcome", "attackbox.tls.sni"]) where span.name == "public.connection"
       - truncate_all(span.attributes, 128)
       - set(span.kind, SPAN_KIND_INTERNAL)
       - set(span.kind, SPAN_KIND_SERVER) where span.name == "public.request"

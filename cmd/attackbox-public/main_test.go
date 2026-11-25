@@ -93,6 +93,7 @@ func TestGatewayHTTPSAndTracing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	a.probe = func(string) bool { return false } // test clients share the healthcheck's loopback peer
 
 	ctx, stop := context.WithCancel(context.Background())
 	finished := make(chan error, 1)
@@ -182,6 +183,99 @@ func TestGatewayHTTPSAndTracing(t *testing.T) {
 	for _, route := range expected {
 		if !seen[route] {
 			t.Errorf("missing route %q", route)
+		}
+	}
+}
+
+func TestPreHTTPConnectionSpans(t *testing.T) {
+	cfg, roots, sink, _ := publicTestConfig(t)
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+	a, err := newApp(cfg, func() (net.Listener, error) { return listener, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.probe = func(string) bool { return false }
+	ctx, stop := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() { finished <- a.run(ctx) }()
+	running := true
+	defer func() {
+		if running {
+			stop()
+			<-finished
+		}
+	}()
+
+	dial := func() net.Conn {
+		conn, err := net.DialTimeout("tcp4", addr, 5*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		return conn
+	}
+	_ = dial().Close()
+	plain := dial()
+	_, _ = io.WriteString(plain, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+	_, _ = io.Copy(io.Discard, plain)
+	_ = plain.Close()
+	untrusted := tls.Client(dial(), &tls.Config{ServerName: "scanner.invalid", MinVersion: tls.VersionTLS12})
+	if untrusted.Handshake() == nil {
+		t.Fatal("untrusted handshake succeeded")
+	}
+	_ = untrusted.Close()
+	idle := tls.Client(dial(), &tls.Config{RootCAs: roots, ServerName: "localhost", MinVersion: tls.VersionTLS12})
+	if err := idle.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	_ = idle.Close()
+	for deadline := time.Now().Add(5 * time.Second); a.preHTTP.Load() < 4 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := a.preHTTP.Load(); got != 4 || a.accepted.Load() != 0 {
+		t.Fatalf("pre-HTTP connections = %d, accepted requests = %d", got, a.accepted.Load())
+	}
+	stop()
+	running = false
+	if err := <-finished; err != nil {
+		t.Fatal(err)
+	}
+
+	got := make(map[string]string)
+	for len(sink.requests) > 0 {
+		for _, r := range (<-sink.requests).ResourceSpans {
+			for _, s := range r.ScopeSpans {
+				for _, span := range s.Spans {
+					if span.Name != "public.connection" {
+						continue
+					}
+					var outcome, sni string
+					for _, attr := range span.Attributes {
+						switch attr.Key {
+						case "attackbox.connection.outcome":
+							outcome = attr.Value.GetStringValue()
+						case "attackbox.tls.sni":
+							sni = attr.Value.GetStringValue()
+						case "client.address":
+							t.Error("loopback connection acquired an internet client address")
+						}
+					}
+					got[outcome] = sni
+				}
+			}
+		}
+	}
+	want := map[string]string{"no_data": "", "not_tls": "", "tls_failed": "other", "no_request": "match"}
+	if len(got) != len(want) {
+		t.Fatalf("connection outcomes = %v, want %v", got, want)
+	}
+	for outcome, sni := range want {
+		if s, ok := got[outcome]; !ok || s != sni {
+			t.Errorf("outcome %s: sni %q, want %q (all: %v)", outcome, s, sni, got)
 		}
 	}
 }

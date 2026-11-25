@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"sync"
@@ -30,25 +31,31 @@ const externalPort = 443
 const requestRate = 1
 const requestBurst = 4
 const connectionLimit = 128
+const connectionSpanRate = 1
+const connectionSpanBurst = 16
 
 type config struct {
 	socket, host, campaign, cert, key string
 }
 
 type app struct {
-	listener  net.Listener
-	server    *http.Server
-	tracing   *observability.Runtime
-	limiter   rateLimit
-	slots     chan struct{}
-	accepted  atomic.Uint64
-	limited   atomic.Uint64
-	tlsMu     sync.RWMutex
-	tlsCert   *tls.Certificate
-	certPath  string
-	keyPath   string
-	closeOnce sync.Once
-	closeErr  error
+	listener    net.Listener
+	server      *http.Server
+	tracing     *observability.Runtime
+	limiter     rateLimit
+	connLimiter rateLimit
+	slots       chan struct{}
+	accepted    atomic.Uint64
+	limited     atomic.Uint64
+	preHTTP     atomic.Uint64
+	rejected    atomic.Uint64
+	probe       func(remote string) bool
+	tlsMu       sync.RWMutex
+	tlsCert     *tls.Certificate
+	certPath    string
+	keyPath     string
+	closeOnce   sync.Once
+	closeErr    error
 }
 
 func main() {
@@ -104,7 +111,8 @@ func newApp(cfg config, listen func() (net.Listener, error)) (_ *app, err error)
 		return nil, fmt.Errorf("public tracing: %w", err)
 	}
 
-	a := &app{tracing: tracing, limiter: newRateLimit(requestRate, requestBurst, time.Now()), slots: make(chan struct{}, connectionLimit), tlsCert: &pair, certPath: cfg.cert, keyPath: cfg.key}
+	now := time.Now()
+	a := &app{tracing: tracing, limiter: newRateLimit(requestRate, requestBurst, now), connLimiter: newRateLimit(connectionSpanRate, connectionSpanBurst, now), slots: make(chan struct{}, connectionLimit), probe: loopbackPeer, tlsCert: &pair, certPath: cfg.cert, keyPath: cfg.key}
 	defer func() {
 		if err != nil {
 			_ = a.close()
@@ -116,11 +124,11 @@ func newApp(cfg config, listen func() (net.Listener, error)) (_ *app, err error)
 	if err != nil {
 		return nil, fmt.Errorf("public listener: %w", err)
 	}
-	a.listener = &limitedListener{Listener: listener, slots: a.slots}
+	a.listener = &limitedListener{Listener: listener, slots: a.slots, rejected: &a.rejected}
 
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: a.getCertificate}
 	a.server = &http.Server{
-		Handler:           a.admit(gateway),
+		Handler:           a.admit(gateway, publicedge.NewGateway(nil)),
 		TLSConfig:         tlsConfig,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
@@ -128,14 +136,31 @@ func newApp(cfg config, listen func() (net.Listener, error)) (_ *app, err error)
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    8192,
 		ErrorLog:          log.New(io.Discard, "", 0),
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			if lc := publicConn(c); lc != nil {
+				return context.WithValue(ctx, connKey{}, lc)
+			}
+			return ctx
+		},
+		ConnState: a.trackConn,
 	}
 	return a, nil
 }
 
-func (a *app) getCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+func (a *app) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	a.tlsMu.RLock()
-	defer a.tlsMu.RUnlock()
-	return a.tlsCert, nil
+	cert := a.tlsCert
+	a.tlsMu.RUnlock()
+	if c, ok := hello.Conn.(*limitedConn); ok {
+		sni := sniOther
+		if hello.ServerName == "" {
+			sni = sniNone
+		} else if cert.Leaf != nil && cert.Leaf.VerifyHostname(hello.ServerName) == nil {
+			sni = sniMatch
+		}
+		c.sni.Store(sni)
+	}
+	return cert, nil
 }
 
 func (a *app) reloadCertificate() error {
@@ -149,8 +174,16 @@ func (a *app) reloadCertificate() error {
 	return nil
 }
 
-func (a *app) admit(next http.Handler) http.Handler {
+// admit serves the in-container healthcheck untraced and outside the visitor rate limit.
+func (a *app) admit(next, probe http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if c, _ := r.Context().Value(connKey{}).(*limitedConn); c != nil {
+			c.served.Store(true)
+		}
+		if a.probe(r.RemoteAddr) {
+			probe.ServeHTTP(w, r)
+			return
+		}
 		now := time.Now()
 		if !a.limiter.allow(now) {
 			a.limited.Add(1)
@@ -161,6 +194,12 @@ func (a *app) admit(next http.Handler) http.Handler {
 		a.accepted.Add(1)
 		next.ServeHTTP(w, r)
 	})
+}
+
+// loopbackPeer identifies the Docker healthcheck: DNAT and docker-proxy traffic never arrives from 127/8.
+func loopbackPeer(remote string) bool {
+	peer, err := netip.ParseAddrPort(remote)
+	return err == nil && peer.Addr().Unmap().IsLoopback()
 }
 
 type rateLimit struct {
@@ -191,7 +230,8 @@ func (r *rateLimit) allow(now time.Time) bool {
 
 type limitedListener struct {
 	net.Listener
-	slots chan struct{}
+	slots    chan struct{}
+	rejected *atomic.Uint64
 }
 
 func (l *limitedListener) Accept() (net.Conn, error) {
@@ -202,17 +242,40 @@ func (l *limitedListener) Accept() (net.Conn, error) {
 		}
 		select {
 		case l.slots <- struct{}{}:
-			return &limitedConn{Conn: conn, slots: l.slots}, nil
+			return &limitedConn{Conn: conn, slots: l.slots, opened: time.Now()}, nil
 		default:
+			l.rejected.Add(1)
 			_ = conn.Close()
 		}
 	}
 }
 
+const (
+	sniNone uint32 = iota + 1
+	sniMatch
+	sniOther
+)
+
+var sniNames = [...]string{sniNone: "none", sniMatch: "match", sniOther: "other"}
+
+type connKey struct{}
+
 type limitedConn struct {
 	net.Conn
-	slots chan struct{}
-	once  sync.Once
+	slots  chan struct{}
+	once   sync.Once
+	opened time.Time
+	first  atomic.Int32  // first received byte + 1; 0 until data arrives
+	sni    atomic.Uint32 // set once a ClientHello is parsed
+	served atomic.Bool   // a request reached the handler
+}
+
+func (c *limitedConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 && c.first.Load() == 0 {
+		c.first.CompareAndSwap(0, int32(p[0])+1)
+	}
+	return n, err
 }
 
 func (c *limitedConn) Close() error {
@@ -221,10 +284,50 @@ func (c *limitedConn) Close() error {
 	return err
 }
 
+func publicConn(c net.Conn) *limitedConn {
+	if tc, ok := c.(*tls.Conn); ok {
+		c = tc.NetConn()
+	}
+	lc, _ := c.(*limitedConn)
+	return lc
+}
+
+// trackConn records connections that close before any request reaches the handler.
+func (a *app) trackConn(conn net.Conn, state http.ConnState) {
+	c := publicConn(conn)
+	if state != http.StateClosed || c == nil || c.served.Load() || a.probe(c.RemoteAddr().String()) {
+		return
+	}
+	a.preHTTP.Add(1)
+	if !a.connLimiter.allow(time.Now()) {
+		return
+	}
+	outcome := "no_request"
+	switch first := c.first.Load(); {
+	case first == 0:
+		outcome = "no_data"
+	case first != 0x16+1:
+		outcome = "not_tls"
+	default:
+		if tc, ok := conn.(*tls.Conn); !ok || !tc.ConnectionState().HandshakeComplete {
+			outcome = "tls_failed"
+		}
+	}
+	attrs := []attribute.KeyValue{attribute.Int("server.port", externalPort), attribute.String("attackbox.connection.outcome", outcome)}
+	if addr := publicedge.ClientAddress(c.RemoteAddr().String()); addr != "" {
+		attrs = append(attrs, attribute.String("client.address", addr))
+	}
+	if sni := c.sni.Load(); sni != 0 {
+		attrs = append(attrs, attribute.String("attackbox.tls.sni", sniNames[sni]))
+	}
+	_, span := a.tracing.Tracer.Start(context.Background(), "public.connection", trace.WithNewRoot(), trace.WithTimestamp(c.opened), trace.WithAttributes(attrs...))
+	span.End()
+}
+
 func (a *app) emitHealth() {
 	_, span := a.tracing.Tracer.Start(context.Background(), "public.health", trace.WithNewRoot())
 	stats := a.tracing.Health()
-	span.SetAttributes(attribute.Int("server.port", externalPort), attribute.Int64("attackbox.accepted_requests", int64(a.accepted.Load())), attribute.Int64("attackbox.rate_limited_requests", int64(a.limited.Load())), attribute.Int64("attackbox.otel_dropped_spans_total", int64(stats["otel_dropped_spans_total"].(uint64))), attribute.Int64("attackbox.otel_export_failed_spans_total", int64(stats["otel_export_failed_spans_total"].(uint64))))
+	span.SetAttributes(attribute.Int("server.port", externalPort), attribute.Int64("attackbox.accepted_requests", int64(a.accepted.Load())), attribute.Int64("attackbox.rate_limited_requests", int64(a.limited.Load())), attribute.Int64("attackbox.pre_http_connections", int64(a.preHTTP.Load())), attribute.Int64("attackbox.rejected_connections", int64(a.rejected.Load())), attribute.Int64("attackbox.otel_dropped_spans_total", int64(stats["otel_dropped_spans_total"].(uint64))), attribute.Int64("attackbox.otel_export_failed_spans_total", int64(stats["otel_export_failed_spans_total"].(uint64))))
 	span.End()
 }
 

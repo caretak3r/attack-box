@@ -114,6 +114,7 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	a.probe = func(string) bool { return false } // test clients share the healthcheck's loopback peer
 
 	serverCtx, stop := context.WithCancel(context.Background())
 	finished := make(chan error, 1)
@@ -164,6 +165,17 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 			t.Fatalf("%s %s: status %d", tc.method, tc.path, resp.StatusCode)
 		}
 	}
+	plain, err := net.DialTimeout("tcp4", addr, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = plain.SetDeadline(time.Now().Add(5 * time.Second))
+	_, _ = io.WriteString(plain, "GET /?token="+privateMarker+" HTTP/1.1\r\nHost: x\r\n\r\n")
+	_, _ = io.Copy(io.Discard, plain)
+	_ = plain.Close()
+	for deadline := time.Now().Add(5 * time.Second); a.preHTTP.Load() < 1 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	a.emitHealth()
 	stop()
@@ -178,28 +190,44 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 	running = false
 
 	seen := make(map[string]bool)
-	health := false
+	health, connection := false, false
 	expected := []string{"/v1/models", "/v1/chat/completions", "/v1/completions", "/openai/deployments/{deployment}/chat/completions"}
-	for !health || len(seen) < len(expected) {
+	for !health || !connection || len(seen) < len(expected) {
 		var req *collector.ExportTraceServiceRequest
 		select {
 		case req = <-got:
 		case <-ctx.Done():
-			t.Fatalf("collector deadline: health=%t routes=%v", health, seen)
+			t.Fatalf("collector deadline: health=%t connection=%t routes=%v", health, connection, seen)
 		}
 		for _, r := range req.ResourceSpans {
 			for _, s := range r.ScopeSpans {
 				for _, span := range s.Spans {
 					if span.Name == "public.health" {
 						health = true
-						var port int64
+						var port, preHTTP int64
 						for _, attr := range span.Attributes {
-							if attr.Key == "server.port" {
+							switch attr.Key {
+							case "server.port":
 								port = attr.Value.GetIntValue()
+							case "attackbox.pre_http_connections":
+								preHTTP = attr.Value.GetIntValue()
 							}
 						}
-						if port != externalPort {
-							t.Errorf("health span: expected port %d, got %d", externalPort, port)
+						if port != externalPort || preHTTP != 1 {
+							t.Errorf("health span: port %d, pre-HTTP connections %d", port, preHTTP)
+						}
+						continue
+					}
+					if span.Name == "public.connection" {
+						connection = true
+						var outcome string
+						for _, attr := range span.Attributes {
+							if attr.Key == "attackbox.connection.outcome" {
+								outcome = attr.Value.GetStringValue()
+							}
+						}
+						if outcome != "not_tls" {
+							t.Errorf("connection span outcome %q, want not_tls", outcome)
 						}
 						continue
 					}

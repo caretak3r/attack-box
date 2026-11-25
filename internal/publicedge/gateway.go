@@ -73,7 +73,7 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 			attrs = append(attrs, attribute.Int("server.port", 443), attribute.String("attackbox.persona", "cloud-gateway"),
 				attribute.String("http.route", route), attribute.String("http.request.method", gatewayPublicMethod(r.Method)),
 				attribute.Int("http.response.status_code", status), attribute.String("attackbox.request.content_type", gatewayContentType(r.Header.Get("Content-Type"))))
-			if addr := gatewayClientAddress(r.RemoteAddr); addr != "" {
+			if addr := ClientAddress(r.RemoteAddr); addr != "" {
 				attrs = append(attrs, attribute.String("client.address", addr))
 			}
 			if r.ContentLength >= 0 {
@@ -183,7 +183,8 @@ func gatewayPublicMethod(method string) string {
 	}
 }
 
-func gatewayClientAddress(remoteAddr string) string {
+// ClientAddress returns the canonical public IPv4 of a TCP peer, or "" for local, private, shared or non-IPv4 peers.
+func ClientAddress(remoteAddr string) string {
 	peer, err := netip.ParseAddrPort(remoteAddr)
 	if err != nil || peer.Port() == 0 || peer.Addr().Zone() != "" {
 		return ""

@@ -174,7 +174,7 @@ func TestGatewayReadObjectRejectsOversized(t *testing.T) {
 	}
 }
 
-func TestGatewayClientAddress(t *testing.T) {
+func TestClientAddress(t *testing.T) {
 	tests := []struct {
 		name   string
 		remote string
@@ -198,9 +198,9 @@ func TestGatewayClientAddress(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := gatewayClientAddress(tt.remote)
+			got := ClientAddress(tt.remote)
 			if got != tt.want {
-				t.Errorf("gatewayClientAddress(%q) = %q, want %q", tt.remote, got, tt.want)
+				t.Errorf("ClientAddress(%q) = %q, want %q", tt.remote, got, tt.want)
 			}
 		})
 	}
