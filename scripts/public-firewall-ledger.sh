@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Source only, from the trusted isolated-443 operator. Never source the legacy launcher.
-# public_firewall_open DIR INSTANCE FIREWALL BIND_IPV4 COMMIT BUNDLE_SHA256 443 SSH_RULE_ID MGMT_IPV4/32
+# public_firewall_open DIR INSTANCE FIREWALL BIND_IPV4 COMMIT BUNDLE_SHA256 PORTS SSH_RULE_ID MGMT_IPV4/32
 # public_firewall_rollback DIR   (idempotent after confirmed closure; keep the ledger)
 #
 # The caller must verify separate /32 management-policy approval, console access, signed
@@ -79,8 +79,8 @@ def complete(reply, name):
     return rows
 
 def check_state(s):
-    require(set(s) == set("version instance firewall ip commit bundle_sha token ssh_id management phase rule_id".split()))
-    require(type(s["version"]) is int and s["version"] == 2)
+    require(set(s) == set("version instance firewall ip commit bundle_sha token ssh_id management phase ports rules".split()))
+    require(type(s["version"]) is int and s["version"] == 3)
     for key in ("instance", "firewall"):
         require(re.fullmatch(r"[A-Za-z0-9_-]{1,128}", s[key]))
     bind = ipaddress.IPv4Address(s["ip"])
@@ -92,20 +92,31 @@ def check_state(s):
     for key in ("bundle_sha", "token"):
         require(re.fullmatch(r"[0-9a-f]{64}", s[key]))
     require(rid(s["ssh_id"]))
-    if s["phase"] == "intent":
-        require(s["rule_id"] is None)
-    else:
-        require(s["phase"] in ("ack", "open", "deleting", "closed") and
-                rid(s["rule_id"]) and (s["phase"] == "ack" or s["rule_id"] != s["ssh_id"]))
+    require(type(s["ports"]) is list and len(s["ports"]) > 0)
+    allowed = {80, 443, 1234, 8000, 8080, 11434}
+    require(all(type(p) is int and p in allowed for p in s["ports"]))
+    require(len(s["ports"]) == len(set(s["ports"])))
+    require(s["ports"] == sorted(s["ports"]))
+    require(type(s["rules"]) is dict)
+    for k, v in s["rules"].items():
+        require(type(k) is str and re.fullmatch(r"[1-9][0-9]{0,4}", k) and int(k) in s["ports"] and rid(v))
+    require(len(set(s["rules"].values())) == len(s["rules"]))
+    count = len(s["rules"])
+    require(s["phase"] in ("intent", "ack", "open", "deleting", "closed") and
+            (s["phase"] == "intent" or count >= 1) and
+            (s["phase"] != "open" or count == len(s["ports"])) and
+            (s["phase"] == "ack" or s["ssh_id"] not in s["rules"].values()))
 
 def check():
     op, *args = sys.argv[1:]
     if op == "plan":
-        instance, firewall, ip, commit, sha, ports, ssh_id, management = args
-        require(ports == "443" and re.fullmatch(r"[1-9][0-9]{0,15}", ssh_id))
-        s = dict(version=2, instance=instance, firewall=firewall, ip=ip, commit=commit,
+        instance, firewall, ip, commit, sha, ports_str, ssh_id, management = args
+        require(re.fullmatch(r"[1-9][0-9]{0,4}(?:,[1-9][0-9]{0,4})*", ports_str))
+        require(re.fullmatch(r"[1-9][0-9]{0,15}", ssh_id))
+        ports = sorted(int(p) for p in ports_str.split(","))
+        s = dict(version=3, instance=instance, firewall=firewall, ip=ip, commit=commit,
                  bundle_sha=sha, token=secrets.token_hex(32), ssh_id=int(ssh_id),
-                 management=management, phase="intent", rule_id=None)
+                 management=management, phase="intent", ports=ports, rules={})
         check_state(s)
         print(json.dumps(s, separators=(",", ":")))
         return
@@ -113,10 +124,12 @@ def check():
     check_state(s)
     if op == "state":
         return
-    note = "attackbox-public:" + s["token"] + ":443"
-    public = dict(ip_type="v4", protocol="tcp", port="443", subnet="0.0.0.0",
-                  subnet_size=0, source="", notes=note)
     if op == "body":
+        port = int(args[1])
+        require(port in s["ports"])
+        note = "attackbox-public:" + s["token"] + ":" + str(port)
+        public = dict(ip_type="v4", protocol="tcp", port=str(port), subnet="0.0.0.0",
+                      subnet_size=0, source="", notes=note)
         print(json.dumps(public, separators=(",", ":")))
         return
     reply = parse(sys.stdin.read())
@@ -130,7 +143,7 @@ def check():
         if "instance_count" in row:
             require(type(row["instance_count"]) is int and row["instance_count"] == 1)
         if "rule_count" in row:
-            require(type(row["rule_count"]) is int and row["rule_count"] in (1, 2))
+            require(type(row["rule_count"]) is int and 1 <= row["rule_count"] <= 1 + len(s["ports"]))
         print(row.get("rule_count", 0))
     elif op == "attachments":
         rows = complete(reply, "instances")
@@ -143,11 +156,12 @@ def check():
         print(n)
     elif op == "rules":
         rows = complete(reply, "firewall_rules")
-        require(len(rows) in (1, 2) and int(args[1]) in (0, len(rows)))
-        ssh = dict(public, action="accept", id=s["ssh_id"], port="22",
-                   subnet=s["management"].split("/")[0], subnet_size=32,
+        require(1 <= len(rows) <= 1 + len(s["ports"]) and int(args[1]) in (0, len(rows)))
+        ssh = dict(action="accept", id=s["ssh_id"], ip_type="v4", protocol="tcp", port="22",
+                   subnet=s["management"].split("/")[0], subnet_size=32, source="",
                    notes="bootstrap ssh; lockdown removes it")
-        found_ssh, owned = False, None
+        found_ssh = False
+        owned = {}
         for row in rows:
             n = row["id"]
             require(rid(n) and type(row["subnet_size"]) is int)
@@ -160,12 +174,21 @@ def check():
                 require(not found_ssh)
                 found_ssh = True
             else:
-                require(owned is None and n != s["ssh_id"] and
-                        (s["rule_id"] is None or n == s["rule_id"]) and
-                        row == dict(public, id=n, action="accept"))
-                owned = n
+                require(n != s["ssh_id"])
+                port = int(row["port"])
+                require(port in s["ports"] and port not in owned)
+                note = "attackbox-public:" + s["token"] + ":" + str(port)
+                public = dict(ip_type="v4", protocol="tcp", port=str(port), subnet="0.0.0.0",
+                              subnet_size=0, source="", notes=note)
+                require(row == dict(public, id=n, action="accept"))
+                if str(port) in s["rules"]:
+                    require(n == s["rules"][str(port)])
+                owned[port] = n
         require(found_ssh)
-        print("absent" if owned is None else owned)
+        if len(owned) == 0:
+            print("absent")
+        else:
+            print(",".join(str(p) + "=" + str(owned[p]) for p in sorted(owned)))
     else:
         require(False)
 
@@ -185,55 +208,69 @@ _public_fw_snapshot() {
   api GET "/firewalls/$fw/rules?per_page=500" | _public_fw_check rules "$state" "$count"
 }
 
+# Canonical "port=id,..." in ascending port order, the form the rules inventory prints.
+_public_fw_pairs() {
+  jq -er 'to_entries | sort_by(.key | tonumber) | map("\(.key)=\(.value)") | join(",")' <<<"$1"
+}
+
 # Caller holds the directory lock. Persist each transition before relying on it.
 _public_fw_mark() {
   local updated
-  updated=$(jq -ce --arg phase "$1" --argjson id "$2" '.phase=$phase | .rule_id=$id' <<<"$state") || return 1
+  updated=$(jq -ce --arg phase "$1" --argjson rules "$2" '.phase=$phase | .rules=$rules' <<<"$state") || return 1
   _public_fw_write "$updated" replace "$ledger" || return 1
   state=$updated
 }
 
 _public_fw_close_locked() {
-  local observed phase current
+  local observed phase current rules id
   observed=$(_public_fw_snapshot "$state" "$instance" "$fw") || return 1
   phase=$(jq -er .phase <<<"$state") || return 1
   if [[ $observed == absent ]]; then
     case $phase in
       closed) return 0 ;;
-      deleting) _public_fw_mark closed "$(jq -er .rule_id <<<"$state")"; return ;;
+      deleting) _public_fw_mark closed "$(jq -ce .rules <<<"$state")"; return ;;
       *) return 1 ;; # Unseen or delayed POST, not proof of rollback.
     esac
   fi
   [[ $phase != closed ]] || return 1
-  _public_fw_mark deleting "$observed" || return 1
+  rules=$(jq -cne --arg o "$observed" '[$o | split(",")[] | split("=") | {(.[0]): (.[1] | tonumber)}] | add') || return 1
+  _public_fw_mark deleting "$rules" || return 1
   current=$(_public_fw_snapshot "$state" "$instance" "$fw") || return 1
   [[ $current == "$observed" ]] || return 1
   # A lost DELETE response can be resolved only by a fresh, successful full read.
-  del "/firewalls/$fw/rules/$observed" >/dev/null || :
+  for id in $(jq -r '.[]' <<<"$rules"); do
+    del "/firewalls/$fw/rules/$id" >/dev/null || :
+  done
   current=$(_public_fw_snapshot "$state" "$instance" "$fw") || return 1
   [[ $current == absent ]] || return 1
-  _public_fw_mark closed "$observed"
+  _public_fw_mark closed "$rules"
 }
 
 public_firewall_open() (
   set -o pipefail
   umask 077
   [[ $# == 9 ]] && declare -F api del >/dev/null || return 1
-  local dir=$1 instance=$2 fw=$3 ledger=$1/public-firewall-ledger.json state id body observed
+  local dir=$1 instance=$2 fw=$3 ledger=$1/public-firewall-ledger.json state id body observed port rules='{}' ok=false
   state=$(_public_fw_check plan "${@:2}") || return 1
   _public_fw_lock "$dir" || return 1
   trap 'rmdir -- "$dir/.public-firewall-lock"' EXIT
   trap 'exit 1' HUP INT TERM
   [[ ! -e $ledger && ! -L $ledger ]] || { _public_fw_error 'ledger already exists' "$dir"; return 1; }
   observed=$(_public_fw_snapshot "$state" "$instance" "$fw") && [[ $observed == absent ]] || return 1
-  body=$(_public_fw_check body "$state") || return 1
   _public_fw_write "$state" create "$ledger" || return 1
   observed=$(_public_fw_snapshot "$state" "$instance" "$fw") && [[ $observed == absent ]] || return 1
-  if id=$(api POST "/firewalls/$fw/rules" "$body" | _public_fw_check post "$state"); then
-    _public_fw_mark ack "$id" || { _public_fw_error 'cannot persist POST identity' "$dir"; return 1; }
-    if observed=$(_public_fw_snapshot "$state" "$instance" "$fw") && [[ $observed == "$id" ]]; then
-      _public_fw_mark open "$id" && return 0
-    fi
+  # One rule per port; the inventory must match the recorded IDs after every POST.
+  for port in $(jq -r '.ports[]' <<<"$state"); do
+    ok=false
+    body=$(_public_fw_check body "$state" "$port") &&
+      id=$(api POST "/firewalls/$fw/rules" "$body" | _public_fw_check post "$state") || break
+    rules=$(jq -ce --arg p "$port" --argjson id "$id" '.[$p]=$id' <<<"$rules") && _public_fw_mark ack "$rules" ||
+      { _public_fw_error 'cannot persist POST identity' "$dir"; return 1; }
+    observed=$(_public_fw_snapshot "$state" "$instance" "$fw") && [[ $observed == "$(_public_fw_pairs "$rules")" ]] || break
+    ok=true
+  done
+  if $ok && _public_fw_mark open "$rules"; then
+    return 0
   fi
   if _public_fw_close_locked; then
     printf '%s\n' 'Cutover failed; verified rollback to the recorded SSH /32.' >&2
@@ -255,5 +292,5 @@ public_firewall_rollback() (
     { _public_fw_error 'missing or invalid ledger' "$dir"; return 1; }
   instance=$(jq -er .instance <<<"$state") && fw=$(jq -er .firewall <<<"$state") || return 1
   _public_fw_close_locked || { _public_fw_error 'cannot prove safe rollback' "$dir"; return 1; }
-  printf '%s\n' 'Verified recorded bootstrap SSH /32 only; no public TCP/443 rule remains.'
+  printf '%s\n' 'Verified recorded bootstrap SSH /32 only; no public TCP rule remains.'
 )

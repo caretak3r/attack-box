@@ -280,6 +280,95 @@ func TestPreHTTPConnectionSpans(t *testing.T) {
 	}
 }
 
+func TestPlainListenerReportsItsPort(t *testing.T) {
+	cfg, _, sink, dir := publicTestConfig(t)
+	cfg.capture = filepath.Join(dir, "capture")
+	if err := os.Mkdir(cfg.capture, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a, err := newApp(cfg, func() (net.Listener, error) { return net.Listen("tcp4", "127.0.0.1:0") })
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.probe = func(string) bool { return false }
+	plain, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := plain.Addr().String()
+	a.addPlain(8000, plain)
+	ctx, stop := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() { finished <- a.run(ctx) }()
+
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get("http://" + addr + "/v1/models")
+	if err != nil {
+		stop()
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != 200 || !strings.Contains(string(body), `"local-instruct-8b"`) {
+		t.Errorf("plain /v1/models: status %d, body %q", resp.StatusCode, body)
+	}
+	// A TLS ClientHello byte on a plain port is data without a request, not a TLS failure.
+	for _, payload := range []string{"", "\x16\x03\x01\r\n\r\n"} {
+		conn, err := net.DialTimeout("tcp4", addr, 5*time.Second)
+		if err != nil {
+			stop()
+			t.Fatal(err)
+		}
+		_, _ = io.WriteString(conn, payload)
+		if payload != "" {
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			_, _ = io.Copy(io.Discard, conn) // wait until the server gives up on the bytes
+		}
+		_ = conn.Close()
+	}
+	for deadline := time.Now().Add(10 * time.Second); a.preHTTP.Load() < 2 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	stop()
+	if err := <-finished; err != nil {
+		t.Fatal(err)
+	}
+
+	requests, outcomes := 0, make(map[string]bool)
+	for len(sink.requests) > 0 {
+		for _, r := range (<-sink.requests).ResourceSpans {
+			for _, s := range r.ScopeSpans {
+				for _, span := range s.Spans {
+					var port int64
+					var outcome string
+					for _, attr := range span.Attributes {
+						switch attr.Key {
+						case "server.port":
+							port = attr.Value.GetIntValue()
+						case "attackbox.connection.outcome":
+							outcome = attr.Value.GetStringValue()
+						}
+					}
+					if port != 8000 {
+						t.Errorf("%s span reports port %d, want 8000", span.Name, port)
+					}
+					if span.Name == "public.request" {
+						requests++
+					} else {
+						outcomes[outcome] = true
+					}
+				}
+			}
+		}
+	}
+	if requests != 1 || len(outcomes) != 2 || !outcomes["no_data"] || !outcomes["no_request"] {
+		t.Errorf("plain port spans: %d requests, connection outcomes %v", requests, outcomes)
+	}
+	raw, err := os.ReadFile(filepath.Join(cfg.capture, "capture-"+time.Now().UTC().Format("20060102")+".jsonl"))
+	if err != nil || !strings.Contains(string(raw), `"port":8000`) {
+		t.Errorf("capture lacks the plain port: %v\n%s", err, raw)
+	}
+}
+
 func TestRateLimitBoundsAndRefills(t *testing.T) {
 	now := time.Unix(1000, 0)
 	r := newRateLimit(1, 2, now)

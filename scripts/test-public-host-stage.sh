@@ -95,7 +95,11 @@ MOCK
 cat >/usr/local/bin/ss <<'MOCK'
 #!/bin/bash
 printf 'LISTEN 0 128 127.0.0.1:443 0.0.0.0:*\n'
-if [[ -e /tmp/mock/listener ]]; then printf 'LISTEN 0 128 %s:443 0.0.0.0:*\n' "$(cat /tmp/mock/listener)"; fi
+if [[ -e /tmp/mock/listener ]]; then
+  port=443
+  [[ ! -e /tmp/mock/listener-port ]] || port=$(cat /tmp/mock/listener-port)
+  printf 'LISTEN 0 128 %s:%s 0.0.0.0:*\n' "$(cat /tmp/mock/listener)" "$port"
+fi
 MOCK
 cat >/usr/local/bin/openssl <<'MOCK'
 #!/bin/bash
@@ -366,11 +370,17 @@ case "$1" in
     ;;
   port)
     if [[ $last == "$(printf '%064d' 1)" && -e /tmp/mock/docker-listener ]]; then
-      printf '9443/tcp -> 0.0.0.0:443\n'
+      port=443
+      [[ ! -e /tmp/mock/docker-listener-port ]] || port=$(cat /tmp/mock/docker-listener-port)
+      printf '9443/tcp -> 0.0.0.0:%s\n' "$port"
     else
       [[ $last == cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc && -e /tmp/mock/container ]]
-      printf '8443/tcp -> 93.184.216.34:443\n'
-      [[ ! -e /tmp/mock/extra-publication ]] || printf '8080/tcp -> 93.184.216.34:80\n'
+      if [[ -e /tmp/mock/partial-bindings ]]; then
+        printf '8443/tcp -> 93.184.216.34:443\n'
+      else
+        printf '20080/tcp -> 93.184.216.34:80\n21234/tcp -> 93.184.216.34:1234\n28000/tcp -> 93.184.216.34:8000\n28080/tcp -> 93.184.216.34:8080\n31434/tcp -> 93.184.216.34:11434\n8443/tcp -> 93.184.216.34:443\n'
+        [[ ! -e /tmp/mock/extra-publication ]] || printf '9000/tcp -> 93.184.216.34:9000\n'
+      fi
     fi
     ;;
   *) exit 1 ;;
@@ -538,6 +548,14 @@ rm /tmp/mock/listener
 touch /tmp/mock/docker-listener
 expect_failure 'Docker publication already owns' bash "$script" check "${common[@]}"
 rm /tmp/mock/docker-listener
+printf '%s\n' "$public_ip" >/tmp/mock/listener
+printf '8000\n' >/tmp/mock/listener-port
+expect_failure 'listener already owns port 8000' bash "$script" check "${common[@]}"
+rm /tmp/mock/listener /tmp/mock/listener-port
+touch /tmp/mock/docker-listener
+printf '11434\n' >/tmp/mock/docker-listener-port
+expect_failure 'Docker publication already owns' bash "$script" check "${common[@]}"
+rm /tmp/mock/docker-listener /tmp/mock/docker-listener-port
 for addr in 127.0.0.2 10.1.2.3 0.0.0.0 224.0.0.1 198.51.100.1; do
   expect_failure 'globally routable' bash "$script" check "${common[@]}" --public-ip "$addr"
 done
@@ -626,7 +644,7 @@ rmdir /run/attackbox-public-otel
 bash "$script" rollback --approve "$bundle_sha" >/dev/null
 [[ $(cat /tmp/mock/stops) == attackbox-public-otel.service && ! -e /var/lib/attackbox-public ]] || fail 'repeat rollback tried to stop a missing unit'
 
-for check in 'extra-publication:ports are not bound exactly' 'foreign-mount:public mounts must contain only' \
+for check in 'partial-bindings:ports are not bound exactly' 'extra-publication:ports are not bound exactly' 'foreign-mount:public mounts must contain only' \
   'wrong-isolation:live public isolation differs' 'live-untrusted:live public HTTPS failed'; do
   touch "/tmp/mock/${check%%:*}"
   expect_failure "${check#*:}" bash "$script" stage "${common[@]}" --approve "$bundle_sha"

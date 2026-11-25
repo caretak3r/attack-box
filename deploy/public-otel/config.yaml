@@ -19,7 +19,7 @@ processors:
       - 'Len(span.links) > 0'
       - 'spanevent.name == spanevent.name'
       - 'span.attributes["server.port"] == nil or not IsInt(span.attributes["server.port"])'
-      - 'span.attributes["server.port"] != 443 or resource.attributes["service.name"] != "attackbox-public-443"'
+      - 'not IsMatch(String(span.attributes["server.port"]), "^(80|443|1234|8000|8080|11434)$") or resource.attributes["service.name"] != "attackbox-public-443"'
       - 'span.attributes["client.address"] != nil and not IsString(span.attributes["client.address"])'
       # Canonical IPv4 octets; keep local, shared, and non-unicast peers out of this public stream.
       - 'IsString(span.attributes["client.address"]) and not IsMatch(span.attributes["client.address"], "^([1-9][0-9]?|1[0-9]{2}|2[01][0-9]|22[0-3])([.](0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}$")'

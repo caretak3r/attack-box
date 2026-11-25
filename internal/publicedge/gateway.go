@@ -2,6 +2,7 @@ package publicedge
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
@@ -66,6 +67,21 @@ func gatewayRequestModel(r *http.Request, obj map[string]json.RawMessage) (strin
 
 const gatewayJSON = "application/json"
 const gatewayBodyLimit = 64 << 10
+
+type portKey struct{}
+
+// WithPort records the public port a connection arrived on.
+func WithPort(ctx context.Context, port int) context.Context {
+	return context.WithValue(ctx, portKey{}, port)
+}
+
+// requestPort defaults to 443 when no listener set a port.
+func requestPort(r *http.Request) int {
+	if port, ok := r.Context().Value(portKey{}).(int); ok {
+		return port
+	}
+	return 443
+}
 
 type Gateway struct {
 	tracer trace.Tracer
@@ -173,7 +189,7 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 		}
 		if span.IsRecording() {
 			attrs := make([]attribute.KeyValue, 0, 13)
-			attrs = append(attrs, attribute.Int("server.port", 443), attribute.String("attackbox.persona", "cloud-gateway"),
+			attrs = append(attrs, attribute.Int("server.port", requestPort(r)), attribute.String("attackbox.persona", "cloud-gateway"),
 				attribute.String("http.route", route), attribute.String("http.request.method", gatewayPublicMethod(r.Method)),
 				attribute.Int("http.response.status_code", status), attribute.String("attackbox.request.content_type", gatewayContentType(r.Header.Get("Content-Type"))),
 				attribute.Int("attackbox.request.query_params", gatewayQueryParams(r.URL.RawQuery)))

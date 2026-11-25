@@ -86,7 +86,7 @@ func (c *Capture) Record(r *http.Request, route string, status int, probe string
 	rec := captureRecord{
 		Time: c.now().UTC().Format(time.RFC3339Nano), Peer: clip(peer, captureHeader), Method: clip(r.Method, 32),
 		Target: clip(r.RequestURI, captureTarget), Host: clip(r.Host, captureHeader), UserAgent: clip(r.UserAgent(), captureHeader),
-		Route: route, Status: status, Probe: probe, Port: 443, Proto: clip(r.Proto, 16),
+		Route: route, Status: status, Probe: probe, Port: requestPort(r), Proto: clip(r.Proto, 16),
 	}
 
 	type headerPair struct {

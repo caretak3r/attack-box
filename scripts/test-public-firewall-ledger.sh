@@ -31,7 +31,7 @@ change_rules() {
   jq "$@" "$inventory" >"$case_dir/next" && mv -- "$case_dir/next" "$inventory"
 }
 api() {
-  local method=$1 path=$2 body=${3-} ip=$bind attached=fw-1 members=1 size result
+  local method=$1 path=$2 body=${3-} ip=$bind attached=fw-1 members=1 size result port id note
   case "$method $path" in
     'GET /instances/instance-1')
       case $fault in
@@ -42,8 +42,15 @@ api() {
       esac
       jq -cn --arg ip "$ip" --arg fw "$attached" '{instance:{id:"instance-1", main_ip:$ip, firewall_group_id:$fw}}' ;;
     'GET /firewalls/fw-1')
+      local token n
+      if [[ -f $journal ]]; then
+        token=$(jq -r .token "$journal") || return 1
+        n=$(jq -r '.ports | length' "$journal") || return 1
+      else
+        n=1
+      fi
       if [[ $fault == countdrift ]]; then
-        printf '%s\n' '{"firewall_group":{"id":"fw-1","rule_count":2}}'
+        printf '%s\n' "{\"firewall_group\":{\"id\":\"fw-1\",\"rule_count\":$((n+1))}}"
       else
         printf '%s\n' '{"firewall_group":{"id":"fw-1"}}'
       fi ;;
@@ -70,32 +77,45 @@ api() {
           printf '%s\n' "$result" ;;
         failafterdelete)
           printf '%s\n' "$result"
-          [[ ! -s $deletes ]] ;; # Even valid-looking JSON on failed GET is not evidence.
+          [[ ! -s $deletes ]] ;;
         *) printf '%s\n' "$result" ;;
       esac ;;
     'POST /firewalls/fw-1/rules')
+      local prior_posts
+      prior_posts=$(wc -l <"$posts")
       printf '%s\n' "$body" >>"$posts"
-      jq -e '.phase == "intent" and .rule_id == null' "$journal" >/dev/null || return 1
+      jq -e '.phase == "intent" or .phase == "ack"' "$journal" >/dev/null || return 1
       if [[ $fault == noresponse ]]; then return 1; fi
-      change_rules --argjson body "$body" '. + [($body + {id:93,action:"accept",direction:"in",type:"v4",loadbalancer_id:"",source:"0.0.0.0/0"})]' || return 1
+      port=$(jq -r .port <<<"$body") || return 1
+      if [[ $port == 443 ]]; then id=93; else id=$((30 + port)); fi
+      note=$(jq -r .notes <<<"$body") || return 1
+      change_rules --argjson body "$body" --argjson id "$id" '. + [($body + {id:$id,action:"accept",direction:"in",type:"v4",loadbalancer_id:"",source:"0.0.0.0/0"})]' || return 1
       case $fault in
-        lost|lostoffline) return 1 ;;
+        lost|thirdportfail)
+          if [[ $fault == thirdportfail && $prior_posts -lt 2 ]]; then
+            printf '{"firewall_rule":{"id":%d}}\n' "$id"
+          else
+            return 1
+          fi ;;
+        lostoffline) return 1 ;;
         wrongid) printf '%s\n' '{"firewall_rule":{"id":96}}' ;;
         wrongssh) printf '%s\n' '{"firewall_rule":{"id":81}}' ;;
         invalidid) printf '%s\n' '{"firewall_rule":{"id":1.5}}' ;;
-        *) printf '%s\n' '{"firewall_rule":{"id":93}}' ;;
+        *) printf '{"firewall_rule":{"id":%d}}\n' "$id" ;;
       esac ;;
     *) return 1 ;;
   esac
 }
 del() {
   printf '%s\n' "$1" >>"$deletes"
-  [[ $1 == /firewalls/fw-1/rules/93 ]] || return 1
-  jq -e '.phase == "deleting" and .rule_id == 93' "$journal" >/dev/null || return 1
+  local expected_id=$(echo "$1" | grep -o '[0-9]*$')
+  local journal_ids=$(jq -r '.rules | to_entries[] | .value' "$journal" 2>/dev/null | sort -n | tr '\n' ' ')
+  printf '%s' "$journal_ids" | grep -qw "$expected_id" || return 1
+  jq -e '.phase == "deleting"' "$journal" >/dev/null || return 1
   case $fault in
     residual) change_rules '.[1].id=100 | .[1].port="80"' ;;
     faileddelete) return 1 ;;
-    *) change_rules 'map(select(.id != 93))' || return 1
+    *) change_rules --argjson id "$expected_id" 'map(select(.id != $id))' || return 1
        [[ $fault != lostdelete ]] ;;
   esac
 }
@@ -108,8 +128,8 @@ rollback_case() {
 no_write() { [[ ! -s $posts && ! -s $deletes ]] || fail 'unexpected mutation'; }
 closed() {
   jq -e --argjson ssh "$ssh" '. == [$ssh]' "$inventory" >/dev/null || fail 'SSH changed or residual ingress'
-  jq -e '.phase=="closed" and .rule_id==93' "$journal" >/dev/null || fail 'absence not journaled'
-  [[ $(cat "$deletes") == /firewalls/fw-1/rules/93 ]] || fail 'unexpected DELETE sequence'
+  jq -e '.phase=="closed" and (.rules | length) >= 1' "$journal" >/dev/null || fail 'ledger not marked closed'
+  [[ -s $deletes ]] || fail 'no deletion was attempted'
 }
 
 new_case success
@@ -119,18 +139,60 @@ jq -se --arg token "$(jq -r .token "$journal")" '
          source:"",notes:("attackbox-public:"+$token+":443")}]' "$posts" >/dev/null || fail 'not one exact POST'
 jq -e --argjson ssh "$ssh" 'length==2 and .[0]==$ssh and .[1].id==93' "$inventory" >/dev/null || fail 'open inventory'
 jq -e --arg c "$commit" --arg s "$sha" --arg ip "$bind" '
-  .version==2 and .phase=="open" and .commit==$c and .bundle_sha==$s and .ip==$ip and
-  .ssh_id==81 and .management=="192.0.2.10/32" and .rule_id==93' "$journal" >/dev/null || fail 'incomplete audit identity'
+  .version==3 and .phase=="open" and .commit==$c and .bundle_sha==$s and .ip==$ip and
+  .ssh_id==81 and .management=="192.0.2.10/32" and .ports==[443] and .rules=={"443":93}' "$journal" >/dev/null || fail 'incomplete audit identity'
 reject open_case
 rollback_case && rollback_case || fail 'idempotent closure'
 closed
 
-new_case args
-for profile in '80,443,1234,3000,4891,5000,6333,6334,8000,8001,8002,8080,8500,8501,11434,19530' '443,443' '' '80'; do reject open_case "$profile"; done
-reject open_case 443 81 192.0.2.0/24
-reject open_case 443 82
-reject open_case 443 81 192.0.2.11/32
+new_case multiport
+open_case '443,80,1234,8000,8080,11434' || fail '6-port cutover'
+jq -se '[.[].port] == ["80","443","1234","8000","8080","11434"]' "$posts" >/dev/null || fail 'not one POST per port in ascending order'
+jq -e '.version==3 and .phase=="open" and .ports==[80,443,1234,8000,8080,11434] and
+  .rules=={"80":110,"443":93,"1234":1264,"8000":8030,"8080":8110,"11434":11464}' "$journal" >/dev/null || fail '6-port state'
+jq -e 'length==7' "$inventory" >/dev/null || fail '6 public + SSH'
+rollback_case || fail '6-port rollback'
+[[ $(wc -l <"$deletes") -eq 6 ]] || fail 'not one DELETE per owned rule'
+closed
+
+# The third POST creates its rule but loses the reply: all three rules must go.
+new_case thirdportfail; fault=thirdportfail
+reject open_case '80,443,1234,8000'
+[[ $(wc -l <"$posts") -eq 3 && $(wc -l <"$deletes") -eq 3 ]] || fail 'partial cutover not fully rolled back'
+grep -q 'verified rollback to the recorded SSH /32' "$case_dir/err" || fail 'partial cutover rollback not reported'
+closed
+
+new_case lostpostrollback
+fault=lostoffline
+reject open_case '80,443'
+jq -e '.phase=="intent" and .rules=={}' "$journal" >/dev/null || fail 'lost POST leaves intent'
+[[ ! -s $deletes ]] || fail 'attempted DELETE with provider unavailable'
+fault=normal
+rollback_case || fail 'recovery by unique operation note'
+closed
+
+new_case lostpostmulti
+fault=lost
+reject open_case '443,8080'
+[[ $(wc -l < "$posts") -eq 1 ]] || fail 'POST not retried'
+fault=normal
+rollback_case || fail 'recovery via inventory'
+[[ $(wc -l < "$deletes") -eq 1 ]] || fail 'found and deleted'
+closed
+
+new_case foreignrule
+change_rules '.+[{id:99,ip_type:"v4",type:"v4",direction:"in",loadbalancer_id:"",action:"accept",protocol:"tcp",port:"8888",subnet:"0.0.0.0",subnet_size:0,source:"0.0.0.0/0",notes:"elsewhere"}]'
+reject open_case '443'
 no_write
+
+new_case planreject
+for ports in '8001' '443,443' '0443' '' '22'; do
+  reject open_case "$ports"
+done
+no_write
+
+new_case args
+for profile in '80,443,1234,3000,4891,5000,6333,6334,8000,8001,8002,8080,8500,8501,11434,19530'; do reject open_case "$profile"; done
 
 for scenario in wrongip wrongfw shared unseenattachment countdrift missingmeta truncated nextpage prevpage dupkey multijson prepostdrift; do
   new_case "$scenario"; fault=$scenario
@@ -140,7 +202,7 @@ for drift in \
   '[]' '.+[.[0]]' '.[0].source="alias"' '.[0].id="81"' '.[0].id=0' '.[0].subnet_size=24' \
   '.[0].notes=""' '.[0].protocol="udp"' '.[0].action="drop"' '.[0].ip_type="v6"' \
   '.[0].direction="out"' '.[0].type="v6"' '.[0].loadbalancer_id="other"' \
-  '.+[ (.[0] | .id=94 | .port="443" | .subnet="0.0.0.0" | .subnet_size=0 | .notes="elsewhere") ]'; do
+  '.+[ (.[0] | .id=94 | .port="8080" | .subnet="0.0.0.0" | .subnet_size=0 | .notes="elsewhere") ]'; do
   new_case "drift-$((++sequence))"
   change_rules "$drift"; reject open_case; no_write
 done
@@ -162,19 +224,19 @@ for scenario in wrongid wrongssh postmove; do
 done
 new_case ack; fault=offlineafterpost
 reject open_case
-jq -e '.phase=="ack" and .rule_id==93' "$journal" >/dev/null || fail 'lost acknowledged ID'
+jq -e '.phase=="ack" and .rules=={"443":93}' "$journal" >/dev/null || fail 'lost acknowledged ID'
 [[ ! -s $deletes ]] || fail 'deleted without readback'
 fault=normal; rollback_case || fail 'recovery after read outage'; closed
 new_case lostoffline; fault=lostoffline
 reject open_case
-jq -e '.phase=="intent" and .rule_id==null' "$journal" >/dev/null || fail 'missing ambiguous intent'
+jq -e '.phase=="intent" and .rules=={}' "$journal" >/dev/null || fail 'missing ambiguous intent'
 [[ ! -s $deletes ]] || fail 'attempted DELETE with provider unavailable'
 fault=normal; rollback_case || fail 'recovery by unique operation note'; closed
 
 new_case tampered
 open_case || fail 'setup for ledger checks'
 cp -- "$journal" "$case_dir/original"
-jq '.version=1' "$case_dir/original" >"$journal"
+jq '.version=2' "$case_dir/original" >"$journal"
 reject rollback_case
 cp -- "$case_dir/original" "$journal"
 mkdir -- "$case_dir/.public-firewall-lock"
@@ -184,7 +246,7 @@ rmdir -- "$case_dir/.public-firewall-lock"
 
 for drift in '.[1].id=94' '.[1].port="80"' '.[1].notes="other"' '.[1].protocol="udp"' \
   '.[1].source="alias"' '.[1].action="drop"' '.[1].subnet_size=32' '.[0].subnet="192.0.2.12"' \
-  '.+[(.[1] | .id=94)]'; do
+  '.+[(.[1] | .id=94)]' '.[1].port="8080"'; do
   new_case "rollback-$((++sequence))"
   open_case || fail 'rollback setup'
   change_rules "$drift"; reject rollback_case

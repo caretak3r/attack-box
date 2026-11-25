@@ -1,5 +1,7 @@
 # Inspect public HTTPS traffic
 
+The isolated public gateway publishes six TCP ports on the public IPv4 address. Port 443 uses TLS and maps to container port 8443. Ports 80, 1234, 8000, 8080, and 11434 use plain HTTP. Each plain port maps to container port 20000 plus the public port. All ports give the same synthetic responses, and each record keeps the port that the request used.
+
 For a release with structured request spans, open **Query your data** in New Relic. Select the ingest account. Run this NRQL query:
 
 ```sql

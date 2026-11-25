@@ -1,4 +1,4 @@
-// Command attackbox-public serves the isolated cloud-gateway HTTPS profile on port 8443.
+// Command attackbox-public serves the isolated cloud-gateway profile: HTTPS on port 8443 and plain HTTP on the plainPorts listeners.
 package main
 
 import (
@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -28,6 +29,12 @@ var version = "dev"
 
 const internalPort = "8443"
 const externalPort = 443
+
+// A plain-HTTP public port p listens in the container on plainOffset+p, because the unprivileged user cannot bind port 80.
+const plainOffset = 20000
+
+var plainPorts = [...]int{80, 1234, 8000, 8080, 11434}
+
 const requestRate = 1
 const requestBurst = 4
 const connectionLimit = 128
@@ -40,6 +47,7 @@ type config struct {
 
 type app struct {
 	listener    net.Listener
+	plain       []net.Listener
 	server      *http.Server
 	tracing     *observability.Runtime
 	limiter     rateLimit
@@ -83,6 +91,15 @@ func main() {
 	a, err := newApp(cfg, func() (net.Listener, error) {
 		return net.Listen("tcp4", "0.0.0.0:"+internalPort)
 	})
+	for _, port := range plainPorts {
+		if err != nil {
+			break
+		}
+		var l net.Listener
+		if l, err = net.Listen("tcp4", "0.0.0.0:"+strconv.Itoa(plainOffset+port)); err == nil {
+			a.addPlain(port, l)
+		}
+	}
 	if err == nil {
 		err = a.run(ctx)
 	}
@@ -131,7 +148,7 @@ func newApp(cfg config, listen func() (net.Listener, error)) (_ *app, err error)
 	if err != nil {
 		return nil, fmt.Errorf("public listener: %w", err)
 	}
-	a.listener = &limitedListener{Listener: listener, slots: a.slots, rejected: &a.rejected}
+	a.listener = &limitedListener{Listener: listener, slots: a.slots, rejected: &a.rejected, port: externalPort}
 
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: a.getCertificate}
 	a.server = &http.Server{
@@ -145,7 +162,7 @@ func newApp(cfg config, listen func() (net.Listener, error)) (_ *app, err error)
 		ErrorLog:          log.New(io.Discard, "", 0),
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			if lc := publicConn(c); lc != nil {
-				return context.WithValue(ctx, connKey{}, lc)
+				return publicedge.WithPort(context.WithValue(ctx, connKey{}, lc), lc.port)
 			}
 			return ctx
 		},
@@ -239,6 +256,12 @@ type limitedListener struct {
 	net.Listener
 	slots    chan struct{}
 	rejected *atomic.Uint64
+	port     int // public port reported for this listener's connections
+}
+
+// addPlain serves l as plain HTTP for one public port; call it before run.
+func (a *app) addPlain(port int, l net.Listener) {
+	a.plain = append(a.plain, &limitedListener{Listener: l, slots: a.slots, rejected: &a.rejected, port: port})
 }
 
 func (l *limitedListener) Accept() (net.Conn, error) {
@@ -249,7 +272,7 @@ func (l *limitedListener) Accept() (net.Conn, error) {
 		}
 		select {
 		case l.slots <- struct{}{}:
-			return &limitedConn{Conn: conn, slots: l.slots, opened: time.Now()}, nil
+			return &limitedConn{Conn: conn, slots: l.slots, opened: time.Now(), port: l.port}, nil
 		default:
 			l.rejected.Add(1)
 			_ = conn.Close()
@@ -270,6 +293,7 @@ type connKey struct{}
 type limitedConn struct {
 	net.Conn
 	slots  chan struct{}
+	port   int
 	once   sync.Once
 	opened time.Time
 	first  atomic.Int32  // first received byte + 1; 0 until data arrives
@@ -313,6 +337,8 @@ func (a *app) trackConn(conn net.Conn, state http.ConnState) {
 	switch first := c.first.Load(); {
 	case first == 0:
 		outcome = "no_data"
+	case c.port != externalPort:
+		// plain listener: bytes arrived but no request reached the handler
 	case first != 0x16+1:
 		outcome = "not_tls"
 	default:
@@ -320,7 +346,7 @@ func (a *app) trackConn(conn net.Conn, state http.ConnState) {
 			outcome = "tls_failed"
 		}
 	}
-	attrs := []attribute.KeyValue{attribute.Int("server.port", externalPort), attribute.String("attackbox.connection.outcome", outcome)}
+	attrs := []attribute.KeyValue{attribute.Int("server.port", c.port), attribute.String("attackbox.connection.outcome", outcome)}
 	if addr := publicedge.ClientAddress(c.RemoteAddr().String()); addr != "" {
 		attrs = append(attrs, attribute.String("client.address", addr))
 	}
@@ -344,14 +370,20 @@ func (a *app) run(ctx context.Context) error {
 	signal.Notify(sighup, syscall.SIGHUP)
 	defer signal.Stop(sighup)
 
-	result := make(chan error, 1)
-	go func() {
-		err := a.server.ServeTLS(a.listener, "", "")
-		if errors.Is(err, http.ErrServerClosed) {
-			err = nil
-		}
-		result <- err
-	}()
+	result := make(chan error, 1+len(a.plain))
+	serve := func(f func() error) {
+		go func() {
+			err := f()
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
+			}
+			result <- err
+		}()
+	}
+	serve(func() error { return a.server.ServeTLS(a.listener, "", "") })
+	for _, l := range a.plain {
+		serve(func() error { return a.server.Serve(l) })
+	}
 
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -386,6 +418,9 @@ func (a *app) close() error {
 		}
 		if a.listener != nil {
 			_ = a.listener.Close()
+		}
+		for _, l := range a.plain {
+			_ = l.Close()
 		}
 		if a.tracing != nil {
 			a.closeErr = a.tracing.Close()

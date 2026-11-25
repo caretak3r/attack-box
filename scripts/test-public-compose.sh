@@ -160,8 +160,14 @@ for project in "$project1" "$project2"; do
     ATTACKBOX_HOST_ID=ci-host ATTACKBOX_CAMPAIGN_ID=ci-campaign \
     docker compose --project-name "$project" -f "$root/compose.public.yaml" config --format json |
     jq -er 'select(.services.public as $s |
-      ($s.ports | length) == 1 and
-      ($s.ports[0] | .host_ip == "93.184.216.34" and (.published|tostring) == "443" and .target == 8443 and .protocol == "tcp") and
+      ($s.ports | length) == 6 and
+      ([$s.ports[] | {host_ip, published: (.published|tostring), target, protocol}] | sort_by(.published)) ==
+      [{host_ip: "93.184.216.34", published: "11434", target: 31434, protocol: "tcp"},
+       {host_ip: "93.184.216.34", published: "1234", target: 21234, protocol: "tcp"},
+       {host_ip: "93.184.216.34", published: "443", target: 8443, protocol: "tcp"},
+       {host_ip: "93.184.216.34", published: "80", target: 20080, protocol: "tcp"},
+       {host_ip: "93.184.216.34", published: "8000", target: 28000, protocol: "tcp"},
+       {host_ip: "93.184.216.34", published: "8080", target: 28080, protocol: "tcp"}] and
       ([$s.volumes[] | [.type,.source,.target,(.read_only // false)]] | sort) ==
       [["bind","/etc/attackbox-public/tls","/run/secrets",true],["bind","/run/attackbox-public-otel","/run/attackbox-public-otel",true],
        ["bind","/var/lib/attackbox-public-capture/requests","/var/lib/attackbox-public-capture",false]] and

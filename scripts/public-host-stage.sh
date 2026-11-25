@@ -19,6 +19,8 @@ PUBLIC_USER=abx-public-otel
 PUBLIC_GROUP=abx-public-otel
 CAPTURE_ROOT=/var/lib/attackbox-public-capture
 CAPTURE_DIR=$CAPTURE_ROOT/requests
+# Published ports as public:container. 443 is TLS; the others are plain HTTP on 20000 + public port.
+PUBLIC_PORTS=(443:8443 80:20080 1234:21234 8000:28000 8080:28080 11434:31434)
 
 usage() {
   cat >&2 <<'USAGE'
@@ -205,20 +207,26 @@ verify_firewall() {
 }
 
 verify_ports_free() {
-  local ids id mappings
-  ss -H -ltn | awk -v bind="$public_ip" '
-    $4 ~ /:443$/ {addr=$4; sub(/:443$/, "", addr); gsub(/^\[|\]$/, "", addr)
-      if (addr==bind || addr=="*" || addr=="0.0.0.0" || addr=="::" || addr=="::ffff:"bind) exit 1}
-  ' || fail "a wildcard or $public_ip listener already owns port 443"
+  local ids id mappings pair public_port
+  for pair in "${PUBLIC_PORTS[@]}"; do
+    public_port=${pair%%:*}
+    ss -H -ltn | awk -v bind="$public_ip" -v port="$public_port" '
+      $4 ~ ":"port"$" {addr=$4; sub(":"port"$", "", addr); gsub(/^\[|\]$/, "", addr)
+        if (addr==bind || addr=="*" || addr=="0.0.0.0" || addr=="::" || addr=="::ffff:"bind) exit 1}
+    ' || fail "a wildcard or $public_ip listener already owns port $public_port"
+  done
   # Docker may publish DNAT without a listening userland proxy.
   ids=$(docker ps -q --no-trunc) || fail 'cannot inspect Docker containers'
   while IFS= read -r id; do
     [[ -n $id ]] || continue
     [[ $id =~ ^[0-9a-f]{64}$ ]] || fail 'invalid running container ID'
     mappings=$(docker port "$id") || fail 'cannot inspect existing Docker publications'
-    if grep -Eq "/tcp -> (0\\.0\\.0\\.0|\\[::\\]|\\[::ffff:${public_ip//./\\.}\\]|${public_ip//./\\.}):443$" <<<"$mappings"; then
-      fail "a Docker publication already owns $public_ip:443"
-    fi
+    for pair in "${PUBLIC_PORTS[@]}"; do
+      public_port=${pair%%:*}
+      if grep -Eq "/tcp -> (0\\.0\\.0\\.0|\\[::\\]|\\[::ffff:${public_ip//./\\.}\\]|${public_ip//./\\.}):${public_port}$" <<<"$mappings"; then
+        fail "a Docker publication already owns $public_ip:$public_port"
+      fi
+    done
   done <<<"$ids"
 }
 
@@ -575,10 +583,15 @@ check_tls_directory() {
 }
 
 verify_public_bindings() {
-  local container=$1 actual mounts isolation network
+  local container=$1 actual expected mounts isolation network pair
   check_tls_directory || fail 'refusing non-dedicated public TLS directory'
-  actual=$(docker port "$container") || fail 'cannot inspect public port bindings'
-  [[ $actual == "8443/tcp -> $public_ip:443" ]] || fail "public ports are not bound exactly to $public_ip:443"
+  actual=$(docker port "$container" | sort) || fail 'cannot inspect public port bindings'
+  expected=()
+  for pair in "${PUBLIC_PORTS[@]}"; do
+    expected+=("${pair#*:}/tcp -> $public_ip:${pair%%:*}")
+  done
+  expected=$(printf '%s\n' "${expected[@]}" | sort)
+  [[ $actual == "$expected" ]] || fail "public ports are not bound exactly to the six published ports on $public_ip"
   mounts=$(docker inspect --type container --format '{{range .Mounts}}{{println .Type .Source .Destination .RW}}{{end}}' "$container" | sed '/^$/d' | sort) || fail 'cannot inspect public mounts'
   [[ $mounts == $'bind /etc/attackbox-public/tls /run/secrets false\nbind /run/attackbox-public-otel /run/attackbox-public-otel false\nbind /var/lib/attackbox-public-capture/requests /var/lib/attackbox-public-capture true' ]] || fail 'public mounts must contain only read-only public TLS and socket directories and the capture directory'
   network=$(marker_value project.network_id)
@@ -1187,7 +1200,7 @@ run_stage() {
   cleanup_work
   stage_in_progress=false
   trap - EXIT
-  note "staged public project $project on $public_ip:443; verified local TLS trust, hostname and leaf pin"
+  note "staged public project $project on $public_ip ports 443 (TLS), 80, 1234, 8000, 8080, 11434 (plain HTTP); verified local TLS trust, hostname and leaf pin"
   note 'not claimed: provider firewall state, public ingress or New Relic ingestion'
 }
 
