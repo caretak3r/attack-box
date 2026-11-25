@@ -175,8 +175,10 @@ func renderPublic(raw []byte, day, until time.Time) ([]byte, error) {
 		}
 	}
 	b.WriteString("\nTLS failures, empty connections and plaintext on a TLS port are consistent with scanning, client errors or operator tests. They do not identify a tool, actor or exploit. Connections that end before HTTP do not have an HTTP response to inspect.\n\n## Telemetry receipt and limits\n\n")
+	hasHeartbeat := false
 	for _, row := range account["health"].Results {
 		if n, ok := number(row, "latest.timestamp"); ok {
+			hasHeartbeat = true
 			fmt.Fprintf(&b, "Latest public-service heartbeat received in New Relic: **%s**.\n\n", clockLabel(time.UnixMilli(int64(n))))
 		}
 		for _, field := range []string{"attackbox.otel_dropped_spans_total", "attackbox.otel_export_failed_spans_total", "attackbox.rate_limited_requests"} {
@@ -185,7 +187,7 @@ func renderPublic(raw []byte, day, until time.Time) ([]byte, error) {
 			}
 		}
 	}
-	if len(account["health"].Results) == 0 {
+	if !hasHeartbeat {
 		b.WriteString("**No public heartbeat received in the queried ten-minute window.** Collection health needs review.\n")
 	}
 	b.WriteString("\nThe public profile records request metadata and response status. It does not retain request or response bodies. This evidence cannot reconstruct prompts, exact replies, tool instructions, attacker sessions or exploit success. The private proxy has a separate capture path; its counts below do not measure public HTTPS traffic.\n\nPublic-service and host health use separate collection paths. This report does not verify the provider firewall, complete packet capture or all New Relic pipelines. Raw addresses, identities, credentials, payloads and captured instructions are excluded. No captured command is executed and no observed destination is contacted.\n\nThe local publisher checks every five minutes. It commits only this daily report, with ordinary hooks and signing. Read the update and observation times: Mac sleep, power loss or network loss stops publication.\n")

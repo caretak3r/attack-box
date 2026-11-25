@@ -36,6 +36,11 @@ func TestPublicPrivacyCoverageAndReceipt(t *testing.T) {
 	if _, err := renderPublic([]byte(`{"errors":[{"message":"SECRET"}]}`), day, day); err == nil || strings.Contains(err.Error(), "SECRET") {
 		t.Fatal("unsafe GraphQL failure")
 	}
+	missing := bytes.Replace(raw, []byte(`"latest.timestamp":1795617316450`), []byte(`"latest.timestamp":null`), 1)
+	b, err = renderPublic(missing, day, day)
+	if err != nil || !bytes.Contains(b, []byte("No public heartbeat received")) {
+		t.Fatal("null heartbeat hidden", err)
+	}
 	t.Setenv("NEW_RELIC_ACCOUNT_ID", "123")
 	q := publicQuery(day, day.Add(15*time.Hour))
 	if !strings.Contains(q, "SINCE 1795582800") || !strings.Contains(q, "public.request") {

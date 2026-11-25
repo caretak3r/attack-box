@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -116,6 +117,13 @@ func runMain(source, checkout, deadlineText, date string, once bool) error {
 		}
 		if err == nil {
 			host, done, err = render(data, report)
+		}
+		if err == nil && done {
+			// Let the lagged query pass the final host observation before exit.
+			lines := bytes.Split(bytes.TrimSpace(data), []byte{'\n'})
+			var last sample
+			err = json.Unmarshal(lines[len(lines)-1], &last)
+			done = !time.Now().Before(last.Until.Add(2 * time.Minute))
 		}
 		if err == nil {
 			public, err = publicReport(day, time.Now().UTC().Add(-time.Minute))

@@ -63,7 +63,7 @@ The report uses fixed prose and allowed route, status, method and outcome labels
 
 The host SSH watcher remains a separate source. Its proxy counts describe the private proxy, not the public decoy. Its legacy `component_count_not_12` warning can occur because the audit filter is now the thirteenth component; confirm individual running-state metrics before describing an outage. The public profile does not capture request or response bodies. No report can recover those bodies from metadata.
 
-Use an explicit future UTC deadline, at most twelve hours away. Set it at least ten minutes after the host watch ends to allow the final publication. The process exits after it publishes a complete or interrupted host watch. On 25 November, the existing host watch ends at 23:53:39 UTC / 18:53:39 Eastern. The publication deadline is 00:03:39 UTC on 26 November. The operator Mac must stay powered on and connected. `caffeinate -i` prevents idle sleep but cannot prevent shutdown or network loss.
+Use an explicit future UTC deadline, at most twelve hours away. Set it at least ten minutes after the host watch ends to allow the final publication. The process exits after it publishes a complete or interrupted host watch and the final observation is at least two minutes old. This lets the lagged query pass the final observation time; it does not guarantee that all late telemetry has arrived. On 25 November, the existing host watch ends at 23:53:39 UTC / 18:53:39 Eastern. The publication deadline is 00:03:39 UTC on 26 November. The operator Mac must stay powered on and connected. `caffeinate -i` prevents idle sleep but cannot prevent shutdown or network loss.
 
 Example after the isolated checkout is clean and credentials are in the environment:
 
