@@ -193,8 +193,10 @@ func TestCaptureLargeBodyTruncation(t *testing.T) {
 	g := NewGateway(nil)
 	g.Capture = c
 
-	body := strings.Repeat("a", 20000)
+	// A chunked body larger than the request limit is the only body that reaches the capture cut.
+	body := strings.Repeat("a", gatewayBodyLimit+5000)
 	r := httptest.NewRequest("POST", "/unmatched", strings.NewReader(body))
+	r.ContentLength = -1
 	rec := httptest.NewRecorder()
 	g.ServeHTTP(rec, r)
 
@@ -212,15 +214,11 @@ func TestCaptureLargeBodyTruncation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(got.Body) != 16384 {
-		t.Errorf("body length = %d, want 16384", len(got.Body))
+	if len(got.Body) != captureBodyLimit || got.BodyBytes != captureBodyLimit {
+		t.Errorf("body length = %d, body_bytes = %d, want %d", len(got.Body), got.BodyBytes, captureBodyLimit)
 	}
-	if got.BodyBytes != 20000 {
-		t.Errorf("body_bytes = %d, want 20000", got.BodyBytes)
-	}
-	h := sha256.Sum256([]byte(body))
-	wantHash := hex.EncodeToString(h[:])
-	if got.BodySHA256 != wantHash {
+	h := sha256.Sum256([]byte(body[:captureBodyLimit]))
+	if got.BodySHA256 != hex.EncodeToString(h[:]) {
 		t.Errorf("body_sha256 mismatch")
 	}
 	if !got.BodyTruncated {
@@ -228,7 +226,8 @@ func TestCaptureLargeBodyTruncation(t *testing.T) {
 	}
 }
 
-func TestCaptureHeaderScrubbing(t *testing.T) {
+// The operator keeps credentials as sent: headers and bodies are not redacted.
+func TestCaptureKeepsCredentialsAsSent(t *testing.T) {
 	dir := t.TempDir()
 	day := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
 	c, err := openCapture(dir, func() time.Time { return day })
@@ -239,61 +238,22 @@ func TestCaptureHeaderScrubbing(t *testing.T) {
 	g := NewGateway(nil)
 	g.Capture = c
 
-	r := httptest.NewRequest("GET", "/unmatched", nil)
-	r.Header.Set("Authorization", "Bearer sk-1234567890abcdef1234567890abcdef")
-	rec := httptest.NewRecorder()
-	g.ServeHTTP(rec, r)
+	// Fixtures are built here so that no credential-shaped literal exists in the source.
+	key, other := "sk-proj-"+strings.Repeat("a1", 12), "sk-ant-"+strings.Repeat("b2", 12)
+	r := httptest.NewRequest("POST", "/unmatched", strings.NewReader(`{"api_key":"`+other+`"}`))
+	r.Header.Set("Authorization", "Bearer "+key)
+	g.ServeHTTP(httptest.NewRecorder(), r)
 
-	f, err := os.Open(filepath.Join(dir, "capture-20261125.jsonl"))
+	raw, err := os.ReadFile(filepath.Join(dir, "capture-20261125.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	line, err := bufio.NewReader(f).ReadString('\n')
-	if err != nil {
+	var got captureRecord
+	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
-
-	if strings.Contains(line, "sk-1234567890abcdef1234567890abcdef") {
-		t.Fatal("raw secret in capture file")
-	}
-	if !strings.Contains(line, "Bearer [redacted") {
-		t.Fatal("expected Bearer [redacted in capture")
-	}
-}
-
-func TestCaptureBodyScrubbing(t *testing.T) {
-	dir := t.TempDir()
-	day := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
-	c, err := openCapture(dir, func() time.Time { return day })
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-	g := NewGateway(nil)
-	g.Capture = c
-
-	body := `{"api_key":"sk-1234567890abcdef1234567890abcdef","data":"test"}`
-	r := httptest.NewRequest("POST", "/unmatched", strings.NewReader(body))
-	r.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	g.ServeHTTP(rec, r)
-
-	f, err := os.Open(filepath.Join(dir, "capture-20261125.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	line, err := bufio.NewReader(f).ReadString('\n')
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if strings.Contains(line, "sk-1234567890abcdef1234567890abcdef") {
-		t.Fatal("raw secret in capture file")
-	}
-	if !strings.Contains(line, `[redacted`) {
-		t.Fatal("expected [redacted in capture")
+	if got.Body != `{"api_key":"`+other+`"}` || len(got.Headers) != 1 || got.Headers[0] != [2]string{"Authorization", "Bearer " + key} {
+		t.Fatalf("record = %+v", got)
 	}
 }
 
@@ -370,27 +330,5 @@ func TestCaptureKeepsBodyThatNoHandlerReads(t *testing.T) {
 	var rec captureRecord
 	if err := json.Unmarshal(raw, &rec); err != nil || w.Code != 200 || rec.Body != "probe-body" || rec.BodyBytes != 10 || rec.BodyTruncated {
 		t.Fatalf("status=%d record=%+v err=%v", w.Code, rec, err)
-	}
-}
-
-func TestScrubBody(t *testing.T) {
-	// Fixtures are built here so that no credential-shaped literal exists in the source.
-	fill := strings.Repeat("a1", 12)
-	key, aws, gh := "sk-proj-"+fill+"_x-y", "AKIA"+strings.Repeat("A", 16), "ghp_"+fill
-	jwt := "eyJ" + fill + ".eyJ" + fill + ".sig" + fill
-	for _, tc := range []struct{ name, in, secret, keep string }{
-		{"json member", `{"api_key":"` + key + `","model":"m"}`, key, `"model":"m"`},
-		{"json member with a longer name", `{"access_token": "opaque value with spaces"}`, "opaque value", `"access_token": "[redacted`},
-		{"form pair", "user=a&client_secret=" + fill + "&x=1", fill, "user=a&client_secret=[redacted"},
-		{"bearer in text", "send Authorization: Bearer " + fill + ".z please", fill, "Bearer [redacted"},
-		{"bare key", "use " + key + " now", key, "use [redacted"},
-		{"aws key id", "id " + aws + " end", aws, "id [redacted"},
-		{"github token", gh, gh, "[redacted"},
-		{"jwt", "t " + jwt + " x", jwt, "t [redacted"},
-		{"plain prompt stays", `{"max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`, "redacted", `"max_tokens":64,"messages":[{"role":"user","content":"hello"}]`},
-	} {
-		if got := scrubBody(tc.in); strings.Contains(got, tc.secret) || !strings.Contains(got, tc.keep) {
-			t.Errorf("%s: scrubBody = %q", tc.name, got)
-		}
 	}
 }

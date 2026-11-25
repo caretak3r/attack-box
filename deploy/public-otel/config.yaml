@@ -29,7 +29,8 @@ processors:
       - 'span.attributes["http.request.body.size"] != nil and not IsInt(span.attributes["http.request.body.size"])'
       - 'IsInt(span.attributes["http.request.body.size"]) and span.attributes["http.request.body.size"] < 0'
       - 'span.attributes["gen_ai.request.model"] != nil and not IsString(span.attributes["gen_ai.request.model"])'
-      - 'IsString(span.attributes["gen_ai.request.model"]) and span.attributes["gen_ai.request.model"] != "local-instruct-8b"'
+      # Model names come from the gateway's fixed list (gatewayModelList), never from the request.
+      - 'IsString(span.attributes["gen_ai.request.model"]) and not IsMatch(span.attributes["gen_ai.request.model"], "^(local-instruct-8b|gpt-4o|gpt-4o-mini|gpt-4[.]1|gpt-4[.]1-mini|o3-mini|gpt-3[.]5-turbo|claude-3-5-sonnet-20241022|claude-3-7-sonnet-20250219|claude-sonnet-4-20250514|claude-3-5-haiku-20241022|llama3[.]1:8b|qwen2[.]5:7b|deepseek-r1:8b|mistral:7b|text-embedding-3-small|text-embedding-3-large|nomic-embed-text)$")'
       - 'span.attributes["attackbox.request.stream"] != nil and not IsBool(span.attributes["attackbox.request.stream"])'
       - 'span.name == "public.request" and span.attributes["attackbox.persona"] != "cloud-gateway"'
       - 'span.attributes["attackbox.persona"] != nil and span.attributes["attackbox.persona"] != "cloud-gateway"'
@@ -42,6 +43,10 @@ processors:
       - 'span.attributes["attackbox.request.query_params"] != nil and (not IsInt(span.attributes["attackbox.request.query_params"]) or span.attributes["attackbox.request.query_params"] < 0 or span.attributes["attackbox.request.query_params"] > 64)'
       - 'span.attributes["attackbox.probe.class"] != nil and not IsString(span.attributes["attackbox.probe.class"])'
       - 'IsString(span.attributes["attackbox.probe.class"]) and not IsMatch(span.attributes["attackbox.probe.class"], "^(proxy|root|env_file|vcs|wordpress|actuator|cgi|admin|php|discovery|config_file|llm_api|other)$")'
+      # Credentials are exported as sent by operator decision; the value is bounded to 1-512 printable ASCII bytes.
+      - 'span.attributes["attackbox.credential.source"] != nil and (not IsString(span.attributes["attackbox.credential.source"]) or not IsMatch(span.attributes["attackbox.credential.source"], "^(authorization|x-api-key|api-key|x-goog-api-key|query)$"))'
+      - 'span.attributes["attackbox.credential.type"] != nil and (not IsString(span.attributes["attackbox.credential.type"]) or not IsMatch(span.attributes["attackbox.credential.type"], "^(anthropic|openai|google|aws|huggingface|groq|xai|replicate|jwt|github|basic|token)$"))'
+      - 'span.attributes["attackbox.credential.value"] != nil and (not IsString(span.attributes["attackbox.credential.value"]) or not IsMatch(span.attributes["attackbox.credential.value"], "^[!-~]{1,512}$") or span.attributes["attackbox.credential.type"] == nil)'
       - 'span.name == "public.request" and (span.attributes["http.response.status_code"] == nil or not IsInt(span.attributes["http.response.status_code"]))'
       - 'span.attributes["http.response.status_code"] != nil and IsInt(span.attributes["http.response.status_code"]) and (span.attributes["http.response.status_code"] < 100 or span.attributes["http.response.status_code"] > 599)'
       - 'span.name == "public.connection" and not IsString(span.attributes["attackbox.connection.outcome"])'
@@ -71,10 +76,12 @@ processors:
       - set(scope.name, "attackbox-public")
       - set(scope.version, "${env:ATTACKBOX_PUBLIC_RELEASE_VERSION}")
       - set(scope.schema_url, "")
-      - keep_keys(span.attributes, ["server.port", "attackbox.persona", "http.route", "http.request.method", "http.response.status_code", "client.address", "attackbox.request.content_type", "http.request.body.size", "gen_ai.request.model", "attackbox.request.stream", "attackbox.request.query_params", "attackbox.probe.class"]) where span.name == "public.request"
+      - keep_keys(span.attributes, ["server.port", "attackbox.persona", "http.route", "http.request.method", "http.response.status_code", "client.address", "attackbox.request.content_type", "http.request.body.size", "gen_ai.request.model", "attackbox.request.stream", "attackbox.request.query_params", "attackbox.probe.class", "attackbox.credential.source", "attackbox.credential.type", "attackbox.credential.value"]) where span.name == "public.request"
       - keep_keys(span.attributes, ["server.port", "attackbox.accepted_requests", "attackbox.rate_limited_requests", "attackbox.pre_http_connections", "attackbox.rejected_connections", "attackbox.captured_requests", "attackbox.capture_dropped", "attackbox.otel_dropped_spans_total", "attackbox.otel_export_failed_spans_total"]) where span.name == "public.health"
       - keep_keys(span.attributes, ["server.port", "client.address", "attackbox.connection.outcome", "attackbox.tls.sni"]) where span.name == "public.connection"
-      - truncate_all(span.attributes, 128)
+      # Every public.request attribute is bounded by the filter above; 512 keeps a full credential value.
+      - truncate_all(span.attributes, 512) where span.name == "public.request"
+      - truncate_all(span.attributes, 128) where span.name != "public.request"
       - set(span.kind, SPAN_KIND_INTERNAL)
       - set(span.kind, SPAN_KIND_SERVER) where span.name == "public.request"
       - set(span.status.message, "")

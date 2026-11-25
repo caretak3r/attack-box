@@ -142,6 +142,8 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 	defer client.CloseIdleConnections()
 
 	const chatPayload = `{"model":"local-instruct-8b","stream":true,"messages":[{"role":"user","content":"` + privateMarker + `"}]}`
+	// Longer than the 128-byte cap on other spans: the full value must survive the Collector.
+	credential := "sk-ant-" + strings.Repeat("k0", 80)
 	for _, tc := range []struct {
 		method, path, body string
 	}{
@@ -150,12 +152,12 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 		{"POST", "/v1/api/completions", `{"model":"local-instruct-8b","prompt":"test"}`},
 		{"POST", "/openai/deployments/local-instruct-8b/chat/completions", `{"messages":[{"role":"user","content":"test"}]}`},
 	} {
-		req, err := http.NewRequestWithContext(serverCtx, tc.method, "https://"+addr+tc.path+"?token="+privateMarker, strings.NewReader(tc.body))
+		req, err := http.NewRequestWithContext(serverCtx, tc.method, "https://"+addr+tc.path+"?q="+privateMarker, strings.NewReader(tc.body))
 		if err != nil {
 			t.Fatal(err)
 		}
 		req.Header.Set("Content-Type", "application/json; fixture="+privateMarker)
-		req.Header.Set("Authorization", "Bearer "+privateMarker)
+		req.Header.Set("Authorization", "Bearer "+credential)
 		req.Header.Set("Cookie", "session="+privateMarker)
 		req.Header.Set("Forwarded", "for="+forgedPeer)
 		req.Header.Set("X-Forwarded-For", forgedPeer)
@@ -238,7 +240,7 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 						continue
 					}
 					if span.Name == "public.request" {
-						var route, persona, contentType, model string
+						var route, persona, contentType, model, credSource, credType, credValue string
 						var port int64
 						var stream bool
 						size, queryParams := int64(-1), int64(-1)
@@ -262,6 +264,12 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 								size = attr.Value.GetIntValue()
 							case "attackbox.request.query_params":
 								queryParams = attr.Value.GetIntValue()
+							case "attackbox.credential.source":
+								credSource = attr.Value.GetStringValue()
+							case "attackbox.credential.type":
+								credType = attr.Value.GetStringValue()
+							case "attackbox.credential.value":
+								credValue = attr.Value.GetStringValue()
 							}
 						}
 						if persona != "cloud-gateway" {
@@ -269,6 +277,9 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 						}
 						if port != externalPort || queryParams != 1 {
 							t.Errorf("request span: port %d, query params %d", port, queryParams)
+						}
+						if credSource != "authorization" || credType != "anthropic" || credValue != credential {
+							t.Errorf("request span credential: source %q type %q value length %d", credSource, credType, len(credValue))
 						}
 						if route == "/v1/chat/completions" && (size != int64(len(chatPayload)) || contentType != "application/json" || model != "local-instruct-8b" || !stream) {
 							t.Error("chat span lost structured request fields on its way to the exporter")
@@ -285,7 +296,7 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 		}
 	}
 	raw, err := os.ReadFile(filepath.Join(cfg.capture, "capture-"+time.Now().UTC().Format("20060102")+".jsonl"))
-	if err != nil || bytes.Count(raw, []byte("\n")) != 4 || !bytes.Contains(raw, []byte(`"/v1/api/completions?token=`+privateMarker+`"`)) {
+	if err != nil || bytes.Count(raw, []byte("\n")) != 4 || !bytes.Contains(raw, []byte(`"/v1/api/completions?q=`+privateMarker+`"`)) || !bytes.Contains(raw, []byte(`"Bearer `+credential+`"`)) {
 		t.Fatalf("local capture missing raw targets: %v\n%s", err, raw)
 	}
 }

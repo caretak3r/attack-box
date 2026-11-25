@@ -7,7 +7,8 @@ FROM Span SELECT timestamp, `client.address` AS 'client_ip',
   `http.request.method`, `http.route`, `http.response.status_code`,
   `attackbox.probe.class`, `attackbox.request.query_params`,
   `attackbox.request.content_type`, `http.request.body.size`,
-  `gen_ai.request.model`, `attackbox.request.stream`, `trace.id`
+  `gen_ai.request.model`, `attackbox.request.stream`,
+  `attackbox.credential.source`, `attackbox.credential.type`, `attackbox.credential.value`, `trace.id`
 WHERE `service.name` = 'attackbox-public-443' AND name = 'public.request'
   AND `attackbox.request.content_type` IS NOT NULL
 SINCE 1 hour ago LIMIT 100
@@ -15,7 +16,35 @@ SINCE 1 hour ago LIMIT 100
 
 `client_ip` is the IPv4 peer of the TCP connection, not an identity from an HTTP header. The listener ignores `Forwarded` and `X-Forwarded-For`. A VPN or NAT exposes its exit IP. A public proxy exposes its own IP. A local or private peer leaves the field empty. Older releases did not export this field. They cannot supply past addresses.
 
-`http.route` is a route label, not a raw URL. The content type is a fixed category without parameters. For a known length, the size is the declared body length in bytes. For an unknown length, the size is available only if the handler reads the body to its end. On a validated request, the span can include the recognized model and an explicit Boolean streaming flag. `attackbox.request.query_params` is the number of query pairs, up to 64. The span does not contain their names or values.
+`http.route` is a route label, not a raw URL. The content type is a fixed category without parameters. For a known length, the size is the declared body length in bytes. For an unknown length, the size is available only if the handler reads the body to its end. On a validated request that names a model, the span contains that model from the fixed list below and an explicit Boolean streaming flag. `attackbox.request.query_params` is the number of query pairs, up to 64. The span does not contain query names or values, except a credential value.
+
+## Models
+
+The gateway serves these model names: `local-instruct-8b`, `gpt-4o`, `gpt-4o-mini`, `gpt-4.1`, `gpt-4.1-mini`, `o3-mini`, `gpt-3.5-turbo`, `claude-3-5-sonnet-20241022`, `claude-3-7-sonnet-20250219`, `claude-sonnet-4-20250514`, `claude-3-5-haiku-20241022`, `llama3.1:8b`, `qwen2.5:7b`, `deepseek-r1:8b`, `mistral:7b`, `text-embedding-3-small`, `text-embedding-3-large`, and `nomic-embed-text`. `/models` lists all of them. `/api/tags` lists the local names with an Ollama tag. A client can add `:latest` to a name. A request without a model uses `local-instruct-8b`. Other names return 404. The answer names the requested model.
+
+## Credentials
+
+The operator decided to export credentials as the client sends them. The request span contains the first credential found, in this order: the `Authorization`, `X-Api-Key`, `Api-Key`, and `X-Goog-Api-Key` headers, then the query parameters `key`, `api_key`, `apikey`, `api-key`, `access_token`, and `token`. `attackbox.credential.source` is the lowercase header name or `query`. `attackbox.credential.value` is the value without its `Authorization` scheme word. A Basic value stays base64. A value that is not 1 to 512 printable ASCII bytes is not exported, but its source and type are. `attackbox.credential.type` comes from the value prefix:
+
+|Type|Prefix|
+|---|---|
+|`anthropic`|`sk-ant-`|
+|`openai`|`sk-`|
+|`google`|`AIza`|
+|`aws`|`AKIA`, `ASIA`|
+|`huggingface`, `groq`, `xai`, `replicate`|`hf_`, `gsk_`, `xai-`, `r8_`|
+|`jwt`|`eyJ`|
+|`github`|`github_pat_`, `ghp_`, `gho_`, `ghu_`, `ghs_`|
+|`basic`|`Authorization: Basic`|
+|`token`|any other value|
+
+```sql
+FROM Span SELECT count(*), latest(`client.address`)
+WHERE `service.name` = 'attackbox-public-443' AND `attackbox.credential.type` IS NOT NULL
+FACET `attackbox.credential.type`, `attackbox.credential.value` SINCE 7 days ago LIMIT 100
+```
+
+Anyone who can query the account can read these values. They are probably stolen from other people. Do not use them.
 
 The container healthcheck connects from loopback. The service does not trace it and does not count it. Releases before `public.connection` spans exported four healthcheck requests each minute without `client_ip`. To exclude them from older data, add ``AND `client.address` IS NOT NULL``.
 
@@ -46,11 +75,11 @@ FACET `attackbox.probe.class` SINCE 1 day ago
 
 ## Local request capture
 
-The service writes each request line that reaches the gateway to `/var/lib/attackbox-public-capture/requests/capture-YYYYMMDD.jsonl` on the host. Each JSON line contains the time, peer IP, method, raw request target with its query string, `Host`, `User-Agent`, route label, status, probe class, listener port (443), protocol version, bounded request headers, and bounded request body. The service clips the target at 2048 bytes, text header fields at 256 bytes, header names at 64 bytes, and header values at 512 bytes. It stores at most 48 header pairs sorted by canonical name and value order. It records the first 16 KiB of the request body, counts the total bytes read (capped at 64 KiB), and hashes all bytes read with SHA-256. JSON encoding escapes control characters and invalid UTF-8.
+The service writes each request line that reaches the gateway to `/var/lib/attackbox-public-capture/requests/capture-YYYYMMDD.jsonl` on the host. Each JSON line contains the time, peer IP, method, raw request target with its query string, `Host`, `User-Agent`, route label, status, probe class, listener port (443), protocol version, request headers, and request body. The service clips the target at 2048 bytes, text header fields at 256 bytes, header names at 64 bytes, and header values at 512 bytes. It stores at most 48 header pairs sorted by canonical name and value order. It records the request body up to the 64 KiB request limit, counts the bytes read, and hashes them with SHA-256. JSON encoding escapes control characters and invalid UTF-8.
 
-The service keeps 7 UTC days and writes at most 256 MiB each day. `public.health` counts written lines in `attackbox.captured_requests` and lost lines in `attackbox.capture_dropped`. The parent directory is root-only. A stage creates the directory once. A rollback keeps it. The capture stays on the host and is never sent to New Relic.
+The service keeps 7 UTC days and writes at most 256 MiB each day. `public.health` counts written lines in `attackbox.captured_requests` and lost lines in `attackbox.capture_dropped`. The parent directory is root-only. A stage creates the directory once. A rollback keeps it. The capture stays on the host. Only the credential fields above go to New Relic.
 
-The service scrubs credentials from headers and bodies before writing them. Header scrubbing replaces the value of `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, and any header whose lowercase name contains `key`, `token`, `secret`, `auth`, `password`, `session`, or `cookie` with `[redacted len=N sha256=XXXXXXXXXXXX]`. When the value starts with `Bearer `, `Basic `, `Token `, or `Digest `, the prefix stays and the rest is scrubbed. `User-Agent` and `Host` stay unmodified. Body scrubbing replaces `sk-`/`sk_` style keys of 16+ characters, AWS access key IDs (`AKIA` + 16 uppercase alphanumerics), GitHub tokens (`gh[pousr]_` + 20+ chars), JWTs, and the string value of JSON members or form/query pairs whose key contains `password`, `passwd`, `secret`, `token`, `api_key`, `apikey`, or `authorization` (case-insensitive).
+The service does not redact the capture. Headers and bodies keep credentials, cookies, and prompts as sent.
 
 Treat the capture as hostile data. Read it as root with a tool that prints text, such as `jq -r '.target'`. Do not open its URLs or run its contents.
 
@@ -76,6 +105,6 @@ SINCE 1 day ago LIMIT 100
 
 The service sends at most one connection span each second, with a burst of 16. The `public.health` span counts all such connections in `attackbox.pre_http_connections`. It counts connections that the listener rejects at its 128-connection limit in `attackbox.rejected_connections`. Both counters start at zero when the service starts.
 
-The service does not export prompts, bodies, credentials, query names or values, raw paths, arbitrary headers, or received bytes. HTTP parser failures after a TLS handshake produce a `no_request` connection span, not a request span. The rate limiter counts requests it rejects before the gateway. Those requests are not captured. Bounded queues can lose spans.
+The service does not export prompts, bodies, query names or values other than a credential, raw paths, arbitrary headers, or received bytes. HTTP parser failures after a TLS handshake produce a `no_request` connection span, not a request span. The rate limiter counts requests it rejects before the gateway. Those requests are not captured. Bounded queues can lose spans.
 
 Before live export, confirm who can query spans and how long the account retains exact IP addresses. Use a client with a known egress IP to check the public path after an approved deployment. Do not use a forwarded header as proof.

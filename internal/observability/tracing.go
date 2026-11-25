@@ -101,7 +101,12 @@ func New(ctx context.Context, c Config, service, version string) (*Runtime, erro
 	r.processor, r.conn = p, conn
 	// Explicit options ignore global sampler/resource settings. A caller never
 	// installs this provider globally or extracts attacker propagation headers.
-	r.provider = sdk.NewTracerProvider(sdk.WithoutPanicRecording(), sdk.WithSampler(sdk.AlwaysSample()), sdk.WithResource(resource.NewSchemaless(attrs...)), sdk.WithSpanLimits(sdk.SpanLimits{AttributeValueLengthLimit: 128, AttributeCountLimit: 16, EventCountLimit: 4, LinkCountLimit: 0, AttributePerEventCountLimit: 4, AttributePerLinkCountLimit: 0}), sdk.WithSpanProcessor(p))
+	// The public service exports full credential values (up to 512 bytes); its Collector bounds every other attribute.
+	valueLimit := 128
+	if publicService.MatchString(service) {
+		valueLimit = 512
+	}
+	r.provider = sdk.NewTracerProvider(sdk.WithoutPanicRecording(), sdk.WithSampler(sdk.AlwaysSample()), sdk.WithResource(resource.NewSchemaless(attrs...)), sdk.WithSpanLimits(sdk.SpanLimits{AttributeValueLengthLimit: valueLimit, AttributeCountLimit: 16, EventCountLimit: 4, LinkCountLimit: 0, AttributePerEventCountLimit: 4, AttributePerLinkCountLimit: 0}), sdk.WithSpanProcessor(p))
 	r.Tracer = r.provider.Tracer("attackbox")
 	return r, nil
 }

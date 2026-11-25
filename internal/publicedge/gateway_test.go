@@ -245,7 +245,7 @@ func TestGatewayRequestEvidence(t *testing.T) {
 		status                                  int
 		want                                    []attribute.KeyValue
 	}{
-		{"mapped HEAD", "HEAD", "/v1/models?token=fixture-private&b=2", "/v1/models", "[::ffff:203.0.113.42]:443", "", false, 200,
+		{"mapped HEAD", "HEAD", "/v1/models?q=fixture-private&b=2", "/v1/models", "[::ffff:203.0.113.42]:443", "", false, 200,
 			[]attribute.KeyValue{attribute.String("client.address", "203.0.113.42"), attribute.Int64("http.request.body.size", 0), attribute.Int("attackbox.request.query_params", 2)}},
 		{"chunked completion", "POST", "/v1/completions", "/v1/completions", peer, completion, true, 200,
 			[]attribute.KeyValue{attribute.String("client.address", "203.0.113.42"), attribute.Int64("http.request.body.size", int64(len(completion))), attribute.String("gen_ai.request.model", gatewayModel), attribute.Bool("attackbox.request.stream", false), attribute.Int("attackbox.request.query_params", 0)}},
@@ -253,8 +253,11 @@ func TestGatewayRequestEvidence(t *testing.T) {
 			[]attribute.KeyValue{attribute.Int64("http.request.body.size", int64(len(defaults))), attribute.Int("attackbox.request.query_params", 0)}},
 		{"unread chunked body", "GET", "/fixture-private", "/unmatched", "127.0.0.1:443", "fixture-private", true, 404,
 			[]attribute.KeyValue{attribute.Int("attackbox.request.query_params", 0), attribute.String("attackbox.probe.class", "other")}},
-		{"family variant", "POST", "/proxy/v1/api/completions?api_key=fixture-private", "/proxy/v1/api/completions", peer, completion, false, 200,
+		{"family variant", "POST", "/proxy/v1/api/completions?filter=fixture-private", "/proxy/v1/api/completions", peer, completion, false, 200,
 			[]attribute.KeyValue{attribute.String("client.address", "203.0.113.42"), attribute.Int64("http.request.body.size", int64(len(completion))), attribute.String("gen_ai.request.model", gatewayModel), attribute.Bool("attackbox.request.stream", false), attribute.Int("attackbox.request.query_params", 1)}},
+		{"query credential", "GET", "/v1/models?key=AIzaFixture", "/v1/models", peer, "", false, 200,
+			[]attribute.KeyValue{attribute.String("client.address", "203.0.113.42"), attribute.Int64("http.request.body.size", 0), attribute.Int("attackbox.request.query_params", 1),
+				attribute.String("attackbox.credential.source", "query"), attribute.String("attackbox.credential.type", "google"), attribute.String("attackbox.credential.value", "AIzaFixture")}},
 	} {
 		// The local capture must never change what a span exports.
 		for _, captured := range []bool{false, true} {
@@ -309,7 +312,9 @@ func TestGatewayRouteFamilies(t *testing.T) {
 		{"POST", "/chat/completions", chat, "/chat/completions", 200, gatewayJSON, `"chat.completion"`},
 		{"POST", "/openai/v1/chat/completions", chat, "/openai/v1/chat/completions", 200, gatewayJSON, `"chat.completion"`},
 		{"POST", "/v1/engines/local-instruct-8b/completions", `{"prompt":"x"}`, "/v1/engines/{model}/completions", 200, gatewayJSON, `"text_completion"`},
-		{"POST", "/openai/deployments/gpt-4o/chat/completions", chat, "/openai/deployments/{deployment}/chat/completions", 404, gatewayJSON, "model not found"},
+		{"POST", "/openai/deployments/gpt-5-preview/chat/completions", chat, "/openai/deployments/{deployment}/chat/completions", 404, gatewayJSON, "model not found"},
+		{"POST", "/openai/deployments/gpt-4o/chat/completions", `{"messages":[{"role":"user","content":"x"}]}`, "/openai/deployments/{deployment}/chat/completions", 200, gatewayJSON, `"model":"gpt-4o"`},
+		{"POST", "/v1/chat/completions", `{"model":"claude-3-5-sonnet-20241022","stream":true,"messages":[{"role":"user","content":"x"}]}`, "/v1/chat/completions", 200, "text/event-stream", `"model":"claude-3-5-sonnet-20241022"`},
 		{"GET", "/api/v1/models", "", "/api/v1/models", 200, gatewayJSON, `"local-instruct-8b"`},
 		{"POST", "/v1/models", "", "/v1/models", 405, "text/plain; charset=utf-8", "Method Not Allowed"},
 		{"POST", "/v1/embeddings", `{"input":"x"}`, "/v1/embeddings", 200, gatewayJSON, `"embedding"`},
@@ -318,6 +323,8 @@ func TestGatewayRouteFamilies(t *testing.T) {
 		{"POST", "/v1/messages", `{"model":"claude-3","max_tokens":8,"messages":[{"role":"user","content":"x"}]}`, "/v1/messages", 404, gatewayJSON, "not_found_error"},
 		{"POST", "/v1/messages", `{"model":"local-instruct-8b","messages":[{"role":"user","content":"x"}]}`, "/v1/messages", 400, gatewayJSON, "invalid_request_error"},
 		{"GET", "/api/tags", "", "/api/tags", 200, gatewayJSON, `"local-instruct-8b:latest"`},
+		{"GET", "/api/tags", "", "/api/tags", 200, gatewayJSON, `"name":"deepseek-r1:8b"`},
+		{"POST", "/api/chat", `{"model":"qwen2.5:7b","stream":false,"messages":[{"role":"user","content":"x"}]}`, "/api/chat", 200, gatewayJSON, `"model":"qwen2.5:7b"`},
 		{"POST", "/api/chat", `{"model":"local-instruct-8b","messages":[{"role":"user","content":"x"}]}`, "/api/chat", 200, "application/x-ndjson", `"done":true`},
 		{"POST", "/ollama/api/generate", `{"model":"local-instruct-8b:latest","prompt":"x","stream":false}`, "/ollama/api/generate", 200, gatewayJSON, `"response":"Ready."`},
 		{"POST", "/api/generate", `{"model":"llama3","prompt":"x"}`, "/api/generate", 404, gatewayJSON, "model not found"},
@@ -345,6 +352,32 @@ func TestGatewayRouteFamilies(t *testing.T) {
 				t.Fatalf("route = %q, want %q", route, tc.route)
 			}
 		})
+	}
+}
+
+func TestGatewayCredential(t *testing.T) {
+	// Fixtures are built here so that no credential-shaped literal exists in the source.
+	fill := strings.Repeat("a1", 12)
+	for _, tc := range []struct {
+		header, value, query string
+		source, kind, want   string
+	}{
+		{"Authorization", "Bearer sk-ant-" + fill, "", "authorization", "anthropic", "sk-ant-" + fill},
+		{"Authorization", "bearer sk-proj-" + fill, "", "authorization", "openai", "sk-proj-" + fill},
+		{"Authorization", "Basic dXNlcjpwYXNz", "", "authorization", "basic", "dXNlcjpwYXNz"},
+		{"Authorization", "Token " + fill, "", "authorization", "token", fill},
+		{"X-Api-Key", "gsk_" + fill, "", "x-api-key", "groq", "gsk_" + fill},
+		{"Api-Key", "has space", "", "api-key", "token", ""},
+		{"", "", "?model=x&api_key=hf_" + fill, "query", "huggingface", "hf_" + fill},
+		{"Cookie", "session=" + fill, "?q=" + fill, "", "", ""},
+	} {
+		r := httptest.NewRequest("GET", "/v1/models"+tc.query, nil)
+		if tc.header != "" {
+			r.Header.Set(tc.header, tc.value)
+		}
+		if source, kind, value := gatewayCredential(r); source != tc.source || kind != tc.kind || value != tc.want {
+			t.Errorf("%s %q %s: got %q %q %q", tc.header, tc.value, tc.query, source, kind, value)
+		}
 	}
 }
 

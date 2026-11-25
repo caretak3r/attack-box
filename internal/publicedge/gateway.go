@@ -3,6 +3,7 @@ package publicedge
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,48 @@ import (
 )
 
 const gatewayModel = "local-instruct-8b"
+
+// gatewayModelList is the fixed set of names the gateway claims to serve; it must match the
+// gen_ai.request.model allowlist in deploy/public-otel/config.yaml. Ollama-style names also list in /api/tags.
+var gatewayModelList = []string{gatewayModel, "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "o3-mini", "gpt-3.5-turbo",
+	"claude-3-5-sonnet-20241022", "claude-3-7-sonnet-20250219", "claude-sonnet-4-20250514", "claude-3-5-haiku-20241022",
+	"llama3.1:8b", "qwen2.5:7b", "deepseek-r1:8b", "mistral:7b", "text-embedding-3-small", "text-embedding-3-large", "nomic-embed-text"}
+
+// gatewayModelName returns the listed model for a requested name; Ollama clients may add ":latest".
+func gatewayModelName(s string) (string, bool) {
+	s = strings.TrimSuffix(s, ":latest")
+	for _, m := range gatewayModelList {
+		if s == m {
+			return m, true
+		}
+	}
+	return "", false
+}
+
+// gatewayRequestModel resolves the deployment path and the body model; either one must be listed. No model means the default.
+func gatewayRequestModel(r *http.Request, obj map[string]json.RawMessage) (string, bool) {
+	model := gatewayModel
+	if d := r.PathValue("deployment"); d != "" {
+		m, ok := gatewayModelName(d)
+		if !ok {
+			return "", false
+		}
+		model = m
+	}
+	if raw := obj["model"]; raw != nil {
+		var s string
+		if json.Unmarshal(raw, &s) != nil {
+			return "", false
+		}
+		m, ok := gatewayModelName(s)
+		if !ok {
+			return "", false
+		}
+		model = m
+	}
+	return model, true
+}
+
 const gatewayJSON = "application/json"
 const gatewayBodyLimit = 64 << 10
 
@@ -129,7 +172,7 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 			probe = gatewayProbe(r)
 		}
 		if span.IsRecording() {
-			attrs := make([]attribute.KeyValue, 0, 10)
+			attrs := make([]attribute.KeyValue, 0, 13)
 			attrs = append(attrs, attribute.Int("server.port", 443), attribute.String("attackbox.persona", "cloud-gateway"),
 				attribute.String("http.route", route), attribute.String("http.request.method", gatewayPublicMethod(r.Method)),
 				attribute.Int("http.response.status_code", status), attribute.String("attackbox.request.content_type", gatewayContentType(r.Header.Get("Content-Type"))),
@@ -139,6 +182,12 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 			}
 			if addr := ClientAddress(r.RemoteAddr); addr != "" {
 				attrs = append(attrs, attribute.String("client.address", addr))
+			}
+			if source, kind, value := gatewayCredential(r); source != "" {
+				attrs = append(attrs, attribute.String("attackbox.credential.source", source), attribute.String("attackbox.credential.type", kind))
+				if value != "" {
+					attrs = append(attrs, attribute.String("attackbox.credential.value", value))
+				}
 			}
 			if r.ContentLength >= 0 {
 				attrs = append(attrs, attribute.Int64("http.request.body.size", r.ContentLength))
@@ -345,7 +394,23 @@ func gatewayReadObject(r *http.Request) (map[string]json.RawMessage, int) {
 }
 
 func gatewayModels(w http.ResponseWriter, _ *http.Request) {
-	gatewayReply(w, 200, gatewayJSON, `{"object":"list","data":[{"id":"`+gatewayModel+`","object":"model","created":1722470400,"owned_by":"local"}]}`)
+	var b strings.Builder
+	b.WriteString(`{"object":"list","data":[`)
+	for i, m := range gatewayModelList {
+		owner := "local"
+		switch {
+		case strings.HasPrefix(m, "gpt-"), strings.HasPrefix(m, "o3-"), strings.HasPrefix(m, "text-embedding-"):
+			owner = "openai"
+		case strings.HasPrefix(m, "claude-"):
+			owner = "anthropic"
+		}
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, `{"id":"%s","object":"model","created":1722470400,"owned_by":"%s"}`, m, owner)
+	}
+	b.WriteString(`]}`)
+	gatewayReply(w, 200, gatewayJSON, b.String())
 }
 
 func gatewayCompletion(chat bool) http.HandlerFunc {
@@ -355,7 +420,8 @@ func gatewayCompletion(chat bool) http.HandlerFunc {
 			gatewayReply(w, status, gatewayJSON, gatewayInvalid)
 			return
 		}
-		if d := r.PathValue("deployment"); d != "" && d != gatewayModel || obj["model"] != nil && !gatewayModelMatches(obj["model"]) {
+		model, ok := gatewayRequestModel(r, obj)
+		if !ok {
 			gatewayReply(w, 404, gatewayJSON, gatewayNoModel)
 			return
 		}
@@ -364,7 +430,7 @@ func gatewayCompletion(chat bool) http.HandlerFunc {
 			gatewayReply(w, 400, gatewayJSON, gatewayInvalid)
 			return
 		}
-		gatewayTrace(r, obj, stream)
+		gatewayTrace(r, obj, model, stream)
 		id, ok := gatewayID(w)
 		if !ok {
 			return
@@ -376,7 +442,7 @@ func gatewayCompletion(chat bool) http.HandlerFunc {
 		}
 		if !stream {
 			w.Header().Set("Content-Type", gatewayJSON)
-			_, _ = fmt.Fprintf(w, `{"id":"%s-%x","object":"%s","created":%d,"model":"`+gatewayModel+`","choices":[{"index":0,%s,"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`, prefix, id, kind, now, content)
+			_, _ = fmt.Fprintf(w, `{"id":"%s-%x","object":"%s","created":%d,"model":"%s","choices":[{"index":0,%s,"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`, prefix, id, kind, now, model, content)
 			return
 		}
 		end := `"text":""`
@@ -384,14 +450,14 @@ func gatewayCompletion(chat bool) http.HandlerFunc {
 			kind, content, end = "chat.completion.chunk", `"delta":{"role":"assistant","content":"Ready."}`, `"delta":{}`
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		const frame = `data: {"id":"%s-%x","object":"%s","created":%d,"model":"` + gatewayModel + `","choices":[{"index":0,%s,"finish_reason":%s}]}` + "\n\n"
-		if _, err := fmt.Fprintf(w, frame, prefix, id, kind, now, content, "null"); err != nil {
+		const frame = `data: {"id":"%s-%x","object":"%s","created":%d,"model":"%s","choices":[{"index":0,%s,"finish_reason":%s}]}` + "\n\n"
+		if _, err := fmt.Fprintf(w, frame, prefix, id, kind, now, model, content, "null"); err != nil {
 			return
 		}
 		if err := http.NewResponseController(w).Flush(); err != nil {
 			return
 		}
-		_, _ = fmt.Fprintf(w, frame, prefix, id, kind, now, end, `"stop"`)
+		_, _ = fmt.Fprintf(w, frame, prefix, id, kind, now, model, end, `"stop"`)
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	}
 }
@@ -399,11 +465,11 @@ func gatewayCompletion(chat bool) http.HandlerFunc {
 const gatewayInvalid = `{"error":{"message":"invalid request","type":"invalid_request_error"}}`
 const gatewayNoModel = `{"error":{"message":"model not found","type":"not_found_error"}}`
 
-// gatewayTrace records only server-chosen values: the model constant and the parsed stream flag.
-func gatewayTrace(r *http.Request, obj map[string]json.RawMessage, stream bool) {
+// gatewayTrace records only server-chosen values: the listed model when the client named one, and the parsed stream flag.
+func gatewayTrace(r *http.Request, obj map[string]json.RawMessage, model string, stream bool) {
 	if span := trace.SpanFromContext(r.Context()); span.IsRecording() {
-		if obj["model"] != nil {
-			span.SetAttributes(attribute.String("gen_ai.request.model", gatewayModel))
+		if obj["model"] != nil || r.PathValue("deployment") != "" {
+			span.SetAttributes(attribute.String("gen_ai.request.model", model))
 		}
 		if obj["stream"] != nil {
 			span.SetAttributes(attribute.Bool("attackbox.request.stream", stream))
@@ -435,7 +501,8 @@ func gatewayEmbeddings(w http.ResponseWriter, r *http.Request) {
 		gatewayReply(w, status, gatewayJSON, gatewayInvalid)
 		return
 	}
-	if d := r.PathValue("deployment"); d != "" && d != gatewayModel || obj["model"] != nil && !gatewayModelMatches(obj["model"]) {
+	model, ok := gatewayRequestModel(r, obj)
+	if !ok {
 		gatewayReply(w, 404, gatewayJSON, gatewayNoModel)
 		return
 	}
@@ -443,8 +510,8 @@ func gatewayEmbeddings(w http.ResponseWriter, r *http.Request) {
 		gatewayReply(w, 400, gatewayJSON, gatewayInvalid)
 		return
 	}
-	gatewayTrace(r, obj, false)
-	gatewayReply(w, 200, gatewayJSON, `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.0123,-0.0456,0.0789,-0.0012,0.0345,-0.0678,0.0901,-0.0234]}],"model":"`+gatewayModel+`","usage":{"prompt_tokens":1,"total_tokens":1}}`)
+	gatewayTrace(r, obj, model, false)
+	gatewayReply(w, 200, gatewayJSON, `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.0123,-0.0456,0.0789,-0.0012,0.0345,-0.0678,0.0901,-0.0234]}],"model":"`+model+`","usage":{"prompt_tokens":1,"total_tokens":1}}`)
 }
 
 func gatewayMessages(w http.ResponseWriter, r *http.Request) {
@@ -460,11 +527,12 @@ func gatewayMessages(w http.ResponseWriter, r *http.Request) {
 		gatewayReply(w, 400, gatewayJSON, invalid)
 		return
 	}
-	if !gatewayModelMatches(obj["model"]) {
+	model, found := gatewayRequestModel(r, obj)
+	if !found {
 		gatewayReply(w, 404, gatewayJSON, `{"type":"error","error":{"type":"not_found_error","message":"model not found"}}`)
 		return
 	}
-	gatewayTrace(r, obj, stream)
+	gatewayTrace(r, obj, model, stream)
 	id, ok := gatewayID(w)
 	if !ok {
 		return
@@ -472,11 +540,11 @@ func gatewayMessages(w http.ResponseWriter, r *http.Request) {
 	const usage = `"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`
 	if !stream {
 		w.Header().Set("Content-Type", gatewayJSON)
-		_, _ = fmt.Fprintf(w, `{"id":"msg_%x","type":"message","role":"assistant","model":"`+gatewayModel+`","content":[{"type":"text","text":"Ready."}],"stop_reason":"end_turn",`+usage, id)
+		_, _ = fmt.Fprintf(w, `{"id":"msg_%x","type":"message","role":"assistant","model":"%s","content":[{"type":"text","text":"Ready."}],"stop_reason":"end_turn",`+usage, id, model)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
-	start := fmt.Sprintf("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_%x\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\""+gatewayModel+"\",\"content\":[],\"stop_reason\":null,"+usage+"}\n\n", id)
+	start := fmt.Sprintf("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_%x\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"%s\",\"content\":[],\"stop_reason\":null,"+usage+"}\n\n", id, model)
 	if !gatewayFlush(w, start, "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
 		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Ready.\"}}\n\n") {
 		return
@@ -486,10 +554,33 @@ func gatewayMessages(w http.ResponseWriter, r *http.Request) {
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 }
 
-const gatewayOllamaName = gatewayModel + ":latest"
+// gatewayOllamaTag gives a model the tag form Ollama reports.
+func gatewayOllamaTag(m string) string {
+	if strings.Contains(m, ":") {
+		return m
+	}
+	return m + ":latest"
+}
 
+// gatewayOllamaTags lists the local-style models only; hosted API names are not Ollama tags.
 func gatewayOllamaTags(w http.ResponseWriter, _ *http.Request) {
-	gatewayReply(w, 200, gatewayJSON, `{"models":[{"name":"`+gatewayOllamaName+`","model":"`+gatewayOllamaName+`","modified_at":"2024-08-01T00:00:00Z","size":4920734272,"digest":"5f8a3c2e9b1d4a6f7c0e8b2d1a9f3e6c4b7d0a2e5f8c1b4d7a0e3f6c9b2d5a8e","details":{"parent_model":"","format":"gguf","family":"llama","families":["llama"],"parameter_size":"8.0B","quantization_level":"Q4_K_M"}}]}`)
+	var b strings.Builder
+	b.WriteString(`{"models":[`)
+	n := 0
+	for _, m := range gatewayModelList {
+		if strings.HasPrefix(m, "gpt-") || strings.HasPrefix(m, "o3-") || strings.HasPrefix(m, "claude-") || strings.HasPrefix(m, "text-embedding-") {
+			continue
+		}
+		if n > 0 {
+			b.WriteByte(',')
+		}
+		n++
+		tag := gatewayOllamaTag(m)
+		fmt.Fprintf(&b, `{"name":"%s","model":"%s","modified_at":"2024-08-01T00:00:00Z","size":%d,"digest":"%x","details":{"parent_model":"","format":"gguf","family":"llama","families":["llama"],"parameter_size":"8.0B","quantization_level":"Q4_K_M"}}`,
+			tag, tag, 4920734272-int64(n)*73400320, sha256.Sum256([]byte(tag)))
+	}
+	b.WriteString(`]}`)
+	gatewayReply(w, 200, gatewayJSON, b.String())
 }
 
 // gatewayOllama follows Ollama's defaults: streaming NDJSON unless the client sets "stream": false.
@@ -508,12 +599,12 @@ func gatewayOllama(chat bool) http.HandlerFunc {
 			gatewayReply(w, 400, gatewayJSON, `{"error":"invalid request"}`)
 			return
 		}
-		var model string
-		if json.Unmarshal(obj["model"], &model) != nil || model != gatewayModel && model != gatewayOllamaName {
+		model, found := gatewayRequestModel(r, obj)
+		if !found {
 			gatewayReply(w, 404, gatewayJSON, `{"error":"model not found"}`)
 			return
 		}
-		gatewayTrace(r, obj, stream)
+		gatewayTrace(r, obj, model, stream)
 		created := time.Now().UTC().Format(time.RFC3339Nano)
 		content := func(text string) string {
 			if chat {
@@ -522,7 +613,7 @@ func gatewayOllama(chat bool) http.HandlerFunc {
 			return `"response":"` + text + `"`
 		}
 		const done = `,"done_reason":"stop","done":true,"total_duration":182400000,"load_duration":10600000,"prompt_eval_count":1,"prompt_eval_duration":21300000,"eval_count":1,"eval_duration":148900000}`
-		head := `{"model":"` + gatewayOllamaName + `","created_at":"` + created + `",`
+		head := `{"model":"` + gatewayOllamaTag(model) + `","created_at":"` + created + `",`
 		if !stream {
 			gatewayReply(w, 200, gatewayJSON, head+content("Ready.")+done)
 			return
@@ -616,7 +707,59 @@ func gatewayStream(raw json.RawMessage) (bool, bool) {
 	}
 }
 
-func gatewayModelMatches(raw json.RawMessage) bool {
-	var s string
-	return json.Unmarshal(raw, &s) == nil && s == gatewayModel
+// gatewayCredential returns the first credential a client sent: where it came from, a fixed type, and the value as sent.
+// The operator chose to export full values. A value that is not 1-512 printable ASCII bytes keeps its type but not its value.
+func gatewayCredential(r *http.Request) (source, kind, value string) {
+	for _, h := range [...]string{"Authorization", "X-Api-Key", "Api-Key", "X-Goog-Api-Key"} {
+		v := r.Header.Get(h)
+		if v == "" {
+			continue
+		}
+		source, kind = strings.ToLower(h), ""
+		if scheme, rest, ok := strings.Cut(v, " "); ok && h == "Authorization" {
+			v = strings.TrimSpace(rest)
+			if strings.EqualFold(scheme, "basic") {
+				kind = "basic"
+			}
+		}
+		if kind == "" {
+			kind = gatewayCredentialKind(v)
+		}
+		return source, kind, gatewayCredentialValue(v)
+	}
+	q := r.URL.Query()
+	for _, name := range [...]string{"key", "api_key", "apikey", "api-key", "access_token", "token"} {
+		if v := q.Get(name); v != "" {
+			return "query", gatewayCredentialKind(v), gatewayCredentialValue(v)
+		}
+	}
+	return "", "", ""
+}
+
+// gatewayCredentialPrefixes is checked in order; the type set must match deploy/public-otel/config.yaml.
+var gatewayCredentialPrefixes = [...][2]string{
+	{"sk-ant-", "anthropic"}, {"sk-", "openai"}, {"AIza", "google"}, {"AKIA", "aws"}, {"ASIA", "aws"}, {"hf_", "huggingface"},
+	{"gsk_", "groq"}, {"xai-", "xai"}, {"r8_", "replicate"}, {"eyJ", "jwt"}, {"github_pat_", "github"}, {"ghp_", "github"},
+	{"gho_", "github"}, {"ghu_", "github"}, {"ghs_", "github"},
+}
+
+func gatewayCredentialKind(v string) string {
+	for _, p := range gatewayCredentialPrefixes {
+		if strings.HasPrefix(v, p[0]) {
+			return p[1]
+		}
+	}
+	return "token"
+}
+
+func gatewayCredentialValue(v string) string {
+	if len(v) == 0 || len(v) > 512 {
+		return ""
+	}
+	for i := range len(v) {
+		if v[i] < '!' || v[i] > '~' {
+			return ""
+		}
+	}
+	return v
 }

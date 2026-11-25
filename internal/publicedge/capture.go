@@ -5,14 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"hash"
 	"io"
 	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -25,11 +23,11 @@ const (
 	CaptureDays      = 7
 	captureTarget    = 2048
 	captureHeader    = 256
-	captureBodyLimit = 16 << 10
-	captureRecordMax = 64 << 10
+	captureBodyLimit = gatewayBodyLimit
+	captureRecordMax = 512 << 10
 )
 
-// Capture appends raw request lines to local JSONL files. The files stay on the host; nothing here is exported.
+// Capture appends raw request lines, headers and bodies to local JSONL files, credentials included and unredacted.
 type Capture struct {
 	mu       sync.Mutex
 	dir      string
@@ -98,7 +96,7 @@ func (c *Capture) Record(r *http.Request, route string, status int, probe string
 	var headers []headerPair
 	for name, values := range r.Header {
 		for _, value := range values {
-			headers = append(headers, headerPair{name: http.CanonicalHeaderKey(name), value: scrubHeader(name, value)})
+			headers = append(headers, headerPair{name: http.CanonicalHeaderKey(name), value: value})
 		}
 	}
 	sort.Slice(headers, func(i, j int) bool {
@@ -121,7 +119,7 @@ func (c *Capture) Record(r *http.Request, route string, status int, probe string
 		rec.BodyBytes = bodyRec.bytes
 		rec.BodySHA256 = hex.EncodeToString(bodyRec.hash.Sum(nil))
 		if bodyRec.buf.Len() > 0 {
-			rec.Body = scrubBody(bodyRec.buf.String())
+			rec.Body = bodyRec.buf.String()
 		}
 		rec.BodyTruncated = !bodyRec.eof || bodyRec.bytes > bodyRec.buf.Len()
 	}
@@ -255,48 +253,4 @@ func (r *captureBodyRecorder) Read(p []byte) (int, error) {
 		r.eof = true
 	}
 	return n, err
-}
-
-var (
-	credentialHeaderWords = []string{"key", "token", "secret", "auth", "password", "session", "cookie"}
-	schemeRe              = regexp.MustCompile(`^(Bearer|Basic|Token|Digest) +(.+)`)
-	// Each rule keeps group 1 and replaces group 2. The member rules run first, so a value is hashed one time.
-	bodySecretRes = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)("[^"]*(?:password|passwd|secret|token|api_?key|authorization)[^"]*"\s*:\s*")((?:[^"\\]|\\.)+)`),
-		regexp.MustCompile(`(?i)((?:^|[?&\s])[\w.\[\]-]*(?:password|passwd|secret|token|api_?key|authorization)[\w.\[\]-]*=)([^&\s"]+)`),
-		regexp.MustCompile(`(?i)(bearer\s+)([A-Za-z0-9._~+/=-]{8,})`),
-	}
-	bodyTokenRe = regexp.MustCompile(`\bsk[-_][A-Za-z0-9_-]{16,}|\bAKIA[A-Z0-9]{16}\b|\bgh[pousr]_[A-Za-z0-9]{20,}|\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+`)
-)
-
-// redact keeps the length and a short hash, so that the same credential can be recognized again without its value.
-func redact(secret string) string {
-	h := sha256.Sum256([]byte(secret))
-	return fmt.Sprintf("[redacted len=%d sha256=%x]", len(secret), h[:6])
-}
-
-func scrubHeader(name, value string) string {
-	lower := strings.ToLower(name)
-	if lower == "user-agent" || lower == "host" {
-		return value
-	}
-	for _, word := range credentialHeaderWords {
-		if strings.Contains(lower, word) {
-			if m := schemeRe.FindStringSubmatch(value); m != nil {
-				return m[1] + " " + redact(m[2])
-			}
-			return redact(value)
-		}
-	}
-	return value
-}
-
-func scrubBody(s string) string {
-	for _, re := range bodySecretRes {
-		s = re.ReplaceAllStringFunc(s, func(match string) string {
-			m := re.FindStringSubmatch(match)
-			return m[1] + redact(m[2])
-		})
-	}
-	return bodyTokenRe.ReplaceAllStringFunc(s, redact)
 }
