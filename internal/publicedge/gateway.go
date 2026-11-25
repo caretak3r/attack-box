@@ -113,6 +113,7 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 	w := &gatewayWriter{ResponseWriter: base}
 	route := "/unmatched"
 	var counted *gatewayBodyCounter
+	var bodyRec *captureBodyRecorder
 	defer func() {
 		panicked := recover() != nil
 		partial := panicked && w.status != 0
@@ -150,7 +151,7 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 			}
 		}
 		span.End()
-		g.Capture.Record(r, route, status, probe)
+		g.Capture.Record(r, route, status, probe, bodyRec)
 		if partial {
 			panic(http.ErrAbortHandler)
 		}
@@ -184,9 +185,23 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 			counted = &gatewayBodyCounter{ReadCloser: r.Body}
 			r.Body = counted
 		}
+		if g.Capture != nil {
+			bodyRec = newCaptureBodyRecorder(r.Body)
+			r.Body = bodyRec
+		}
+	}
+	// With a capture, read a body that no handler reads, so that the local record holds it.
+	// The span keeps its meaning: it reports a chunked body size only when a handler read the body.
+	drain := func() {
+		if bodyRec != nil {
+			counted = nil
+			_ = http.NewResponseController(base).SetReadDeadline(time.Now().Add(2 * time.Second))
+			_, _ = io.Copy(io.Discard, bodyRec)
+		}
 	}
 
 	if f == nil {
+		drain()
 		gatewayReply(w, http.StatusNotFound, "text/plain; charset=utf-8", "404 page not found\n")
 		return
 	}
@@ -196,11 +211,15 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 			allow = "GET, HEAD"
 		}
 		w.Header().Set("Allow", allow)
+		drain()
 		gatewayReply(w, http.StatusMethodNotAllowed, "text/plain; charset=utf-8", "Method Not Allowed\n")
 		return
 	}
 	if deployment != "" {
 		r.SetPathValue("deployment", deployment)
+	}
+	if f.method == http.MethodGet {
+		drain()
 	}
 	f.handle(w, r)
 }

@@ -37,7 +37,7 @@ services:
         source: /etc/attackbox-public/tls
         target: /run/secrets
         read_only: true
-      # Raw request lines stay on the host; the app keeps 7 days at up to 16 MiB per day.
+      # Raw requests stay on the host; the app keeps 7 days at up to 256 MiB per day.
       - type: bind
         source: /var/lib/attackbox-public-capture/requests
         target: /var/lib/attackbox-public-capture

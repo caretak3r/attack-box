@@ -1,6 +1,7 @@
 package publicedge
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -255,33 +256,45 @@ func TestGatewayRequestEvidence(t *testing.T) {
 		{"family variant", "POST", "/proxy/v1/api/completions?api_key=fixture-private", "/proxy/v1/api/completions", peer, completion, false, 200,
 			[]attribute.KeyValue{attribute.String("client.address", "203.0.113.42"), attribute.Int64("http.request.body.size", int64(len(completion))), attribute.String("gen_ai.request.model", gatewayModel), attribute.Bool("attackbox.request.stream", false), attribute.Int("attackbox.request.query_params", 1)}},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			rec := tracetest.NewSpanRecorder()
-			tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
-			defer tp.Shutdown(t.Context())
-			r := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
-			r.RemoteAddr = tc.remote
-			if tc.unknownLength {
-				r.ContentLength = -1
-			}
-			r.Header.Set("Content-Type", "Application/JSON; secret=fixture-private")
-			r.Header.Set("X-Forwarded-For", "198.51.100.1")
-			r.Header.Set("X-Real-IP", "198.51.100.2")
-			NewGateway(tp.Tracer("test")).ServeHTTP(httptest.NewRecorder(), r)
-			spans := rec.Ended()
-			if len(spans) != 1 || spans[0].Name() != "public.request" {
-				t.Fatal("missing public.request span")
-			}
-			want := attribute.NewSet(append([]attribute.KeyValue{
-				attribute.Int("server.port", 443), attribute.String("attackbox.persona", "cloud-gateway"),
-				attribute.String("http.route", tc.route), attribute.String("http.request.method", tc.method),
-				attribute.Int("http.response.status_code", tc.status), attribute.String("attackbox.request.content_type", gatewayJSON),
-			}, tc.want...)...)
-			got := attribute.NewSet(spans[0].Attributes()...)
-			if !want.Equals(&got) {
-				t.Errorf("request attributes = %v, want %v", got.ToSlice(), want.ToSlice())
-			}
-		})
+		// The local capture must never change what a span exports.
+		for _, captured := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s capture=%v", tc.name, captured), func(t *testing.T) {
+				rec := tracetest.NewSpanRecorder()
+				tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+				defer tp.Shutdown(t.Context())
+				r := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+				r.RemoteAddr = tc.remote
+				if tc.unknownLength {
+					r.ContentLength = -1
+				}
+				r.Header.Set("Content-Type", "Application/JSON; secret=fixture-private")
+				r.Header.Set("X-Forwarded-For", "198.51.100.1")
+				r.Header.Set("X-Real-IP", "198.51.100.2")
+				g := NewGateway(tp.Tracer("test"))
+				if captured {
+					c, err := OpenCapture(t.TempDir())
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer c.Close()
+					g.Capture = c
+				}
+				g.ServeHTTP(httptest.NewRecorder(), r)
+				spans := rec.Ended()
+				if len(spans) != 1 || spans[0].Name() != "public.request" {
+					t.Fatal("missing public.request span")
+				}
+				want := attribute.NewSet(append([]attribute.KeyValue{
+					attribute.Int("server.port", 443), attribute.String("attackbox.persona", "cloud-gateway"),
+					attribute.String("http.route", tc.route), attribute.String("http.request.method", tc.method),
+					attribute.Int("http.response.status_code", tc.status), attribute.String("attackbox.request.content_type", gatewayJSON),
+				}, tc.want...)...)
+				got := attribute.NewSet(spans[0].Attributes()...)
+				if !want.Equals(&got) {
+					t.Errorf("request attributes = %v, want %v", got.ToSlice(), want.ToSlice())
+				}
+			})
+		}
 	}
 }
 

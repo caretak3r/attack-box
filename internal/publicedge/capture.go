@@ -1,11 +1,19 @@
 package publicedge
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"hash"
+	"io"
 	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -13,10 +21,12 @@ import (
 
 // Capture limits: one file per UTC day, a byte budget per day, and a fixed number of retained days.
 const (
-	CaptureDayLimit = 16 << 20
-	CaptureDays     = 7
-	captureTarget   = 2048
-	captureHeader   = 256
+	CaptureDayLimit  = 256 << 20
+	CaptureDays      = 7
+	captureTarget    = 2048
+	captureHeader    = 256
+	captureBodyLimit = 16 << 10
+	captureRecordMax = 64 << 10
 )
 
 // Capture appends raw request lines to local JSONL files. The files stay on the host; nothing here is exported.
@@ -32,15 +42,22 @@ type Capture struct {
 }
 
 type captureRecord struct {
-	Time      string `json:"time"`
-	Peer      string `json:"peer"`
-	Method    string `json:"method"`
-	Target    string `json:"target"`
-	Host      string `json:"host,omitempty"`
-	UserAgent string `json:"user_agent,omitempty"`
-	Route     string `json:"route"`
-	Status    int    `json:"status"`
-	Probe     string `json:"probe,omitempty"`
+	Time          string      `json:"time"`
+	Peer          string      `json:"peer"`
+	Method        string      `json:"method"`
+	Target        string      `json:"target"`
+	Host          string      `json:"host,omitempty"`
+	UserAgent     string      `json:"user_agent,omitempty"`
+	Route         string      `json:"route"`
+	Status        int         `json:"status"`
+	Probe         string      `json:"probe,omitempty"`
+	Port          int         `json:"port,omitempty"`
+	Proto         string      `json:"proto,omitempty"`
+	Headers       [][2]string `json:"headers,omitempty"`
+	Body          string      `json:"body,omitempty"`
+	BodyBytes     int         `json:"body_bytes,omitempty"`
+	BodySHA256    string      `json:"body_sha256,omitempty"`
+	BodyTruncated bool        `json:"body_truncated,omitempty"`
 }
 
 // OpenCapture fails when dir cannot hold today's file, so a broken mount stops startup.
@@ -59,7 +76,7 @@ func openCapture(dir string, now func() time.Time) (*Capture, error) {
 }
 
 // Record stores the request line as data; JSON encoding escapes control bytes and replaces invalid UTF-8.
-func (c *Capture) Record(r *http.Request, route string, status int, probe string) {
+func (c *Capture) Record(r *http.Request, route string, status int, probe string, bodyRec *captureBodyRecorder) {
 	if c == nil {
 		return
 	}
@@ -67,15 +84,65 @@ func (c *Capture) Record(r *http.Request, route string, status int, probe string
 	if ap, err := netip.ParseAddrPort(peer); err == nil {
 		peer = ap.Addr().Unmap().String()
 	}
-	line, err := json.Marshal(captureRecord{
+
+	rec := captureRecord{
 		Time: c.now().UTC().Format(time.RFC3339Nano), Peer: clip(peer, captureHeader), Method: clip(r.Method, 32),
 		Target: clip(r.RequestURI, captureTarget), Host: clip(r.Host, captureHeader), UserAgent: clip(r.UserAgent(), captureHeader),
-		Route: route, Status: status, Probe: probe,
+		Route: route, Status: status, Probe: probe, Port: 443, Proto: clip(r.Proto, 16),
+	}
+
+	type headerPair struct {
+		name  string
+		value string
+	}
+	var headers []headerPair
+	for name, values := range r.Header {
+		for _, value := range values {
+			headers = append(headers, headerPair{name: http.CanonicalHeaderKey(name), value: scrubHeader(name, value)})
+		}
+	}
+	sort.Slice(headers, func(i, j int) bool {
+		if headers[i].name != headers[j].name {
+			return headers[i].name < headers[j].name
+		}
+		return headers[i].value < headers[j].value
 	})
+	if len(headers) > 48 {
+		headers = headers[:48]
+	}
+	if len(headers) > 0 {
+		rec.Headers = make([][2]string, len(headers))
+		for i, h := range headers {
+			rec.Headers[i] = [2]string{clip(h.name, 64), clip(h.value, 512)}
+		}
+	}
+
+	if bodyRec != nil && bodyRec.bytes > 0 {
+		rec.BodyBytes = bodyRec.bytes
+		rec.BodySHA256 = hex.EncodeToString(bodyRec.hash.Sum(nil))
+		if bodyRec.buf.Len() > 0 {
+			rec.Body = scrubBody(bodyRec.buf.String())
+		}
+		rec.BodyTruncated = !bodyRec.eof || bodyRec.bytes > bodyRec.buf.Len()
+	}
+
+	line, err := json.Marshal(rec)
 	if err != nil {
 		c.drop()
 		return
 	}
+
+	// One record must stay small; the hash and the byte count still describe the dropped body.
+	if len(line) > captureRecordMax {
+		rec.Body = ""
+		rec.BodyTruncated = true
+		line, err = json.Marshal(rec)
+		if err != nil {
+			c.drop()
+			return
+		}
+	}
+
 	line = append(line, '\n')
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -164,4 +231,72 @@ func clip(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// captureBodyRecorder keeps the first bytes of a request body and hashes and counts all bytes that pass through it.
+type captureBodyRecorder struct {
+	io.ReadCloser
+	buf   bytes.Buffer
+	hash  hash.Hash
+	bytes int
+	eof   bool
+}
+
+func newCaptureBodyRecorder(r io.ReadCloser) *captureBodyRecorder {
+	return &captureBodyRecorder{ReadCloser: r, hash: sha256.New()}
+}
+
+func (r *captureBodyRecorder) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.bytes += n
+	r.hash.Write(p[:n])
+	r.buf.Write(p[:min(n, captureBodyLimit-r.buf.Len())])
+	if err == io.EOF {
+		r.eof = true
+	}
+	return n, err
+}
+
+var (
+	credentialHeaderWords = []string{"key", "token", "secret", "auth", "password", "session", "cookie"}
+	schemeRe              = regexp.MustCompile(`^(Bearer|Basic|Token|Digest) +(.+)`)
+	// Each rule keeps group 1 and replaces group 2. The member rules run first, so a value is hashed one time.
+	bodySecretRes = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)("[^"]*(?:password|passwd|secret|token|api_?key|authorization)[^"]*"\s*:\s*")((?:[^"\\]|\\.)+)`),
+		regexp.MustCompile(`(?i)((?:^|[?&\s])[\w.\[\]-]*(?:password|passwd|secret|token|api_?key|authorization)[\w.\[\]-]*=)([^&\s"]+)`),
+		regexp.MustCompile(`(?i)(bearer\s+)([A-Za-z0-9._~+/=-]{8,})`),
+	}
+	bodyTokenRe = regexp.MustCompile(`\bsk[-_][A-Za-z0-9_-]{16,}|\bAKIA[A-Z0-9]{16}\b|\bgh[pousr]_[A-Za-z0-9]{20,}|\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+`)
+)
+
+// redact keeps the length and a short hash, so that the same credential can be recognized again without its value.
+func redact(secret string) string {
+	h := sha256.Sum256([]byte(secret))
+	return fmt.Sprintf("[redacted len=%d sha256=%x]", len(secret), h[:6])
+}
+
+func scrubHeader(name, value string) string {
+	lower := strings.ToLower(name)
+	if lower == "user-agent" || lower == "host" {
+		return value
+	}
+	for _, word := range credentialHeaderWords {
+		if strings.Contains(lower, word) {
+			if m := schemeRe.FindStringSubmatch(value); m != nil {
+				return m[1] + " " + redact(m[2])
+			}
+			return redact(value)
+		}
+	}
+	return value
+}
+
+func scrubBody(s string) string {
+	for _, re := range bodySecretRes {
+		s = re.ReplaceAllStringFunc(s, func(match string) string {
+			m := re.FindStringSubmatch(match)
+			return m[1] + redact(m[2])
+		})
+	}
+	return bodyTokenRe.ReplaceAllStringFunc(s, redact)
 }
