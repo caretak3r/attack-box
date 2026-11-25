@@ -43,7 +43,7 @@ func set(words string) map[string]bool {
 var countKeys = set(`http_total http_private_source http_public_source http_source_unknown http_synthetic_label_claimed falco_events falco_unparsed falco_time_unparsed proxy_unparsed proxy_time_unparsed kernel_unparsed kernel_time_unparsed docker_non_proxy_rows proxy_non_access_rows unknown_section_marker kernel:OUTPUT-DROP: kernel:CONTAINER-EGRESS-BLOCK: kernel:METADATA-BLOCK: kernel:METADATA-BLOCK-OUT:`)
 var routes = set(`/ /v1/models /v1/chat/completions /v1/completions /v1/responses /v1/embeddings /api/chat /api/generate /api/tags /health /ready mcp_other other unknown`)
 var metricKeys = set(`MemAvailable_KiB MemTotal_KiB SwapFree_KiB load_1m root_disk_used_percent attackbox_inventory_snapshot_valid attackbox_inventory_snapshot_age_seconds falco_source_age_seconds shipper_checkpoint_age_seconds falco_cursor_age_seconds egress_cursor_age_seconds otelcol_exporter_sent_spans otelcol_exporter_sent_spans_total otelcol_exporter_send_failed_spans otelcol_exporter_send_failed_spans_total otelcol_receiver_refused_spans otelcol_receiver_refused_spans_total otelcol_exporter_queue_size otelcol_exporter_queue_capacity`)
-var components = set(`attackbox-bait attackbox-proxy attackbox-egress-adapter.service attackbox-falco-adapter.service attackbox-hostcollector.service attackbox-otel.service attackbox-shipper.service attackbox.service auditd.service containerd.service docker.service falco-modern-bpf.service`)
+var components = set(`attackbox-bait attackbox-proxy attackbox-auditfilter.service attackbox-egress-adapter.service attackbox-falco-adapter.service attackbox-hostcollector.service attackbox-otel.service attackbox-shipper.service attackbox.service auditd.service containerd.service docker.service falco-modern-bpf.service`)
 var componentMetric = regexp.MustCompile(`^(attackbox_(?:component_observed|component_running|component_ready|component_probe_failed|container_health|container_restarts|container_runtime_approved))\{component="([a-zA-Z0-9_.-]+)"\}$`)
 var statusKey = regexp.MustCompile(`^http_status:[1-5][0-9]{2}$`)
 var stateLine = regexp.MustCompile(`(?m)^State: (running|complete|interrupted)\. Start: ([0-9TZ:+-]+)\. Deadline: ([0-9TZ:+-]+)\. Samples: ([0-9]+)\.$`)
@@ -130,7 +130,11 @@ func render(data, report []byte) ([]byte, bool, error) {
 		return nil, false, errors.New("report/sample update in progress")
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "# Security watch debrief — 24 November 2026\n\n**Watch: %s · %d snapshots · last observation %s**\n\nCoverage: %s to %s. Planned final collection: 05:58 Eastern / 10:58 UTC. The first snapshot includes a five-minute baseline.\n\n", state[1], n, clockLabel(last.Until), clockLabel(first), clockLabel(last.Until))
+	deadline, err := time.Parse(time.RFC3339, string(state[3]))
+	if err != nil {
+		return nil, false, errors.New("invalid watch deadline")
+	}
+	fmt.Fprintf(&b, "# Host and private-proxy watch\n\n**Watch: %s · %d snapshots · last observation %s**\n\nCoverage: %s to %s. Planned final collection: %s. The first snapshot includes a five-minute baseline.\n\n", state[1], n, clockLabel(last.Until), clockLabel(first), clockLabel(last.Until), clockLabel(deadline))
 	debrief(&b, samples, counts, notices)
 	b.WriteString("\n<details>\n<summary>Technical evidence: exact counters, collection warnings and latest metrics</summary>\n\n## Activity totals\n\nFailed-service counts are sample occurrences. Falco parse errors can include repeated old records. These are not unique attacks.\n\n")
 	writeCounts := func(m map[string]int64) {
@@ -175,7 +179,7 @@ func git(dir string, args ...string) ([]byte, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), limit)
 	defer cancel()
-	base := []string{"-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "-c", "push.gpgsign=false", "-c", "core.sshCommand=ssh -oBatchMode=yes -oConnectTimeout=10 -oServerAliveInterval=5 -oServerAliveCountMax=2"}
+	base := []string{"-c", "core.sshCommand=ssh -oBatchMode=yes -oConnectTimeout=10 -oServerAliveInterval=5 -oServerAliveCountMax=2"}
 	cmd := exec.CommandContext(ctx, "git", append(base, args...)...)
 	cmd.Dir = dir
 	for _, value := range os.Environ() {
@@ -256,7 +260,11 @@ func run() error {
 	checkout := flag.String("checkout", "", "absolute isolated findings-only checkout")
 	deadlineText := flag.String("deadline", "2026-11-24T11:00:00Z", "stop retrying at this UTC deadline")
 	once := flag.Bool("once", false, "publish once and exit")
+	mainDate := flag.String("main-date", "", "publish this YYYY-MM-DD debrief to main; requires NEW_RELIC_API_KEY and NEW_RELIC_ACCOUNT_ID")
 	flag.Parse()
+	if *mainDate != "" {
+		return runMain(*source, *checkout, *deadlineText, *mainDate, *once)
+	}
 	deadline, err := time.Parse(time.RFC3339, *deadlineText)
 	if err != nil || !filepath.IsAbs(*source) || !filepath.IsAbs(*checkout) || (!*once && (time.Until(deadline) <= 0 || time.Until(deadline) > 12*time.Hour)) {
 		return errors.New("invalid paths or deadline")

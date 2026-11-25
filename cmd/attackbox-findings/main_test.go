@@ -70,6 +70,7 @@ func TestPublishIsolationRetryAndNoop(t *testing.T) {
 	rawGit(t, checkout, "init", "-b", branch)
 	rawGit(t, checkout, "config", "user.name", "Test")
 	rawGit(t, checkout, "config", "user.email", "test@example.invalid")
+	rawGit(t, checkout, "config", "commit.gpgsign", "false")
 	rawGit(t, checkout, "remote", "add", "origin", remote)
 	data, report := fixture(t)
 	content, _, err := render(data, report)
@@ -111,9 +112,9 @@ func TestPublishIsolationRetryAndNoop(t *testing.T) {
 		t.Fatal("unrelated staged file accepted")
 	}
 	// Deleting a secret later does not make the ancestry safe to publish.
-	rawGit(t, checkout, "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-m", "private fixture")
+	rawGit(t, checkout, "commit", "-m", "private fixture")
 	rawGit(t, checkout, "rm", "secret.txt")
-	rawGit(t, checkout, "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", "commit", "-m", "remove fixture")
+	rawGit(t, checkout, "commit", "-m", "remove fixture")
 	if err = publish(checkout, content); err == nil {
 		t.Fatal("private history accepted")
 	}

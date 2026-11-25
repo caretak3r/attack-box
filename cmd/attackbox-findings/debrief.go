@@ -30,7 +30,7 @@ func debrief(b *strings.Builder, samples []sample, counts, notices map[string]in
 	default:
 		b.WriteString("**No HTTP activity was recorded in the collected evidence.** This can mean no traffic or incomplete collection; it does not establish that the service was idle or safe.\n\n")
 	}
-	b.WriteString("Public ingress was closed at setup. The watcher does not re-check the provider firewall. Silence during this watch is therefore not evidence that an internet-facing service resisted attack.\n\n## What took place\n\n")
+	b.WriteString("These HTTP counts cover the private proxy, not the separate public decoy. The watcher does not re-check the provider firewall. Private-proxy silence does not measure public traffic.\n\n## What took place\n\n")
 	if total > 0 {
 		fmt.Fprintf(b, "The proxy recorded **%d HTTP requests**: %d with public-source addresses, %d with private/local addresses and %d with unparseable source addresses.\n\n", total, public, private, counts["http_source_unknown"])
 		if counts["route:/v1/models"] > 0 {
