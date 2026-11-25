@@ -1,10 +1,10 @@
 # Security debrief — 25 November 2026
 
-Updated from New Relic at Nov 25 13:36:17 EST / 18:36:17 UTC. HTTP and connection totals cover the Eastern calendar day through Nov 25 13:35:17 EST / 18:35:17 UTC. The end time trails the query by one minute. Later runs re-query the full day to include delayed arrivals.
+Updated from New Relic at Nov 25 13:41:37 EST / 18:41:37 UTC. HTTP and connection totals cover the Eastern calendar day through Nov 25 13:40:37 EST / 18:40:37 UTC. The end time trails the query by one minute. Later runs re-query the full day to include delayed arrivals.
 
 ## What we observed
 
-The HTTPS decoy on port 443 recorded **62 request span records with a recorded transport peer**, representing **62 distinct span IDs**. Distinct counts can be estimates above 50,000 IDs. These are telemetry observations, not confirmed attackers or exploits. Operator probes can be present. The captured metadata cannot identify the purpose of a caller.
+The HTTPS decoy on port 443 recorded **64 request span records with a recorded transport peer**, representing **64 distinct span IDs**. Distinct counts can be estimates above 50,000 IDs. These are telemetry observations, not confirmed attackers or exploits. Operator probes can be present. The captured metadata cannot identify the purpose of a caller.
 
 **1976 additional request spans without a recorded peer are excluded from the visitor table.** Older versions exported loopback health checks as request spans and older releases did not record transport peers. Do not classify all of these records as visitors or discard them all as health checks. Current loopback health checks are excluded by the service.
 
@@ -12,8 +12,8 @@ The HTTPS decoy on port 443 recorded **62 request span records with a recorded t
 | --- | --- | ---: | ---: |
 | `GET` | `/unmatched` | 400 | 2 |
 | `GET` | `/unmatched` | 404 | 33 |
-| `GET` | `/v1/models` | 200 | 8 |
-| `GET` | `other` | 200 | 2 |
+| `GET` | `/v1/models` | 200 | 9 |
+| `GET` | `other` | 200 | 3 |
 | `POST` | `/unmatched` | 404 | 3 |
 | `POST` | `/v1/completions` | 200 | 5 |
 | `POST` | `/v1/completions` | 404 | 5 |
@@ -25,15 +25,15 @@ The HTTPS decoy on port 443 recorded **62 request span records with a recorded t
 A request to `/unmatched` reached an unrecognized route. A 404 response shows that the route was not served; the route category does not preserve the attempted path or prove an exploit attempt. A 2xx response shows HTTP success, not successful execution of an attack.
 
 - `tls_failed`: 36 connection span records.
-- `no_data`: 10 connection span records.
-- `no_request`: 17 connection span records.
+- `no_data`: 11 connection span records.
+- `no_request`: 18 connection span records.
 - `not_tls`: 9 connection span records.
 
 TLS failures, empty connections and plaintext on a TLS port are consistent with scanning, client errors or operator tests. They do not identify a tool, actor or exploit. Connections that end before HTTP do not have an HTTP response to inspect.
 
 ## Telemetry receipt and limits
 
-Latest public-service heartbeat received in New Relic: **Nov 25 13:34:35 EST / 18:34:35 UTC**.
+Latest public-service heartbeat received in New Relic: **Nov 25 13:39:05 EST / 18:39:05 UTC**.
 
 - `attackbox.otel_dropped_spans_total`: 0 in the latest received heartbeat.
 - `attackbox.otel_export_failed_spans_total`: 0 in the latest received heartbeat.
@@ -52,21 +52,21 @@ The local publisher checks every five minutes. It commits only this daily report
 
 # Host and private-proxy watch
 
-**Watch: running · 81 snapshots · last observation Nov 25 13:34:45 EST / 18:34:45 UTC**
+**Watch: running · 82 snapshots · last observation Nov 25 13:39:46 EST / 18:39:46 UTC**
 
-Coverage: Nov 25 06:48:39 EST / 11:48:39 UTC to Nov 25 13:34:45 EST / 18:34:45 UTC. Planned final collection: Nov 25 18:53:39 EST / 23:53:39 UTC. The first snapshot includes a five-minute baseline.
+Coverage: Nov 25 06:48:39 EST / 11:48:39 UTC to Nov 25 13:39:46 EST / 18:39:46 UTC. Planned final collection: Nov 25 18:53:39 EST / 23:53:39 UTC. The first snapshot includes a five-minute baseline.
 
 ## Assessment
 
-**No public-source requests were recorded in the collected HTTP evidence.** The proxy recorded 1628 requests, including 1628 from private, loopback or link-local addresses. These observations do not establish an attack or compromise.
+**No public-source requests were recorded in the collected HTTP evidence.** The proxy recorded 1648 requests, including 1648 from private, loopback or link-local addresses. These observations do not establish an attack or compromise.
 
 These HTTP counts cover the private proxy, not the separate public decoy. The watcher does not re-check the provider firewall. Private-proxy silence does not measure public traffic.
 
 ## What took place
 
-The proxy recorded **1628 HTTP requests**: 0 with public-source addresses, 1628 with private/local addresses and 0 with unparseable source addresses.
+The proxy recorded **1648 HTTP requests**: 0 with public-source addresses, 1648 with private/local addresses and 0 with unparseable source addresses.
 
-The model-list endpoint received **1624 requests**. This endpoint lists the models that the simulated AI service advertises. Requests here can be inventory checks or reconnaissance; the route alone does not show the caller's purpose.
+The model-list endpoint received **1644 requests**. This endpoint lists the models that the simulated AI service advertises. Requests here can be inventory checks or reconnaissance; the route alone does not show the caller's purpose.
 
 Other requested surfaces:
 
@@ -76,9 +76,9 @@ These route categories do not reveal payloads, exploit techniques or a sequence 
 
 ## Service response and containment
 
-Recorded HTTP outcomes: **1628 successful responses (2xx)**, 0 redirects (3xx), 0 client-error responses (4xx), and 0 server-error responses (5xx). A 2xx status does not prove an exploit worked. This summary does not inspect response bodies or link status totals to individual routes.
+Recorded HTTP outcomes: **1648 successful responses (2xx)**, 0 redirects (3xx), 0 client-error responses (4xx), and 0 server-error responses (5xx). A 2xx status does not prove an exploit worked. This summary does not inspect response bodies or link status totals to individual routes.
 
-Firewall logs contained **378 host-output deny records**, **64 container-egress deny records**, and **7 metadata-access deny records**. These are logged packet denials, not unique sessions or attackers. They can include routine blocked traffic. The aggregates do not link a deny record to an HTTP request or prove that all unwanted traffic was blocked.
+Firewall logs contained **380 host-output deny records**, **64 container-egress deny records**, and **7 metadata-access deny records**. These are logged packet denials, not unique sessions or attackers. They can include routine blocked traffic. The aggregates do not link a deny record to an HTTP request or prove that all unwanted traffic was blocked.
 
 The runtime sensor recorded **292 timestamped Falco events** inside the collection windows. Review the original rule and process context before treating these as execution, persistence or compromise.
 
@@ -88,15 +88,15 @@ At the latest snapshot, **13 of 13 expected components reported running**; runni
 
 Root disk use was **15%**.
 
-Available memory was **6.75 GiB**.
+Available memory was **6.82 GiB**.
 
 The telemetry exporter reported a queue size of **0** at the latest snapshot. A nonzero queue can be transient; one sample does not prove a delivery fault. The watcher does not query New Relic for receipt. Export counters and a running collector are not end-to-end delivery proof.
 
-Failed systemd units were reported **159 times across snapshots**. One persistent failure can appear repeatedly. These counts are not distinct outages and do not identify a security incident.
+Failed systemd units were reported **161 times across snapshots**. One persistent failure can appear repeatedly. These counts are not distinct outages and do not identify a security incident.
 
 ## Evidence gaps and next checks
 
-- The runtime-sensor read reached its 1,000-row tail limit in 81 snapshots. Older events can fall outside the view.
+- The runtime-sensor read reached its 1,000-row tail limit in 82 snapshots. Older events can fall outside the view.
 - Some runtime-sensor rows could not be parsed or timed. Re-reading an old tail can count the same problem again.
 - Collection warnings are present. Their exact labels and occurrence counts are in the technical evidence below.
 - The legacy watcher expects twelve components. The audit filter adds a thirteenth. This count warning alone is not an outage; check individual running-state values.
@@ -110,7 +110,6 @@ Each row is one collection window. Rows are not linked attacker sessions. The ta
 
 | Window end (EST / UTC) | Observed activity | Collection status |
 | --- | --- | --- |
-| Nov 25 12:39:36 EST / 17:39:36 UTC | 20 HTTP requests (0 public-source); 4 host-output denies; 0 container-egress denies; 0 metadata denies; 0 runtime events | 2 collection/health warnings |
 | Nov 25 12:44:37 EST / 17:44:37 UTC | 20 HTTP requests (0 public-source); 2 host-output denies; 0 container-egress denies; 0 metadata denies; 0 runtime events | 2 collection/health warnings |
 | Nov 25 12:49:38 EST / 17:49:38 UTC | 20 HTTP requests (0 public-source); 0 host-output denies; 7 container-egress denies; 0 metadata denies; 0 runtime events | 2 collection/health warnings |
 | Nov 25 12:54:39 EST / 17:54:39 UTC | 20 HTTP requests (0 public-source); 1 host-output denies; 3 container-egress denies; 0 metadata denies; 0 runtime events | 2 collection/health warnings |
@@ -122,6 +121,7 @@ Each row is one collection window. Rows are not linked attacker sessions. The ta
 | Nov 25 13:24:44 EST / 18:24:44 UTC | 20 HTTP requests (0 public-source); 0 host-output denies; 0 container-egress denies; 0 metadata denies; 0 runtime events | 2 collection/health warnings |
 | Nov 25 13:29:44 EST / 18:29:44 UTC | 20 HTTP requests (0 public-source); 0 host-output denies; 0 container-egress denies; 0 metadata denies; 0 runtime events | 2 collection/health warnings |
 | Nov 25 13:34:45 EST / 18:34:45 UTC | 21 HTTP requests (0 public-source); 16 host-output denies; 0 container-egress denies; 0 metadata denies; 73 runtime events | 2 collection/health warnings |
+| Nov 25 13:39:46 EST / 18:39:46 UTC | 20 HTTP requests (0 public-source); 2 host-output denies; 0 container-egress denies; 0 metadata denies; 0 runtime events | 2 collection/health warnings |
 
 This debrief uses fixed narrative rules and numeric observations. It does not execute captured text, contact observed sources or change the VPS. Raw requests, response bodies, addresses, identities and captured instructions are excluded from the public report.
 
@@ -132,27 +132,27 @@ This debrief uses fixed narrative rules and numeric observations. It does not ex
 
 Failed-service counts are sample occurrences. Falco parse errors can include repeated old records. These are not unique attacks.
 
-- `docker_non_proxy_rows`: 22
-- `failed_service_sample_occurrences`: 159
+- `docker_non_proxy_rows`: 24
+- `failed_service_sample_occurrences`: 161
 - `falco_events`: 292
 - `falco_time_unparsed`: 80
-- `falco_unparsed`: 81
-- `http_private_source`: 1628
-- `http_status:200`: 1628
-- `http_total`: 1628
+- `falco_unparsed`: 82
+- `http_private_source`: 1648
+- `http_status:200`: 1648
+- `http_total`: 1648
 - `kernel:CONTAINER-EGRESS-BLOCK:`: 64
 - `kernel:METADATA-BLOCK-OUT:`: 7
-- `kernel:OUTPUT-DROP:`: 378
+- `kernel:OUTPUT-DROP:`: 380
 - `proxy_non_access_rows`: 5
-- `route:/v1/models`: 1624
+- `route:/v1/models`: 1644
 - `route:other`: 4
 
 ## Collection warnings
 
 Counts below are occurrences across samples.
 
-- `component_count_not_12`: 81
-- `falco_1000_row_tail_bound`: 81
+- `component_count_not_12`: 82
+- `falco_1000_row_tail_bound`: 82
 
 ## Latest health and telemetry snapshot
 
@@ -160,7 +160,7 @@ Counters below are cumulative source counters, not window totals. Component valu
 
 | Metric | Value |
 | --- | ---: |
-| `MemAvailable_KiB` | 7.080852e+06 |
+| `MemAvailable_KiB` | 7.150752e+06 |
 | `MemTotal_KiB` | 8.12576e+06 |
 | `SwapFree_KiB` | 8.388336e+06 |
 | `attackbox_component_observed{component="attackbox-auditfilter.service"}` | 1 |
@@ -221,15 +221,15 @@ Counters below are cumulative source counters, not window totals. Component valu
 | `attackbox_container_restarts{component="attackbox-proxy"}` | 0 |
 | `attackbox_container_runtime_approved{component="attackbox-bait"}` | 1 |
 | `attackbox_container_runtime_approved{component="attackbox-proxy"}` | 1 |
-| `attackbox_inventory_snapshot_age_seconds` | 12.653162183 |
+| `attackbox_inventory_snapshot_age_seconds` | 11.743690644 |
 | `attackbox_inventory_snapshot_valid` | 1 |
-| `egress_cursor_age_seconds` | 107 |
-| `falco_cursor_age_seconds` | 215 |
-| `falco_source_age_seconds` | 215 |
-| `load_1m` | 0.01 |
+| `egress_cursor_age_seconds` | 47 |
+| `falco_cursor_age_seconds` | 516 |
+| `falco_source_age_seconds` | 516 |
+| `load_1m` | 0.23 |
 | `otelcol_exporter_queue_capacity` | 3.3554432e+07 |
 | `otelcol_exporter_queue_size` | 0 |
-| `otelcol_exporter_sent_spans` | 137647 |
+| `otelcol_exporter_sent_spans` | 137769 |
 | `otelcol_receiver_refused_spans` | 0 |
 | `root_disk_used_percent` | 15 |
 | `shipper_checkpoint_age_seconds` | 9 |
