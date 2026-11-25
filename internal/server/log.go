@@ -36,6 +36,9 @@ func (s *Server) finish(c *call) {
 	if status >= 500 || c.panicked {
 		span.SetStatus(codes.Error, "handler_error")
 	}
+	if c.selfProbe {
+		return
+	}
 	red := s.cfg.Redactor
 	now := s.cfg.Now()
 	headers, creds := red.Headers(c.r.Header)

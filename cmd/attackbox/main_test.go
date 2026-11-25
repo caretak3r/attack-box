@@ -351,13 +351,14 @@ func TestLiveThreePersonas(t *testing.T) {
 	defer nr.Close()
 
 	a, logs, cancel, done := startApp(t, map[string]string{
-		"ATTACKBOX_NR_LICENSE_KEY": testNRKey,
-		"ATTACKBOX_NR_LOG_URL":     nr.URL + "/log/v1",
-		"ATTACKBOX_NR_METRIC_URL":  nr.URL + "/metric/v1",
-		"ATTACKBOX_OPENAI_ADDR":    "127.0.0.1:0",
-		"ATTACKBOX_VLLM_ADDR":      "127.0.0.1:0",
-		"ATTACKBOX_OLLAMA_ADDR":    "127.0.0.1:0",
-		"ATTACKBOX_INSTANCE":       "test-box",
+		"ATTACKBOX_NR_LICENSE_KEY":            testNRKey,
+		"ATTACKBOX_NR_LOG_URL":                nr.URL + "/log/v1",
+		"ATTACKBOX_NR_METRIC_URL":             nr.URL + "/metric/v1",
+		"ATTACKBOX_OPENAI_ADDR":               "127.0.0.1:0",
+		"ATTACKBOX_VLLM_ADDR":                 "127.0.0.1:0",
+		"ATTACKBOX_OLLAMA_ADDR":               "127.0.0.1:0",
+		"ATTACKBOX_INSTANCE":                  "test-box",
+		"ATTACKBOX_SKIP_SELF_PROBE_DETECTION": "true",
 	})
 	addrs := a.addrs()
 	if len(addrs) != 3 {
@@ -534,9 +535,10 @@ func (c heldReadConn) Read(p []byte) (int, error) {
 
 func TestShutdownCutsHolds(t *testing.T) {
 	cfg, err := loadConfig(envOf(map[string]string{
-		"ATTACKBOX_NR_DISABLED":      "true",
-		"ATTACKBOX_OPENAI_ADDR":      "127.0.0.1:0",
-		"ATTACKBOX_SHUTDOWN_TIMEOUT": "500ms",
+		"ATTACKBOX_NR_DISABLED":               "true",
+		"ATTACKBOX_OPENAI_ADDR":               "127.0.0.1:0",
+		"ATTACKBOX_SHUTDOWN_TIMEOUT":          "500ms",
+		"ATTACKBOX_SKIP_SELF_PROBE_DETECTION": "true",
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -719,9 +721,10 @@ func (p *spoolPeer) records(t *testing.T) []telemetry.Record {
 func TestSpoolMode(t *testing.T) {
 	peer, sock := newSpoolPeer(t)
 	a, logs, cancel, done := startApp(t, map[string]string{
-		"ATTACKBOX_SPOOL_SOCKET": sock,
-		"ATTACKBOX_OPENAI_ADDR":  "127.0.0.1:0",
-		"ATTACKBOX_TIMING":       "false",
+		"ATTACKBOX_SPOOL_SOCKET":              sock,
+		"ATTACKBOX_OPENAI_ADDR":               "127.0.0.1:0",
+		"ATTACKBOX_TIMING":                    "false",
+		"ATTACKBOX_SKIP_SELF_PROBE_DETECTION": "true",
 	})
 	if a.nr != nil || a.spool == nil {
 		t.Fatal("spool mode must not build a New Relic client")
@@ -883,10 +886,11 @@ func spoolEnv(t *testing.T, sock string) map[string]string {
 		t.Fatal(err)
 	}
 	return map[string]string{
-		"ATTACKBOX_SPOOL_SOCKET": sock,
-		"ATTACKBOX_OPENAI_ADDR":  "127.0.0.1:0",
-		"ATTACKBOX_TIMING":       "false",
-		"ATTACKBOX_SECRET_FILE":  keyFile,
+		"ATTACKBOX_SPOOL_SOCKET":              sock,
+		"ATTACKBOX_OPENAI_ADDR":               "127.0.0.1:0",
+		"ATTACKBOX_TIMING":                    "false",
+		"ATTACKBOX_SECRET_FILE":               keyFile,
+		"ATTACKBOX_SKIP_SELF_PROBE_DETECTION": "true",
 	}
 }
 
@@ -1031,11 +1035,12 @@ func TestProvenanceDirectNR(t *testing.T) {
 	defer nr.Close()
 	var epoch string
 	a, logs, cancel, done := startAppWith(t, map[string]string{
-		"ATTACKBOX_NR_LICENSE_KEY": testNRKey,
-		"ATTACKBOX_NR_LOG_URL":     nr.URL + "/log/v1",
-		"ATTACKBOX_NR_METRIC_URL":  nr.URL + "/metric/v1",
-		"ATTACKBOX_OPENAI_ADDR":    "127.0.0.1:0",
-		"ATTACKBOX_TIMING":         "false",
+		"ATTACKBOX_NR_LICENSE_KEY":            testNRKey,
+		"ATTACKBOX_NR_LOG_URL":                nr.URL + "/log/v1",
+		"ATTACKBOX_NR_METRIC_URL":             nr.URL + "/metric/v1",
+		"ATTACKBOX_OPENAI_ADDR":               "127.0.0.1:0",
+		"ATTACKBOX_TIMING":                    "false",
+		"ATTACKBOX_SKIP_SELF_PROBE_DETECTION": "true",
 	}, func(c *config) {
 		c.beat = 20 * time.Millisecond
 		epoch = telemetry.NewRedactor(c.derive("redact")).Epoch()
