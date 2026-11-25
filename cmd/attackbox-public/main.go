@@ -150,7 +150,8 @@ func newApp(cfg config, listen func() (net.Listener, error)) (_ *app, err error)
 	}
 	a.listener = &limitedListener{Listener: listener, slots: a.slots, rejected: &a.rejected, port: externalPort}
 
-	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: a.getCertificate}
+	// "h2" must be named here: if a plain listener's Serve reaches the server before ServeTLS, net/http sets up HTTP/2 only when the config asks for it, but ServeTLS offers h2 in ALPN anyway.
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: a.getCertificate, NextProtos: []string{"h2", "http/1.1"}}
 	a.server = &http.Server{
 		Handler:           a.admit(gateway, publicedge.NewGateway(nil)),
 		TLSConfig:         tlsConfig,

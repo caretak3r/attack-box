@@ -369,6 +369,40 @@ func TestPlainListenerReportsItsPort(t *testing.T) {
 	}
 }
 
+func TestHTTP2WorksWhenPlainServeStartsFirst(t *testing.T) {
+	cfg, roots, _, _ := publicTestConfig(t)
+	a, err := newApp(cfg, func() (net.Listener, error) { return net.Listen("tcp4", "127.0.0.1:0") })
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.probe = func(string) bool { return false }
+	// run starts Serve and ServeTLS in any order; a closed listener makes Serve reach the server first here.
+	closed, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = closed.Close()
+	_ = a.server.Serve(closed)
+	ctx, stop := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() { finished <- a.run(ctx) }()
+
+	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{ForceAttemptHTTP2: true, TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: "localhost", MinVersion: tls.VersionTLS12}}}
+	resp, err := client.Get("https://" + a.listener.Addr().String() + "/v1/models")
+	if err != nil {
+		t.Errorf("HTTP/2 request: %v", err)
+	} else {
+		_ = resp.Body.Close()
+		if resp.StatusCode != 200 || resp.ProtoMajor != 2 {
+			t.Errorf("HTTP/2 request: status %d, protocol %s", resp.StatusCode, resp.Proto)
+		}
+	}
+	stop()
+	if err := <-finished; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRateLimitBoundsAndRefills(t *testing.T) {
 	now := time.Unix(1000, 0)
 	r := newRateLimit(1, 2, now)
