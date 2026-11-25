@@ -121,20 +121,35 @@ func TestPublicCollectorSanitizesAndBindsIdentity(t *testing.T) {
 	span := func(name string, id byte, attrs ...*common.KeyValue) *trace.Span {
 		return &trace.Span{Name: name, TraceId: bytes.Repeat([]byte{id}, 16), SpanId: bytes.Repeat([]byte{id}, 8), StartTimeUnixNano: now, EndTimeUnixNano: now + 1000, Kind: trace.Span_SPAN_KIND_CLIENT, TraceState: "private-marker", Status: &trace.Status{Message: "private-marker"}, Attributes: attrs, Events: []*trace.Span_Event{{Name: "private-marker", TimeUnixNano: now}}}
 	}
-	goodHTTP := span("public.request", 1, num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/v1/models"), str("http.request.method", "GET"), num("http.response.status_code", 200), str("client.address", "192.0.2.1"), str("request.body", "private-marker"))
-	badRoute := span("public.request", 2, num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/private-marker"), str("http.request.method", "GET"), num("http.response.status_code", 200))
-	badPort := span("public.request", 3, num("server.port", 80), str("attackbox.persona", "cloud-gateway"), str("http.route", "/v1/models"), str("http.request.method", "GET"), num("http.response.status_code", 200))
-	badAddress := span("public.request", 4, num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/v1/models"), str("http.request.method", "GET"), num("http.response.status_code", 200), str("client.address", "private-marker"))
-	health := span("public.health", 5, num("server.port", 443), num("attackbox.accepted_requests", 1), num("attackbox.rate_limited_requests", 0), num("attackbox.otel_dropped_spans_total", 0), num("attackbox.otel_export_failed_spans_total", 0))
+	contentType := str("attackbox.request.content_type", "application/json")
+	goodHTTP := span("public.request", 1, num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/v1/completions"), str("http.request.method", "POST"), num("http.response.status_code", 200), contentType, str("client.address", "192.0.2.1"), str("request.body", "private-marker"))
+	badRoute := span("public.request", 2, num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/private-marker"), str("http.request.method", "GET"), num("http.response.status_code", 200), contentType)
+	badPort := span("public.request", 3, num("server.port", 80), str("attackbox.persona", "cloud-gateway"), str("http.route", "/v1/models"), str("http.request.method", "GET"), num("http.response.status_code", 200), contentType)
+	badAddress := span("public.request", 4, num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/v1/models"), str("http.request.method", "GET"), num("http.response.status_code", 200), contentType, str("client.address", "private-marker"))
+	health := span("public.health", 5, num("server.port", 443), num("attackbox.accepted_requests", 1), num("attackbox.rate_limited_requests", 0), num("attackbox.otel_dropped_spans_total", 0), num("attackbox.otel_export_failed_spans_total", 0), contentType, str("client.address", "198.51.100.2"))
 	goodRPC := span("public.rpc", 6, num("server.port", 6334), str("attackbox.persona", "qdrant-grpc"), str("rpc.system", "grpc"), str("rpc.service", "qdrant.Collections"), str("rpc.method", "List"), num("rpc.grpc.status_code", 0), str("client.address", "2001:db8::1"))
-	badPersona := span("public.request", 7, num("server.port", 443), str("attackbox.persona", "mlflow"), str("http.route", "/v1/models"), str("http.request.method", "GET"), num("http.response.status_code", 200))
+	badPersona := span("public.request", 7, num("server.port", 443), str("attackbox.persona", "mlflow"), str("http.route", "/v1/models"), str("http.request.method", "GET"), num("http.response.status_code", 200), contentType)
 	badRPCPort := span("public.rpc", 8, num("server.port", 443), str("attackbox.persona", "qdrant-grpc"), str("rpc.system", "grpc"), str("rpc.service", "qdrant.Collections"), str("rpc.method", "List"), num("rpc.grpc.status_code", 0))
 	badRPCService := span("public.rpc", 9, num("server.port", 6334), str("attackbox.persona", "qdrant-grpc"), str("rpc.system", "grpc"), str("rpc.service", "tensorflow.serving.ModelService"), str("rpc.method", "GetModelStatus"), num("rpc.grpc.status_code", 0))
 	resourceSpan := func(service string, spans ...*trace.Span) *trace.ResourceSpans {
 		return &trace.ResourceSpans{SchemaUrl: "private-marker", Resource: &resource.Resource{Attributes: []*common.KeyValue{str("service.name", service), str("secret", "private-marker")}}, ScopeSpans: []*trace.ScopeSpans{{SchemaUrl: "private-marker", Scope: &common.InstrumentationScope{Name: "private-marker", Attributes: []*common.KeyValue{str("secret", "private-marker")}}, Spans: spans}}}
 	}
+	public := []*trace.Span{goodHTTP, badRoute, badPort, badAddress, health, badPersona, badRPCPort}
+	for i, invalid := range []*common.KeyValue{
+		str("client.address", "203.0.113.256"), str("client.address", "192.000.2.1"), str("client.address", "2001:db8::1"),
+		str("client.address", "172.19.0.1"), str("client.address", "100.127.0.1"), str("client.address", "127.0.0.1"),
+		str("client.address", "0.1.2.3"), str("client.address", "240.0.0.1"), num("client.address", 1),
+		str("attackbox.request.content_type", "application/json; token=private-marker"), num("http.request.body.size", -1),
+		str("http.request.body.size", "private-marker"), str("gen_ai.request.model", "private-marker"), str("attackbox.request.stream", "true"),
+	} {
+		s := span("public.request", byte(10+i), num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/v1/models"), str("http.request.method", "GET"), num("http.response.status_code", 200), invalid)
+		if invalid.Key != contentType.Key {
+			s.Attributes = append(s.Attributes, contentType)
+		}
+		public = append(public, s)
+	}
 	input := &collector.ExportTraceServiceRequest{ResourceSpans: []*trace.ResourceSpans{
-		resourceSpan("attackbox-public-443", goodHTTP, badRoute, badPort, badAddress, health, badPersona, badRPCPort),
+		resourceSpan("attackbox-public-443", public...),
 		resourceSpan("attackbox-public-6334", goodRPC, badRPCService),
 	}}
 	if _, err := collector.NewTraceServiceClient(conn).Export(ctx, input); err != nil {
@@ -146,8 +161,8 @@ func TestPublicCollectorSanitizesAndBindsIdentity(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if bytes.Contains(wire, []byte("private-marker")) || bytes.Contains(wire, []byte("192.0.2.1")) || bytes.Contains(wire, []byte("2001:db8::1")) {
-			t.Fatal("untrusted metadata or client address reached the exporter")
+		if bytes.Contains(wire, []byte("private-marker")) || bytes.Contains(wire, []byte("198.51.100.2")) || bytes.Contains(wire, []byte("2001:db8::1")) {
+			t.Fatal("unapproved request or health data reached the exporter")
 		}
 		seen := make(map[byte]bool)
 		for _, rs := range result.ResourceSpans {
@@ -164,6 +179,26 @@ func TestPublicCollectorSanitizesAndBindsIdentity(t *testing.T) {
 						t.Fatal("untrusted trace metadata survived")
 					}
 					seen[s.SpanId[0]] = true
+					if s.Name == "public.request" {
+						var peer string
+						for _, field := range s.Attributes {
+							if field.Key == "client.address" {
+								peer = field.Value.GetStringValue()
+							}
+						}
+						if peer != "192.0.2.1" {
+							t.Error("exporter lost the approved request peer")
+						}
+					}
+					if s.Name == "public.health" {
+						for _, field := range s.Attributes {
+							switch field.Key {
+							case "server.port", "attackbox.accepted_requests", "attackbox.rate_limited_requests", "attackbox.otel_dropped_spans_total", "attackbox.otel_export_failed_spans_total":
+							default:
+								t.Errorf("request data on health span: %s", field.Key)
+							}
+						}
+					}
 					if (s.Name == "public.request" || s.Name == "public.rpc") && s.Kind != trace.Span_SPAN_KIND_SERVER {
 						t.Fatal("server span kind not normalized")
 					}

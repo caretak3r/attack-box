@@ -21,7 +21,16 @@ processors:
       - 'span.attributes["server.port"] == nil or not IsInt(span.attributes["server.port"])'
       - 'span.attributes["server.port"] != 443 or resource.attributes["service.name"] != "attackbox-public-443"'
       - 'span.attributes["client.address"] != nil and not IsString(span.attributes["client.address"])'
-      - 'span.attributes["client.address"] != nil and IsString(span.attributes["client.address"]) and not IsMatch(span.attributes["client.address"], "^[0-9a-f:.]{2,39}$")'
+      # Canonical IPv4 octets; keep local, shared, and non-unicast peers out of this public stream.
+      - 'IsString(span.attributes["client.address"]) and not IsMatch(span.attributes["client.address"], "^([1-9][0-9]?|1[0-9]{2}|2[01][0-9]|22[0-3])([.](0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}$")'
+      - 'IsString(span.attributes["client.address"]) and IsMatch(span.attributes["client.address"], "^(10|127|169[.]254|192[.]168|172[.](1[6-9]|2[0-9]|3[01])|100[.](6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7]))[.]")'
+      - 'span.name == "public.request" and not IsString(span.attributes["attackbox.request.content_type"])'
+      - 'IsString(span.attributes["attackbox.request.content_type"]) and not IsMatch(span.attributes["attackbox.request.content_type"], "^(application/json|text/plain|application/octet-stream|application/x-www-form-urlencoded|multipart/form-data|other|none)$")'
+      - 'span.attributes["http.request.body.size"] != nil and not IsInt(span.attributes["http.request.body.size"])'
+      - 'IsInt(span.attributes["http.request.body.size"]) and span.attributes["http.request.body.size"] < 0'
+      - 'span.attributes["gen_ai.request.model"] != nil and not IsString(span.attributes["gen_ai.request.model"])'
+      - 'IsString(span.attributes["gen_ai.request.model"]) and span.attributes["gen_ai.request.model"] != "local-instruct-8b"'
+      - 'span.attributes["attackbox.request.stream"] != nil and not IsBool(span.attributes["attackbox.request.stream"])'
       - 'span.name == "public.request" and span.attributes["attackbox.persona"] != "cloud-gateway"'
       - 'span.attributes["attackbox.persona"] != nil and span.attributes["attackbox.persona"] != "cloud-gateway"'
       - 'span.name == "public.request" and (span.attributes["http.request.method"] == nil or not IsString(span.attributes["http.request.method"]))'
@@ -49,7 +58,8 @@ processors:
       - set(scope.name, "attackbox-public")
       - set(scope.version, "${env:ATTACKBOX_PUBLIC_RELEASE_VERSION}")
       - set(scope.schema_url, "")
-      - keep_keys(span.attributes, ["server.port", "attackbox.persona", "http.route", "http.request.method", "http.response.status_code", "attackbox.accepted_requests", "attackbox.rate_limited_requests", "attackbox.otel_dropped_spans_total", "attackbox.otel_export_failed_spans_total"])
+      - keep_keys(span.attributes, ["server.port", "attackbox.persona", "http.route", "http.request.method", "http.response.status_code", "client.address", "attackbox.request.content_type", "http.request.body.size", "gen_ai.request.model", "attackbox.request.stream"]) where span.name == "public.request"
+      - keep_keys(span.attributes, ["server.port", "attackbox.accepted_requests", "attackbox.rate_limited_requests", "attackbox.otel_dropped_spans_total", "attackbox.otel_export_failed_spans_total"]) where span.name == "public.health"
       - truncate_all(span.attributes, 128)
       - set(span.kind, SPAN_KIND_INTERNAL)
       - set(span.kind, SPAN_KIND_SERVER) where span.name == "public.request"

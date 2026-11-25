@@ -29,6 +29,8 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 	cfg, roots, _, dir := publicTestConfig(t)
 	cfg.socket = filepath.Join(dir, "public-collector.sock")
 	got := make(chan *collector.ExportTraceServiceRequest, 128)
+	const privateMarker = "fixture-private-marker"
+	const forgedPeer = "203.0.113.29"
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" || r.URL.Path != "/v1/traces" || r.Header.Get("Content-Type") != "application/x-protobuf" || r.Header.Get("Api-Key") == "" {
 			http.Error(w, "invalid collector request", http.StatusBadRequest)
@@ -48,6 +50,9 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 		if err != nil {
 			http.Error(w, "read error", http.StatusBadRequest)
 			return
+		}
+		if bytes.Contains(data, []byte(privateMarker)) || bytes.Contains(data, []byte(forgedPeer)) {
+			t.Error("public export contains private request data or an address from a forwarding header")
 		}
 		var req collector.ExportTraceServiceRequest
 		if err := proto.Unmarshal(data, &req); err != nil {
@@ -131,19 +136,24 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: "localhost", MinVersion: tls.VersionTLS12}}}
 	defer client.CloseIdleConnections()
 
+	const chatPayload = `{"model":"local-instruct-8b","stream":true,"messages":[{"role":"user","content":"` + privateMarker + `"}]}`
 	for _, tc := range []struct {
 		method, path, body string
 	}{
 		{"GET", "/v1/models", ""},
-		{"POST", "/v1/chat/completions", `{"model":"local-instruct-8b","messages":[{"role":"user","content":"test"}]}`},
+		{"POST", "/v1/chat/completions", chatPayload},
 		{"POST", "/v1/completions", `{"model":"local-instruct-8b","prompt":"test"}`},
 		{"POST", "/openai/deployments/local-instruct-8b/chat/completions", `{"messages":[{"role":"user","content":"test"}]}`},
 	} {
-		req, err := http.NewRequestWithContext(serverCtx, tc.method, "https://"+addr+tc.path, strings.NewReader(tc.body))
+		req, err := http.NewRequestWithContext(serverCtx, tc.method, "https://"+addr+tc.path+"?token="+privateMarker, strings.NewReader(tc.body))
 		if err != nil {
 			t.Fatal(err)
 		}
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", "application/json; fixture="+privateMarker)
+		req.Header.Set("Authorization", "Bearer "+privateMarker)
+		req.Header.Set("Cookie", "session="+privateMarker)
+		req.Header.Set("Forwarded", "for="+forgedPeer)
+		req.Header.Set("X-Forwarded-For", forgedPeer)
 		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -194,17 +204,28 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 						continue
 					}
 					if span.Name == "public.request" {
-						var route, persona string
+						var route, persona, contentType, model string
 						var port int64
+						var stream bool
+						size := int64(-1)
 						for _, attr := range span.Attributes {
-							if attr.Key == "http.route" {
+							switch attr.Key {
+							case "http.route":
 								route = attr.Value.GetStringValue()
-							}
-							if attr.Key == "attackbox.persona" {
+							case "attackbox.persona":
 								persona = attr.Value.GetStringValue()
-							}
-							if attr.Key == "server.port" {
+							case "server.port":
 								port = attr.Value.GetIntValue()
+							case "client.address":
+								t.Error("loopback traffic acquired an internet client address")
+							case "attackbox.request.content_type":
+								contentType = attr.Value.GetStringValue()
+							case "gen_ai.request.model":
+								model = attr.Value.GetStringValue()
+							case "attackbox.request.stream":
+								stream = attr.Value.GetBoolValue()
+							case "http.request.body.size":
+								size = attr.Value.GetIntValue()
 							}
 						}
 						if persona != "cloud-gateway" {
@@ -212,6 +233,9 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 						}
 						if port != externalPort {
 							t.Errorf("request span: expected port %d, got %d", externalPort, port)
+						}
+						if route == "/v1/chat/completions" && (size != int64(len(chatPayload)) || contentType != "application/json" || model != "local-instruct-8b" || !stream) {
+							t.Error("chat span lost structured request fields on its way to the exporter")
 						}
 						seen[route] = true
 					}
