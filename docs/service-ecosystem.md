@@ -51,7 +51,7 @@ Display `running`, `ready`, `telemetry fresh`, and `coverage verified` separatel
 
 ## Instrumentation choice
 
-Use native New Relic Infrastructure for host, process and Docker metrics and selected host logs. The user explicitly approved its guided installation on 2026-11-23. Use the official OTel Go SDK for bait and shipper and one pinned Collector for application spans and readiness metrics. Keep the Go shipper for raw evidence and its durable queue. The OTel profile no longer collects duplicate host metrics. Local tracing uses SDK 1.46.0 and Collector 0.165.0.
+Use native New Relic Infrastructure for host, process and Docker metrics and selected host logs. The user explicitly approved its guided installation on 2026-11-23. Use the official OTel Go SDK for bait and shipper and one pinned Collector for application spans and readiness metrics. Keep the Go shipper for raw evidence and its durable queue. The OTel profile no longer collects duplicate host metrics. Local tracing uses Collector 0.165.0.
 
 Use stable names such as `attackbox-bait` and `attackbox-shipper`. Add `service.instance.id`, service version and trusted campaign tags. Match `host.id` across services and host metrics; use the actual `container.id` for container relationships. Keep a common trusted sensor identifier on evidence. Do not mass-rename the existing log field until dashboard compatibility is specified. [OTel identity and relationship requirements](https://docs.newrelic.com/docs/opentelemetry/best-practices/opentelemetry-best-practices-resources/)
 

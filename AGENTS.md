@@ -39,7 +39,7 @@ The Ubuntu profile uses nginx and Docker Compose. The gVisor override selects `r
 
 ## Development setup
 
-Use Go 1.25 or later. From the repository root, run the applicable Go and shell checks:
+Use Go 1.26 or later. From the repository root, run the applicable Go and shell checks:
 
 ```bash
 go vet ./...

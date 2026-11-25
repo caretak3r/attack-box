@@ -8,7 +8,7 @@ Setup: `/Users/rohit/attack-box/docs/operator.md`. Improvement requirements and 
 
 Collect evidence about attacks against fake AI and agent services. Keep request evidence, response evidence, capture limits, and analysis uncertainty. Use deterministic responses to sustain useful interactions. Never execute a requested shell command, tool, model file, package, or external fetch.
 
-Build runtime services in Go. The existing module `/Users/rohit/attack-box/go.mod` declares Go 1.25. Prefer its standard library and existing packages. Retain nginx, systemd, nftables, Docker, gVisor, and Falco for their existing infrastructure roles. Shell provisioning and the Python client test harness remain support tools.
+Build runtime services with the Go version in `/Users/rohit/attack-box/go.mod` or later. Prefer the Go standard library and existing packages. Retain nginx, systemd, nftables, Docker, gVisor, and Falco for their existing infrastructure roles. Shell provisioning and the Python client test harness remain support tools.
 
 ## Source topology (paired release pending)
 

@@ -11,7 +11,7 @@ Each snapshot collects host load, available memory, disk use, component inventor
 Build and run from `/Users/rohit/attack-box`:
 
 ```sh
-GOTOOLCHAIN=go1.25.11 go build -o /Users/rohit/attack-box/.vultr/attackbox-watch ./cmd/attackbox-watch
+go build -o /Users/rohit/attack-box/.vultr/attackbox-watch ./cmd/attackbox-watch
 /usr/bin/caffeinate -i /Users/rohit/attack-box/.vultr/attackbox-watch \
   -duration 8h -interval 5m \
   -out /Users/rohit/attack-box/reports/overnight-20261124
@@ -38,7 +38,7 @@ The public report starts with a security debrief: assessment, observed activity,
 Build from `/Users/rohit/attack-box`, then run in the existing isolated checkout:
 
 ```sh
-GOTOOLCHAIN=go1.25.11 go build -o /Users/rohit/attack-box/.vultr/attackbox-findings ./cmd/attackbox-findings
+go build -o /Users/rohit/attack-box/.vultr/attackbox-findings ./cmd/attackbox-findings
 /usr/bin/caffeinate -i /Users/rohit/attack-box/.vultr/attackbox-findings \
   -source /Users/rohit/attack-box/reports/overnight-20261124 \
   -checkout /Users/rohit/attack-box/.vultr/findings-publisher \

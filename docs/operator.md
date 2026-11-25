@@ -34,7 +34,7 @@ Inspect the `probe` stream and its `declarations` array. Diagnostic fields start
 
 ### Runtime direction
 
-Build runtime services in Go, using the version declared by `/Users/rohit/attack-box/go.mod` (currently Go 1.25). The repository supplies the bait and shipper binaries. The shipper binary also supplies stdin adapter modes. The proposed analysis job and typed response planner are not implemented services.
+Build runtime services with the Go version in `/Users/rohit/attack-box/go.mod` or later. The repository supplies the bait and shipper binaries. The shipper binary also supplies stdin adapter modes. The proposed analysis job and typed response planner are not implemented services.
 
 The supplied Compose setup publishes proxy ports only on host loopback: `127.0.0.1:8443` for TLS and `127.0.0.1:8080` for a redirect. It enables the OpenAI persona only. Public 443, vLLM 8000, and Ollama 11434 require the coordinated I01 change in `/Users/rohit/attack-box/IMPROVE.md`. Opening the provider firewall alone does not enable them.
 
@@ -322,8 +322,8 @@ Validation commands for this change:
 
 ```bash
 cd /Users/rohit/attack-box
-GOTOOLCHAIN=go1.25.11 go test -race ./internal/hostevidence ./internal/shipper ./internal/telemetry ./cmd/attackbox-shipper ./internal/server
-GOTOOLCHAIN=go1.25.11 go vet ./...
+go test -race ./internal/hostevidence ./internal/shipper ./internal/telemetry ./cmd/attackbox-shipper ./internal/server
+go vet ./...
 shellcheck -S error /Users/rohit/attack-box/scripts/deploy-ubuntu.sh /Users/rohit/attack-box/scripts/test-deploy-ubuntu.sh
 bash /Users/rohit/attack-box/scripts/test-deploy-ubuntu.sh
 ```

@@ -38,8 +38,8 @@ Run from `/Users/rohit/attack-box`:
 
 ```sh
 cd /Users/rohit/attack-box
-GOTOOLCHAIN=go1.25.11 go test -race -count=1 -v ./cmd/attackbox-scenarios
-GOTOOLCHAIN=go1.25.11 go vet ./cmd/attackbox-scenarios
+go test -race -count=1 -v ./cmd/attackbox-scenarios
+go vet ./cmd/attackbox-scenarios
 ```
 
 The integration test starts the real HTTP handler with raw evidence capture enabled. It invokes the full CLI, checks all ten responses, then reconstructs each request and response from captured segments. It verifies segment order, offsets, hashes, byte totals, completion flags, response IDs, encoded URI, research headers, and the fake credential. It also verifies that ordinary events contain the readable research marker. Separate tests check destination restrictions, redirects, response limits, self-signed TLS, and exclusive output creation.
@@ -48,7 +48,7 @@ To retain local test evidence, use a new absolute directory:
 
 ```sh
 cd /Users/rohit/attack-box
-ATTACKBOX_SCENARIO_TEST_REPORT_DIR=/tmp/attackbox-scenario-local-001 GOTOOLCHAIN=go1.25.11 go test -race -count=1 -v ./cmd/attackbox-scenarios
+ATTACKBOX_SCENARIO_TEST_REPORT_DIR=/tmp/attackbox-scenario-local-001 go test -race -count=1 -v ./cmd/attackbox-scenarios
 ```
 
 The test writes `/tmp/attackbox-scenario-local-001/results.json` and `/tmp/attackbox-scenario-local-001/local-events.json`. These files prove local handler capture only. They are not New Relic delivery receipts. `/tmp/attackbox-scenario-local-001/local-events.json` uses the internal event schema; do not pass it to the New Relic export reconstruction command.

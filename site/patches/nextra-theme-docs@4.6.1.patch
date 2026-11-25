@@ -1,0 +1,13 @@
+diff --git a/dist/schemas.js b/dist/schemas.js
+--- a/dist/schemas.js
++++ b/dist/schemas.js
+@@ -65,7 +65,8 @@ const LayoutPropsSchema = z.strictObject({
+   banner: reactNode.optional().meta({
+     description: "Rendered [`<Banner>` component](/docs/built-ins/banner). E.g. `<Banner {...bannerProps} />`"
+   }),
+-  children: reactNode,
++  // shortcut: Layout omits children; remove this patch when Nextra accepts that.
++  children: reactNode.optional(),
+   copyPageButton: z.boolean().default(true).meta({
+     description: "Hide/show copy page content button."
+   }),

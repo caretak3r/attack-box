@@ -7,7 +7,7 @@ Status: native New Relic Infrastructure 2.1.1 installed on `srv-000000` on 2026-
 | Component | Input and output | Limits and failure behavior |
 |---|---|---|
 | Native New Relic Infrastructure | Host, process and Docker metrics; selected host logs | Default bootstrap component. Root-owned ingest configuration, mode `0600`; private status endpoint `127.0.0.1:18003`. |
-| Go bait and shipper | Official OTel SDK 1.46.0; OTLP gRPC over separate Unix sockets | 1,024 queued spans, 128 per batch, one-second flush, two-second export timeout, three-second shutdown. Overflow and failed export counters. Spans are not durable. |
+| Go bait and shipper | Official OTel SDK; OTLP gRPC over separate Unix sockets | 1,024 queued spans, 128 per batch, one-second flush, two-second export timeout, three-second shutdown. Overflow and failed export counters. Spans are not durable. |
 | Host OTel Collector 0.165.0 | Role-specific trace sockets; readiness and Collector Prometheus scrapes; HTTPS OTLP to US New Relic | 192 MiB memory limiter, 320 MiB service limit, 16 MiB export queue, 900,000-byte export batches. Retry expires after five minutes. Queue is memory-only. |
 | Go readiness collector | Root-owned inventory snapshot; fixed loopback probes; `/metrics` on `127.0.0.1:9465` | 64 MiB service limit; 15-second refresh; 90-second stale limit. Dynamic user. No Docker socket. |
 | Snapshot helper | Fixed `systemctl show` and `docker inspect` commands; `/run/attackbox-monitoring/inventory.json` | Root one-shot; four concurrent commands; two seconds per command; 64 KiB maximum snapshot; timer every 15 seconds. No environment, mounts or secret fields. |
@@ -38,12 +38,12 @@ The source creates fresh request traces and ignores client trace headers. Raw ev
 
 ## Prepare a reviewed release
 
-Run from the source root. Use Go 1.25 or a compatible later version. Do not replace the existing running binaries during preparation.
+Run from the source root. Use Go 1.26 or later. Do not replace the running binaries during preparation.
 
 ```sh
 cd /Users/rohit/attack-box
-GOTOOLCHAIN=go1.25.11 go test -race ./...
-GOTOOLCHAIN=go1.25.11 go vet ./...
+go test -race ./...
+go vet ./...
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/attackbox-hostcollector-linux-amd64 ./cmd/attackbox-hostcollector
 shasum -a 256 /tmp/attackbox-hostcollector-linux-amd64
 bash /Users/rohit/attack-box/scripts/install-monitoring.sh --check

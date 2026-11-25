@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "@theguild/remark-mermaid": "^0.3.0",
-    "katex": "^0.16.47",
+    "katex": "0.18.2",
     "mermaid": "^11.16.0",
     "next": "^16.0.7",
     "nextra": "^4.6.1",
@@ -24,7 +24,12 @@
   },
   "pnpm": {
     "overrides": {
-      "zod": "4.1.12"
+      "@ts-morph/common>minimatch": "11.0.1",
+      "katex": "$katex",
+      "zod": "4.6.6"
+    },
+    "patchedDependencies": {
+      "nextra-theme-docs@4.6.1": "patches/nextra-theme-docs@4.6.1.patch"
     }
   },
   "packageManager": "pnpm@10.33.2"

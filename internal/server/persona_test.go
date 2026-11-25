@@ -287,7 +287,7 @@ func TestEmbedInputs(t *testing.T) {
 		}
 	}
 	if got, _ := s.embedInputs(nil); got != nil {
-		t.Errorf("absent input = %q", got)
+		t.Errorf("absent input = %+v", got)
 	}
 	if _, err := s.embedInputs(raw(manyStrings(maxEmbedInputs + 1))); err == nil {
 		t.Error("input over the cap accepted")

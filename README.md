@@ -26,7 +26,7 @@ Telemetry can be incomplete. A heartbeat does not prove that the system captured
 
 ## Local setup
 
-Install Go 1.25 or later and `curl`. Run these commands from the repository root. Docker and a New Relic key are not required.
+Install Go 1.26 or later and `curl`. Run these commands from the repository root. Docker and a New Relic key are not required.
 
 ```bash
 go test ./...
