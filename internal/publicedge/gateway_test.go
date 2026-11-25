@@ -366,6 +366,7 @@ func TestGatewayCredential(t *testing.T) {
 		{"Authorization", "bearer sk-proj-" + fill, "", "authorization", "openai", "sk-proj-" + fill},
 		{"Authorization", "Basic dXNlcjpwYXNz", "", "authorization", "basic", "dXNlcjpwYXNz"},
 		{"Authorization", "Token " + fill, "", "authorization", "token", fill},
+		{"Proxy-Authorization", "Basic dXNlcjpwYXNz", "", "proxy-authorization", "basic", "dXNlcjpwYXNz"},
 		{"X-Api-Key", "gsk_" + fill, "", "x-api-key", "groq", "gsk_" + fill},
 		{"Api-Key", "has space", "", "api-key", "token", ""},
 		{"", "", "?model=x&api_key=hf_" + fill, "query", "huggingface", "hf_" + fill},

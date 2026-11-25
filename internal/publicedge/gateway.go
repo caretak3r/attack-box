@@ -726,13 +726,13 @@ func gatewayStream(raw json.RawMessage) (bool, bool) {
 // gatewayCredential returns the first credential a client sent: where it came from, a fixed type, and the value as sent.
 // The operator chose to export full values. A value that is not 1-512 printable ASCII bytes keeps its type but not its value.
 func gatewayCredential(r *http.Request) (source, kind, value string) {
-	for _, h := range [...]string{"Authorization", "X-Api-Key", "Api-Key", "X-Goog-Api-Key"} {
+	for _, h := range [...]string{"Authorization", "Proxy-Authorization", "X-Api-Key", "Api-Key", "X-Goog-Api-Key"} {
 		v := r.Header.Get(h)
 		if v == "" {
 			continue
 		}
 		source, kind = strings.ToLower(h), ""
-		if scheme, rest, ok := strings.Cut(v, " "); ok && h == "Authorization" {
+		if scheme, rest, ok := strings.Cut(v, " "); ok && strings.HasSuffix(h, "Authorization") {
 			v = strings.TrimSpace(rest)
 			if strings.EqualFold(scheme, "basic") {
 				kind = "basic"

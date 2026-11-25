@@ -151,7 +151,7 @@ func newApp(cfg config, listen func() (net.Listener, error)) (_ *app, err error)
 	a.listener = &limitedListener{Listener: listener, slots: a.slots, rejected: &a.rejected, port: externalPort}
 
 	// "h2" must be named here: if a plain listener's Serve reaches the server before ServeTLS, net/http sets up HTTP/2 only when the config asks for it, but ServeTLS offers h2 in ALPN anyway.
-	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: a.getCertificate, NextProtos: []string{"h2", "http/1.1"}}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: a.getCertificate, GetConfigForClient: a.noteSNI, NextProtos: []string{"h2", "http/1.1"}}
 	a.server = &http.Server{
 		Handler:           a.admit(gateway, publicedge.NewGateway(nil)),
 		TLSConfig:         tlsConfig,
@@ -172,11 +172,16 @@ func newApp(cfg config, listen func() (net.Listener, error)) (_ *app, err error)
 	return a, nil
 }
 
-func (a *app) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func (a *app) getCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	a.tlsMu.RLock()
-	cert := a.tlsCert
-	a.tlsMu.RUnlock()
+	defer a.tlsMu.RUnlock()
+	return a.tlsCert, nil
+}
+
+// noteSNI runs for every parsed ClientHello, including session resumption, where getCertificate is skipped.
+func (a *app) noteSNI(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 	if c, ok := hello.Conn.(*limitedConn); ok {
+		cert, _ := a.getCertificate(hello)
 		sni := sniOther
 		if hello.ServerName == "" {
 			sni = sniNone
@@ -185,7 +190,7 @@ func (a *app) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, erro
 		}
 		c.sni.Store(sni)
 	}
-	return cert, nil
+	return nil, nil
 }
 
 func (a *app) reloadCertificate() error {
@@ -282,12 +287,13 @@ func (l *limitedListener) Accept() (net.Conn, error) {
 }
 
 const (
-	sniNone uint32 = iota + 1
+	sniUnknown uint32 = iota // no ClientHello was parsed
+	sniNone
 	sniMatch
 	sniOther
 )
 
-var sniNames = [...]string{sniNone: "none", sniMatch: "match", sniOther: "other"}
+var sniNames = [...]string{sniUnknown: "unknown", sniNone: "none", sniMatch: "match", sniOther: "other"}
 
 type connKey struct{}
 
@@ -351,9 +357,7 @@ func (a *app) trackConn(conn net.Conn, state http.ConnState) {
 	if addr := publicedge.ClientAddress(c.RemoteAddr().String()); addr != "" {
 		attrs = append(attrs, attribute.String("client.address", addr))
 	}
-	if sni := c.sni.Load(); sni != 0 {
-		attrs = append(attrs, attribute.String("attackbox.tls.sni", sniNames[sni]))
-	}
+	attrs = append(attrs, attribute.String("attackbox.tls.sni", sniNames[c.sni.Load()]))
 	_, span := a.tracing.Tracer.Start(context.Background(), "public.connection", trace.WithNewRoot(), trace.WithTimestamp(c.opened), trace.WithAttributes(attrs...))
 	span.End()
 }

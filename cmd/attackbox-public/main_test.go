@@ -228,15 +228,22 @@ func TestPreHTTPConnectionSpans(t *testing.T) {
 		t.Fatal("untrusted handshake succeeded")
 	}
 	_ = untrusted.Close()
-	idle := tls.Client(dial(), &tls.Config{RootCAs: roots, ServerName: "localhost", MinVersion: tls.VersionTLS12})
-	if err := idle.Handshake(); err != nil {
-		t.Fatal(err)
+	// TLS 1.2 tickets arrive inside the handshake, so the second connection resumes without a read.
+	resume := &tls.Config{RootCAs: roots, ServerName: "localhost", MinVersion: tls.VersionTLS12, MaxVersion: tls.VersionTLS12, ClientSessionCache: tls.NewLRUClientSessionCache(1)}
+	for i := range 2 {
+		idle := tls.Client(dial(), resume)
+		if err := idle.Handshake(); err != nil {
+			t.Fatal(err)
+		}
+		if resumed := idle.ConnectionState().DidResume; resumed != (i == 1) {
+			t.Fatalf("connection %d resumed = %v", i, resumed)
+		}
+		_ = idle.Close()
 	}
-	_ = idle.Close()
-	for deadline := time.Now().Add(5 * time.Second); a.preHTTP.Load() < 4 && time.Now().Before(deadline); {
+	for deadline := time.Now().Add(5 * time.Second); a.preHTTP.Load() < 5 && time.Now().Before(deadline); {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if got := a.preHTTP.Load(); got != 4 || a.accepted.Load() != 0 {
+	if got := a.preHTTP.Load(); got != 5 || a.accepted.Load() != 0 {
 		t.Fatalf("pre-HTTP connections = %d, accepted requests = %d", got, a.accepted.Load())
 	}
 	stop()
@@ -264,12 +271,12 @@ func TestPreHTTPConnectionSpans(t *testing.T) {
 							t.Error("loopback connection acquired an internet client address")
 						}
 					}
-					got[outcome] = sni
+					got[outcome] += sni + " "
 				}
 			}
 		}
 	}
-	want := map[string]string{"no_data": "", "not_tls": "", "tls_failed": "other", "no_request": "match"}
+	want := map[string]string{"no_data": "unknown ", "not_tls": "unknown ", "tls_failed": "other ", "no_request": "match match "}
 	if len(got) != len(want) {
 		t.Fatalf("connection outcomes = %v, want %v", got, want)
 	}

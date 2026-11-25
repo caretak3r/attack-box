@@ -44,7 +44,7 @@ processors:
       - 'span.attributes["attackbox.probe.class"] != nil and not IsString(span.attributes["attackbox.probe.class"])'
       - 'IsString(span.attributes["attackbox.probe.class"]) and not IsMatch(span.attributes["attackbox.probe.class"], "^(proxy|root|env_file|vcs|wordpress|actuator|cgi|admin|php|discovery|config_file|llm_api|other)$")'
       # Credentials are exported as sent by operator decision; the value is bounded to 1-512 printable ASCII bytes.
-      - 'span.attributes["attackbox.credential.source"] != nil and (not IsString(span.attributes["attackbox.credential.source"]) or not IsMatch(span.attributes["attackbox.credential.source"], "^(authorization|x-api-key|api-key|x-goog-api-key|query)$"))'
+      - 'span.attributes["attackbox.credential.source"] != nil and (not IsString(span.attributes["attackbox.credential.source"]) or not IsMatch(span.attributes["attackbox.credential.source"], "^(authorization|proxy-authorization|x-api-key|api-key|x-goog-api-key|query)$"))'
       - 'span.attributes["attackbox.credential.type"] != nil and (not IsString(span.attributes["attackbox.credential.type"]) or not IsMatch(span.attributes["attackbox.credential.type"], "^(anthropic|openai|google|aws|huggingface|groq|xai|replicate|jwt|github|basic|token)$"))'
       - 'span.attributes["attackbox.credential.value"] != nil and (not IsString(span.attributes["attackbox.credential.value"]) or not IsMatch(span.attributes["attackbox.credential.value"], "^[!-~]{1,512}$") or span.attributes["attackbox.credential.type"] == nil)'
       - 'span.name == "public.request" and (span.attributes["http.response.status_code"] == nil or not IsInt(span.attributes["http.response.status_code"]))'
@@ -52,7 +52,7 @@ processors:
       - 'span.name == "public.connection" and not IsString(span.attributes["attackbox.connection.outcome"])'
       - 'IsString(span.attributes["attackbox.connection.outcome"]) and not IsMatch(span.attributes["attackbox.connection.outcome"], "^(no_data|not_tls|tls_failed|no_request)$")'
       - 'span.attributes["attackbox.tls.sni"] != nil and not IsString(span.attributes["attackbox.tls.sni"])'
-      - 'IsString(span.attributes["attackbox.tls.sni"]) and not IsMatch(span.attributes["attackbox.tls.sni"], "^(none|match|other)$")'
+      - 'IsString(span.attributes["attackbox.tls.sni"]) and not IsMatch(span.attributes["attackbox.tls.sni"], "^(unknown|none|match|other)$")'
       - 'span.attributes["attackbox.accepted_requests"] != nil and not IsInt(span.attributes["attackbox.accepted_requests"])'
       - 'span.attributes["attackbox.rate_limited_requests"] != nil and not IsInt(span.attributes["attackbox.rate_limited_requests"])'
       - 'span.attributes["attackbox.pre_http_connections"] != nil and not IsInt(span.attributes["attackbox.pre_http_connections"])'

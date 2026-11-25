@@ -26,7 +26,7 @@ The gateway serves these model names: `local-instruct-8b`, `gpt-4o`, `gpt-4o-min
 
 ## Credentials
 
-The operator decided to export credentials as the client sends them. The request span contains the first credential found, in this order: the `Authorization`, `X-Api-Key`, `Api-Key`, and `X-Goog-Api-Key` headers, then the query parameters `key`, `api_key`, `apikey`, `api-key`, `access_token`, and `token`. `attackbox.credential.source` is the lowercase header name or `query`. `attackbox.credential.value` is the value without its `Authorization` scheme word. A Basic value stays base64. A value that is not 1 to 512 printable ASCII bytes is not exported, but its source and type are. `attackbox.credential.type` comes from the value prefix:
+The operator decided to export credentials as the client sends them. The request span contains the first credential found, in this order: the `Authorization`, `Proxy-Authorization`, `X-Api-Key`, `Api-Key`, and `X-Goog-Api-Key` headers, then the query parameters `key`, `api_key`, `apikey`, `api-key`, `access_token`, and `token`. `attackbox.credential.source` is the lowercase header name or `query`. `attackbox.credential.value` is the value without its `Authorization` or `Proxy-Authorization` scheme word. A Basic value stays base64. A value that is not 1 to 512 printable ASCII bytes is not exported, but its source and type are. `attackbox.credential.type` comes from the value prefix:
 
 |Type|Prefix|
 |---|---|
@@ -103,7 +103,7 @@ SINCE 1 day ago LIMIT 100
 |`tls_failed`|The TLS handshake started but did not complete.|
 |`no_request`|The TLS handshake completed, but no valid request reached the gateway.|
 
-`attackbox.tls.sni` is `none` if the ClientHello has no server name, `match` if the name matches the certificate, and `other` for a different name. The field is empty if no ClientHello arrived. The span starts when the service accepts the connection and ends when the connection closes.
+`attackbox.tls.sni` is `none` if the ClientHello has no server name, `match` if the name matches the certificate, and `other` for a different name. It is `unknown` if no ClientHello was parsed, which is always true on the plain-HTTP ports. The service reads the name from every ClientHello, including resumed sessions. The span starts when the service accepts the connection and ends when the connection closes.
 
 The service sends at most one connection span each second, with a burst of 16. The `public.health` span counts all such connections in `attackbox.pre_http_connections`. It counts connections that the listener rejects at its 128-connection limit in `attackbox.rejected_connections`. Both counters start at zero when the service starts.
 
