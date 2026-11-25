@@ -12,11 +12,15 @@ AttackBox implements OpenAI, vLLM, and Ollama API personas. The responses are sy
 
 | Function | What AttackBox does |
 |---|---|
-| Simulate | Return protocol-shaped responses without a model backend. |
-| Observe | Record bounded, redacted observations of service activity. |
-| Transport | Pass observations to a host shipper for local queueing and delivery to New Relic. |
+| Simulate | Return protocol-shaped responses without a model backend. Stream synthetic replies over SSE or NDJSON. |
+| Observe | Record bounded, redacted observations of client behavior: requests, parsed declarations, probe compliance, and sessions. |
+| Collect | Add host runtime evidence from Falco, kernel audit, and privileged snapshots outside the bait container. |
+| Validate | Admit records by role and structure. Reject malformed or oversized payloads before queueing. |
+| Deliver | Append admitted records to a durable disk queue. Batch and ship logs and metrics to New Relic. Export traces to an OpenTelemetry Collector. |
 
 The supplied Ubuntu deployment uses an nginx proxy on host loopback and enables only the OpenAI persona. Local development does not need Docker, a VPS, or a New Relic key.
 
-- [Architecture](/architecture/) explains the data flow and what the records can prove.
+- [Capabilities](/capabilities/) lists API routes, log streams, host evidence, delivery mechanisms, operator tools, and limits.
+- [Architecture](/architecture/) explains the data flow, trust boundaries, containment layers, and what the records can prove.
+- [Operation](/operation/) describes startup, per-request steps, host adapters, heartbeats, health checks, and release gates.
 - [Local setup](/local-setup/) starts a loopback instance with remote telemetry disabled.

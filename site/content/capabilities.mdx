@@ -1,0 +1,110 @@
+---
+title: Capabilities
+---
+
+# Capabilities
+
+AttackBox simulates AI service interfaces for defensive research. It records bounded observations of client behavior without running models or executing client instructions.
+
+## API personas
+
+AttackBox implements three personas. The supplied deployment enables only OpenAI.
+
+| Persona | Routes |
+|---|---|
+| OpenAI | `/v1/models`, `/v1/models/{model}`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/responses/{response_id}`, `/v1/responses/{response_id}/cancel`, `/v1/embeddings`, `/health`, `/version` |
+| vLLM | OpenAI routes plus `/invocations`, `/metrics` (Prometheus), `/docs`, `/openapi.json` |
+| Ollama | OpenAI routes plus `/`, `/api/version`, `/api/tags`, `/api/ps`, `/api/show`, `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/pull`, `/api/push`, `/api/create`, `/api/copy`, `/api/delete` |
+
+Every persona publishes `/v1/edge/{label}/status` for concurrency-gate probes.
+
+## Synthetic responses
+
+The bait answers every inference request from local templates. Responses include simulated streaming over Server-Sent Events or NDJSON. Token counts derive from input size and response length.
+
+AttackBox does not run models, execute shell commands, call tools, or fetch client-supplied destinations. Responses are synthetic data.
+
+## Observation features
+
+The responder records client declarations and measures reply compliance with counter-probes. Probes embed synthetic directives and credentials.
+
+Sessions track bounded declarations across requests. The session key includes source address, user agent, and credential fingerprint. A session stores at most 32 declarations.
+
+Follow-up attribution measures whether a reply quotes operator instructions, claims roles, returns probe credentials, or requests Unicode characters the probe named. The declared action stays `"none"` because nothing executes.
+
+## Log streams
+
+AttackBox writes six log streams. Every event carries `stream`, `timestamp`, and attributes.
+
+| Stream | Records |
+|---|---|
+| `edge` | Incoming HTTP requests: method, path, status, source address, session, persona, body prefix. |
+| `transcript` | Parsed messages and declarations for requests that the bait decoded. |
+| `probe` | Issued counter-probes and attributed follow-up observations. |
+| `runtime` | Bait, shipper, and host-adapter lifecycle events. |
+| `egress` | Outbound connection attempts and DNS queries from containers. |
+| `heartbeat` | Periodic proof that one reporting path worked at that time. |
+
+The transcript and probe streams keep only records with observations. Edge records are written for every request.
+
+## Host evidence
+
+Host adapters add observations outside the bait container.
+
+| Component | Evidence |
+|---|---|
+| Falco adapter | Bounded runtime events that the Falco sensor writes for the containers. |
+| Egress adapter | Kernel journal records about container egress that the host firewall logs. |
+| Audit forwarder | Kernel audit records, joined into complete event groups with a hash. It suppresses one known host-agent event and reports the count. |
+| Readiness collector | Fixed snapshots of systemd unit states and container states, plus loopback readiness probes and metrics. |
+
+Adapters forward evidence to role-specific shipper sockets.
+
+## Delivery
+
+The shipper admits records by role, validates structure, and delivers logs and metrics to New Relic.
+
+| Mechanism | Behavior |
+|---|---|
+| Role admission | The bait sends `edge`, `transcript`, `probe`, and its own lifecycle `runtime` records. Host adapters send `egress` and `runtime` records. A socket client cannot send the heartbeat of the shipper. |
+| Disk queue | Records are appended to a durable disk queue. The queue survives restarts. Maximum payload is 8 MiB per record. |
+| Quarantine | Records rejected by the remote API are retained in a local quarantine directory (maximum 64 MiB, 4096 records). The drain stops when storage is full. |
+| New Relic logs | Records are batched and sent to the Logs API. Chunks fit the 1 MiB POST minimum. |
+| New Relic metrics | Shipper counters, container health, and service readiness are sent as dimensional metrics. |
+| OpenTelemetry traces | The bait and shipper export OTLP traces over a Unix socket to a local Collector. The Collector forwards traces to New Relic. |
+
+The bait holds no ingest key in the deployed profile. The shipper owns the key.
+
+## Operator tools
+
+| Tool | Purpose |
+|---|---|
+| `attackbox-scenarios` | Runs a fixed synthetic workload against a loopback listener. Returns pass/fail results. |
+| `attackbox-evidence` | Reconstructs complete request or response bodies from a local New Relic NDJSON export. Verifies chunk hashes. |
+| `attackbox-watch` | Takes bounded read-only snapshots over SSH. Parses systemd status, container health, disk usage, and journal entries. |
+| `attackbox-findings` | Publishes numeric summaries from watch JSON. Aggregates HTTP status codes, Falco events, and kernel audit drops. |
+
+Evidence tools parse captured text as data and never execute it.
+
+## Limits and safeguards
+
+| Control | Limit |
+|---|---|
+| Request body | 1 MiB maximum (configurable). Oversized requests return HTTP 413. |
+| Log body | 128 KiB default. Longer bodies are prefixed in edge records. |
+| Concurrency | 256 in-flight requests (configurable). 8 requests per source address (configurable). 5000 sessions. |
+| Hold duration | Probe holds run for a configured idle interval (default 45 seconds) with client write checks. Maximum stream duration 180 seconds. |
+| Redaction | Credential-shaped values are replaced with `[redacted:hmac256:FINGERPRINT]` markers. Email-like strings are removed from declarations. |
+| Admission | Shipper validates JSON structure, bounds string lengths, rejects records over 8 MiB, and enforces role-specific stream and action allowlists. |
+
+The read-only root filesystem prevents writes outside `/tmp`. Container resource limits cap CPU at 2 cores and memory at 512 MiB for the bait.
+
+## What AttackBox does not do
+
+- Run models or inference engines
+- Execute shell commands, scripts, or payloads
+- Fetch client-supplied URLs or destinations
+- Open files or directories from request content
+- Write unbounded logs or queue entries
+- Accept requests from non-loopback sources in the supplied deployment
+- Prove complete collection or containment

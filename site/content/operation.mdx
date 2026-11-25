@@ -1,0 +1,78 @@
+---
+title: Operation
+---
+
+# Operation
+
+This page describes what AttackBox does while it runs. No live deployment values are shown.
+
+## Startup
+
+The bait reads configuration from `ATTACKBOX_*` environment variables. It binds the listeners before starting HTTP servers. A port conflict fails startup.
+
+Each persona binds to a separate address. The supplied deployment binds only the OpenAI persona. Set `ATTACKBOX_VLLM_ADDR=off` or `ATTACKBOX_OLLAMA_ADDR=off` to disable a persona. An empty address leaves that persona unbound.
+
+The bait validates the redaction secret at startup. The file must be at least 32 bytes and readable only by its owner. Group or world read bits fail validation.
+
+The shipper binds role-specific Unix sockets for the bait, Falco adapter, and egress adapter. It opens the disk queue and quarantine directories. Queue and quarantine state survive restarts.
+
+## Per-request steps
+
+1. The nginx proxy forwards the request to the bait on the internal network.
+2. The bait acquires a global concurrency slot and a per-source slot. When slots are unavailable, the bait returns HTTP 429.
+3. The bait reads the request body up to the configured limit. Oversized requests return HTTP 413 with the first portion logged.
+4. The bait selects a synthetic response from local templates. Streaming responses simulate SSE or NDJSON with idle keep-alive frames.
+5. The responder records bounded declarations in the session. Email-like strings are removed. Credentials are fingerprinted and never stored as declarations.
+6. For probe requests, the responder measures follow-up compliance: quoted text, claimed roles, returned credentials, Unicode requests.
+7. The bait writes `edge`, `transcript`, and `probe` records to stdout and sends them to the shipper socket. The shipper does not reply.
+8. The shipper validates each record by role, structure, and bounds. Admitted records are appended to the disk queue. Rejected records go to quarantine or are dropped.
+9. The response returns to the client before the shipper commits the record to disk.
+
+The bait releases concurrency slots after the response completes. Session state persists until the process restarts or the session limit is reached.
+
+## Host adapters
+
+Host adapters run continuously and forward observations to the shipper.
+
+| Adapter | Behavior |
+|---|---|
+| Falco adapter | Reads Falco JSON lines from a file. Keeps a durable cursor. Sends bounded `runtime` records to its role socket. |
+| Egress adapter | Reads the kernel journal. Keeps a durable cursor. Sends bounded records to its role socket. |
+| Audit forwarder | Reads the kernel audit file and joins records into event groups. Writes retained groups to a private file that the native New Relic agent forwards. |
+| Readiness collector | A root helper writes fixed snapshots of systemd and container states. An unprivileged collector reads them and serves metrics on loopback. |
+
+Cursors persist across restarts. Adapters skip events older than their last-read cursor.
+
+## Heartbeats
+
+The bait spool, each host adapter, and the shipper send periodic heartbeats. Each heartbeat carries the counters of its own reporting path.
+
+A heartbeat proves only that its sender ran and that its reporting path accepted one record at that time. It does not prove that the bait is reachable, that the system logged every request, or that containment held.
+
+## Health checks
+
+The bait healthcheck calls a loopback URL with the `-healthcheck` flag. It refuses non-loopback targets. A successful healthcheck proves local HTTP reachability only.
+
+The readiness collector HTTP endpoint serves the latest privileged snapshot. Operators query it to check container status, Falco cursor age, and shipper checkpoint age.
+
+New Relic dashboards and alerts in the repository show:
+
+| Artifact | Purpose |
+|---|---|
+| `newrelic/dashboards/attackbox-overview.json` | Edge request rates, response status codes, session counts, component health, and queue depth. |
+| `newrelic/alerts/critical-alerts.yaml` | Component failures, missing heartbeats, queue growth, and container restarts. |
+| `newrelic/alerts/informational-alerts.yaml` | Unusual request patterns and declaration counts. |
+
+Alerts do not prove complete capture. Use the observed match rate formula in [Architecture](/architecture/) for controlled tests.
+
+## Release gates
+
+The repository includes local CI scripts that verify builds without pushing images or contacting cloud services.
+
+| Command | Verification |
+|---|---|
+| `make check` | Runs Go tests, ShellCheck, shell integration tests, Dockerfile lint, Compose validation, and smoke checks against the commit at `HEAD`. Uses a Git archive; uncommitted files are excluded. |
+| `make release-check PLATFORM=linux/amd64` | Runs the full gate plus bait image inspection: platform, non-root user, and entry point. Writes the commit, platform, and image ID to a record in the checkout. |
+| `make deploy PLATFORM=linux/amd64 COMMIT=<id> APPROVE=<id>` | Requires a matching release record. Rebuilds the image on the host from the verified source commit. Local image ID is not proof that the rebuild is identical. |
+
+Deployment requires separate approval. The host rebuilds from source. The release record is not a software signature.

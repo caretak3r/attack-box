@@ -25,6 +25,68 @@ flowchart LR
 | Falco and the kernel journal | Host runtime and egress observations. |
 | New Relic | Remote log and metric ingestion. |
 
+## Request and response timing
+
+The bait returns a response before the shipper acknowledges the record. Delivery runs independently of the HTTP transaction.
+
+```mermaid
+sequenceDiagram
+    accTitle: Response and telemetry are independent
+    accDescr: The client receives a response. The bait submits a bounded event to the shipper without blocking on disk acknowledgement.
+    participant Client
+    participant Proxy as nginx proxy
+    participant Bait as Go bait
+    participant Shipper as Host shipper
+    participant Queue as Disk queue
+    participant NR as New Relic
+
+    Client->>Proxy: HTTP request
+    Proxy->>Bait: Forward
+    Bait-->>Proxy: Synthetic response
+    Proxy-->>Client: Response
+    Bait-)Shipper: Bounded event (Unix socket)
+    Shipper->>Queue: Validate and append
+    Queue->>Shipper: Return (async)
+    Shipper->>NR: Deliver batch
+```
+
+The sequence shows separate paths. A successful socket write does not prove disk commit or remote receipt.
+
+## Trust boundaries
+
+The bait container holds no ingest key in the supplied deployment. The shipper validates every record by role before queueing.
+
+| Boundary | Control |
+|---|---|
+| Bait to shipper | One-way Unix socket. The bait sends records; the shipper never replies with data. |
+| Role admission | The shipper admits only the streams and actions each role may send. The bait may send `edge`, `transcript`, `probe`, and `runtime` records. Host adapters may send `egress` and `runtime` records. |
+| Structural validation | The shipper rejects malformed JSON, oversized payloads, and invalid field values before queueing. |
+| Captured text | Request bodies, response text, and log messages are untrusted data. Redaction can miss secrets. Do not execute captured commands or open extracted links. |
+
+## Containment layers
+
+The Ubuntu deployment profile applies multiple containment controls. The table lists only controls that the deployment files confirm.
+
+| Layer | Mechanism |
+|---|---|
+| gVisor runtime | Containers run under `runsc` with `--host-uds=open` to reach the shipper socket. |
+| Non-root containers | The bait and proxy containers run as UID 65532. No process runs as root inside containers. |
+| Read-only root filesystem | Both containers use `read_only: true`. Writable paths are bounded tmpfs mounts. |
+| Loopback-only proxy | The nginx proxy publishes on `127.0.0.1` only. The internal network has `internal: true`. |
+| nftables egress policy | Host nftables rules allow only New Relic, Ubuntu, and OTel Collector destinations. The policy drops other egress and logs it to the kernel journal. |
+| Falco sensor | The modern-BPF sensor records container process, file, and network activity. |
+| Kernel audit | The audit subsystem logs container execve and connect syscalls. |
+
+No capability grants, no privileged mode, and no Docker socket access.
+
+## Traces
+
+The bait and shipper export OTLP traces over a Unix socket to a local OpenTelemetry Collector. The Collector forwards traces to New Relic when configured.
+
+Trace identity comes from environment settings: `ATTACKBOX_HOST_ID`, `ATTACKBOX_SERVICE_INSTANCE_ID`, and optional `ATTACKBOX_CONTAINER_ID` and `ATTACKBOX_CAMPAIGN_ID`. An empty socket path disables tracing.
+
+Traces are independent of the durable log route. Loss of traces does not affect log delivery.
+
 ## Interpret telemetry
 
 The six log streams are `edge`, `transcript`, `probe`, `runtime`, `egress`, and `heartbeat`. The streams do not form a complete wire transcript. Size limits, redaction, queue pressure, and failures can affect what arrives.
