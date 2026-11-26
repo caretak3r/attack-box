@@ -65,6 +65,19 @@ The gateway answers a request by the end of its path. It does not learn routes f
 
 Before the ending, the path can contain up to four tokens from this list: `v1`, `v2`, `v3`, `api`, `openai`, `azure`, `llm`, `ai`, `proxy`, `gateway`, `inference`, `litellm`, `ollama`, `anthropic`, `deployments/{deployment}`, and `engines/{model}`. For example, `/v1/api/completions` and `/litellm/anthropic/v1/messages` match, and `http.route` contains that path. A deployment or engine name replaces its token with `{deployment}` or `{model}`. Other paths return 404 with `http.route` set to `/unmatched`. A wrong method on a matched path returns 405.
 
+## Port answers
+
+Four plain ports also answer like the server that usually listens on that port. The route families above stay the same on every port. Ports 80 and 443 have no port answers.
+
+|Port|Looks like|`GET` paths|Unmatched request|`Server` header|
+|---|---|---|---|---|
+|11434|Ollama|`/` returns `Ollama is running`. `/api/version` and `/api/ps` return JSON.|404 text|none|
+|1234|LM Studio|`/api/v0/models` returns the local model names.|200 with a JSON error that contains the method and the path|none|
+|8000|vLLM|`/health` returns an empty 200. `/version` returns JSON.|404 `{"detail":"Not Found"}`|`uvicorn`|
+|8080|llama.cpp|`/` returns a small HTML page. `/health` returns `{"status":"ok"}`.|404 JSON error|`llama.cpp`|
+
+A port answer path sets `http.route` to that path, for example `/` or `/health`, and such a request has no `attackbox.probe.class`. Use `server.port` to tell the ports apart. All spans keep `attackbox.persona` set to `cloud-gateway`. On port 1234 an unmatched request has `http.route` set to `/unmatched` and status 200. The version numbers are fixed text.
+
 ## Unmatched requests
 
 A request with `http.route` set to `/unmatched` also has `attackbox.probe.class`. The class comes from a fixed list: `proxy`, `root`, `env_file`, `vcs`, `wordpress`, `actuator`, `cgi`, `admin`, `php`, `discovery`, `config_file`, `llm_api`, and `other`. Run this query to see what scanners look for:

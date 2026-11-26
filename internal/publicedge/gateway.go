@@ -107,6 +107,37 @@ var gatewayFamilies = [...]gatewayFamily{
 	{"models", http.MethodGet, gatewayModels},
 }
 
+// gatewayPersona makes one public port answer like the server that usually listens there.
+type gatewayPersona struct {
+	server   string                      // Server header; "" sends none
+	paths    map[string]http.HandlerFunc // exact GET paths; each path is also its http.route label
+	notFound http.HandlerFunc            // answer to an unmatched request; nil keeps the gateway's 404
+}
+
+const gatewayJSONUTF8 = "application/json; charset=utf-8"
+
+// Persona paths must match the http.route allowlist in deploy/public-otel/config.yaml.
+var gatewayPersonas = map[int]gatewayPersona{
+	11434: {paths: map[string]http.HandlerFunc{ // Ollama
+		"/":            gatewayFixed(200, "text/plain; charset=utf-8", "Ollama is running"),
+		"/api/version": gatewayFixed(200, gatewayJSONUTF8, `{"version":"0.12.6"}`),
+		"/api/ps":      gatewayFixed(200, gatewayJSONUTF8, `{"models":[]}`),
+	}},
+	1234: {paths: map[string]http.HandlerFunc{"/api/v0/models": gatewayLMStudioModels}, notFound: gatewayLMStudioNotFound},
+	8000: {server: "uvicorn", notFound: gatewayFixed(404, gatewayJSON, `{"detail":"Not Found"}`), paths: map[string]http.HandlerFunc{ // vLLM
+		"/health":  func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) },
+		"/version": gatewayFixed(200, gatewayJSON, `{"version":"0.10.2"}`),
+	}},
+	8080: {server: "llama.cpp", notFound: gatewayFixed(404, gatewayJSONUTF8, `{"error":{"code":404,"message":"File Not Found","type":"not_found_error"}}`), paths: map[string]http.HandlerFunc{
+		"/":       gatewayFixed(200, "text/html; charset=utf-8", `<!DOCTYPE html><html><head><meta charset="utf-8"><title>llama.cpp - chat</title></head><body><div id="app"></div></body></html>`),
+		"/health": gatewayFixed(200, gatewayJSONUTF8, `{"status":"ok"}`),
+	}},
+}
+
+func gatewayFixed(status int, contentType, body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) { gatewayReply(w, status, contentType, body) }
+}
+
 // gatewayPrefixes must match the http.route allowlist in deploy/public-otel/config.yaml.
 var gatewayPrefixes = map[string]bool{"v1": true, "v2": true, "v3": true, "api": true, "openai": true, "azure": true, "llm": true, "ai": true,
 	"proxy": true, "gateway": true, "inference": true, "litellm": true, "ollama": true, "anthropic": true}
@@ -224,6 +255,10 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	persona := gatewayPersonas[requestPort(r)]
+	if persona.server != "" {
+		w.Header().Set("Server", persona.server)
+	}
 	if r.Method == http.MethodConnect || r.URL.IsAbs() || r.URL.Path == "" || r.URL.Path[0] != '/' || path.Clean(r.URL.Path) != r.URL.Path {
 		gatewayReply(w, http.StatusBadRequest, "text/plain; charset=utf-8", "invalid request target\n")
 		return
@@ -267,7 +302,14 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 
 	if f == nil {
 		drain()
-		gatewayReply(w, http.StatusNotFound, "text/plain; charset=utf-8", "404 page not found\n")
+		if h := persona.paths[r.URL.Path]; h != nil && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			route = r.URL.Path
+			h(w, r)
+		} else if persona.notFound != nil {
+			persona.notFound(w, r)
+		} else {
+			gatewayReply(w, http.StatusNotFound, "text/plain; charset=utf-8", "404 page not found\n")
+		}
 		return
 	}
 	if r.Method != f.method && (f.method != http.MethodGet || r.Method != http.MethodHead) {
@@ -570,6 +612,40 @@ func gatewayMessages(w http.ResponseWriter, r *http.Request) {
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 }
 
+// gatewayHostedModel reports a hosted API name, which a local model server does not list.
+func gatewayHostedModel(m string) bool {
+	return strings.HasPrefix(m, "gpt-") || strings.HasPrefix(m, "o3-") || strings.HasPrefix(m, "claude-") || strings.HasPrefix(m, "text-embedding-")
+}
+
+// gatewayLMStudioModels answers LM Studio's native model list with the local-style models.
+func gatewayLMStudioModels(w http.ResponseWriter, _ *http.Request) {
+	var b strings.Builder
+	b.WriteString(`{"object":"list","data":[`)
+	n := 0
+	for _, m := range gatewayModelList {
+		if gatewayHostedModel(m) {
+			continue
+		}
+		if n > 0 {
+			b.WriteByte(',')
+		}
+		n++
+		fmt.Fprintf(&b, `{"id":"%s","object":"model","type":"llm","publisher":"lmstudio-community","arch":"llama","compatibility_type":"gguf","quantization":"Q4_K_M","state":"not-loaded","max_context_length":8192}`, m)
+	}
+	b.WriteString(`]}`)
+	gatewayReply(w, 200, gatewayJSONUTF8, b.String())
+}
+
+// gatewayLMStudioNotFound answers as LM Studio does: status 200 and the request line in the error text.
+func gatewayLMStudioNotFound(w http.ResponseWriter, r *http.Request) {
+	target := r.URL.Path
+	if len(target) > 256 {
+		target = target[:256]
+	}
+	body, _ := json.Marshal(map[string]string{"error": "Unexpected endpoint or method. (" + gatewayPublicMethod(r.Method) + " " + target + ")"})
+	gatewayReply(w, 200, gatewayJSONUTF8, string(body))
+}
+
 // gatewayOllamaTag gives a model the tag form Ollama reports.
 func gatewayOllamaTag(m string) string {
 	if strings.Contains(m, ":") {
@@ -584,7 +660,7 @@ func gatewayOllamaTags(w http.ResponseWriter, _ *http.Request) {
 	b.WriteString(`{"models":[`)
 	n := 0
 	for _, m := range gatewayModelList {
-		if strings.HasPrefix(m, "gpt-") || strings.HasPrefix(m, "o3-") || strings.HasPrefix(m, "claude-") || strings.HasPrefix(m, "text-embedding-") {
+		if gatewayHostedModel(m) {
 			continue
 		}
 		if n > 0 {

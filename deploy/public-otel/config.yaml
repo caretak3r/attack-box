@@ -37,8 +37,8 @@ processors:
       - 'span.name == "public.request" and (span.attributes["http.request.method"] == nil or not IsString(span.attributes["http.request.method"]))'
       - 'span.attributes["http.request.method"] != nil and IsString(span.attributes["http.request.method"]) and not IsMatch(span.attributes["http.request.method"], "^(GET|HEAD|POST|PUT|DELETE|CONNECT|OPTIONS|TRACE|PATCH|_OTHER)$")'
       - 'span.name == "public.request" and (span.attributes["http.route"] == nil or not IsString(span.attributes["http.route"]))'
-      # Route labels are built by the gateway from allowlisted prefix tokens and family suffixes only.
-      - 'span.attributes["http.route"] != nil and IsString(span.attributes["http.route"]) and not IsMatch(span.attributes["http.route"], "^(/unmatched|(/(v1|v2|v3|api|openai|azure|llm|ai|proxy|gateway|inference|litellm|ollama|anthropic|deployments/[{]deployment[}]|engines/[{]model[}])){0,4}/(models|chat/completions|completions|embeddings|messages|api/tags|api/chat|api/generate))$")'
+      # Route labels are built by the gateway from allowlisted prefix tokens and family suffixes, or are fixed port persona paths (gatewayPersonas).
+      - 'span.attributes["http.route"] != nil and IsString(span.attributes["http.route"]) and not IsMatch(span.attributes["http.route"], "^(/unmatched|/|/health|/version|/api/version|/api/ps|/api/v0/models|(/(v1|v2|v3|api|openai|azure|llm|ai|proxy|gateway|inference|litellm|ollama|anthropic|deployments/[{]deployment[}]|engines/[{]model[}])){0,4}/(models|chat/completions|completions|embeddings|messages|api/tags|api/chat|api/generate))$")'
       - 'span.name == "public.request" and not IsInt(span.attributes["attackbox.request.query_params"])'
       - 'span.attributes["attackbox.request.query_params"] != nil and (not IsInt(span.attributes["attackbox.request.query_params"]) or span.attributes["attackbox.request.query_params"] < 0 or span.attributes["attackbox.request.query_params"] > 64)'
       - 'span.attributes["attackbox.probe.class"] != nil and not IsString(span.attributes["attackbox.probe.class"])'
