@@ -35,8 +35,9 @@ const plainOffset = 20000
 
 var plainPorts = [...]int{80, 1234, 3000, 4000, 8000, 8080, 8188, 8888, 11434}
 
-const requestRate = 1
-const requestBurst = 4
+// The request limit is for all clients together: it bounds spans and capture records. A burst of scanners after a new certificate must fit.
+const requestRate = 5
+const requestBurst = 40
 const connectionLimit = 128
 const connectionSpanRate = 1
 const connectionSpanBurst = 16

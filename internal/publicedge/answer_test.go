@@ -77,6 +77,9 @@ func gatewayDo(t *testing.T, port int, method, target, body string, header ...st
 	req := httptest.NewRequest(method, target, strings.NewReader(body))
 	req.RemoteAddr = "203.0.113.9:40000"
 	for i := 0; i+1 < len(header); i += 2 {
+		if header[i] == "Host" {
+			req.Host = header[i+1]
+		}
 		req.Header.Set(header[i], header[i+1])
 	}
 	rec := httptest.NewRecorder()
@@ -270,5 +273,28 @@ func TestGatewayProductPorts(t *testing.T) {
 	}
 	if rec := gatewayDo(t, 8000, "GET", "/v1/models", ""); !strings.Contains(rec.Body.String(), `"owned_by":"vllm"`) || strings.Contains(rec.Body.String(), "gpt-4o") {
 		t.Errorf("vLLM port model list = %s", rec.Body)
+	}
+}
+
+func TestGatewayHostNamesOnPort443(t *testing.T) {
+	for _, tc := range []struct {
+		port         int
+		host, target string
+		status       int
+		want         string
+		gatewayOwn   bool // the answer has the headers of ports 80 and 443
+	}{
+		{443, "ollama.gateway.test", "/", 200, "Ollama is running", false},
+		{443, "Ollama.gateway.test:443", "/api/tags", 200, `"llama3.3:70b"`, false},
+		{443, "openwebui.gateway.test", "/api/models", 401, `{"detail":"Not authenticated"}`, false},
+		{443, "litellm.gateway.test", "/v1/models", 401, `"type":"auth_error"`, false},
+		{443, "llm.gateway.test", "/v1/models", 401, "authentication_error", true},
+		{443, "ollamax.gateway.test", "/", 404, "404 page not found", true},
+		{80, "ollama.gateway.test", "/", 404, "404 page not found", true},
+	} {
+		rec := gatewayDo(t, tc.port, "GET", tc.target, "", "Host", tc.host)
+		if rec.Code != tc.status || !strings.Contains(rec.Body.String(), tc.want) || (rec.Header().Get("Cache-Control") == "no-store") != tc.gatewayOwn {
+			t.Errorf("%d %s %s = %d %v %s", tc.port, tc.host, tc.target, rec.Code, rec.Header(), rec.Body)
+		}
 	}
 }

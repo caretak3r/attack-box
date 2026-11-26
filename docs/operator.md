@@ -130,7 +130,7 @@ To find the client that fetched a key, select `client.address` from the spans th
 
 ## Port answers
 
-Eight plain ports also answer like the server that usually listens on that port. The route families above stay the same on every port. Ports 80 and 443 have no port answers.
+Eight plain ports also answer like the server that usually listens on that port. The route families above stay the same on every port. Port 80 has no port answers. Port 443 has no port answers of its own, but a `Host` name can select the answers of a product port, as shown below the table.
 
 |Port|Looks like|Fixed paths|Unmatched request|`Server` header|
 |---|---|---|---|---|
@@ -146,6 +146,8 @@ Eight plain ports also answer like the server that usually listens on that port.
 A port answer path sets `http.route` to that path, for example `/` or `/health`, and such a request has no `attackbox.probe.class`. Use `server.port` to tell the ports apart. All spans keep `attackbox.persona` set to `cloud-gateway`. On port 1234 an unmatched request has `http.route` set to `/unmatched` and status 200. The version numbers are fixed text.
 
 A product port sends only the headers of its product. Ports 80 and 443 also send `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. The session token from the Open WebUI sign-up opens nothing. A client that sends it later has a credential of type `jwt`. A queued ComfyUI workflow and a Jupyter password are in the local request capture only; nothing runs a workflow. Only the Ollama answers were compared with the real server. The answers of the other products follow their documents.
+
+On port 443, the first label of the `Host` header can select a product answer, as a reverse proxy in front of that product does. The label `ollama` gives the answers of port 11434, `openwebui` gives those of port 3000, and `litellm` gives those of port 4000. Thus the `ollama` name does not ask for a key, and the other two names ask with the error text of their product. All other names keep the answers of port 443. `server.port` stays 443 and the span does not show the name. The local request capture keeps the `Host` header.
 
 ## Unmatched requests
 
@@ -189,6 +191,6 @@ SINCE 1 day ago LIMIT 100
 
 The service sends at most one connection span each second, with a burst of 16. The `public.health` span counts all such connections in `attackbox.pre_http_connections`. It counts connections that the listener rejects at its 128-connection limit in `attackbox.rejected_connections`. Both counters start at zero when the service starts.
 
-The service does not export prompts, bodies, query names or values other than a credential, raw paths, arbitrary headers, or received bytes. HTTP parser failures after a TLS handshake produce a `no_request` connection span, not a request span. The rate limiter counts requests it rejects before the gateway. Those requests are not captured. Bounded queues can lose spans.
+The service does not export prompts, bodies, query names or values other than a credential, raw paths, arbitrary headers, or received bytes. HTTP parser failures after a TLS handshake produce a `no_request` connection span, not a request span. The service admits at most five requests each second from all clients together, with a burst of 40. It answers 429 to the others and counts them in `attackbox.rate_limited_requests`. Those requests are not captured. Bounded queues can lose spans.
 
 Before live export, confirm who can query spans and how long the account retains exact IP addresses. Use a client with a known egress IP to check the public path after an approved deployment. Do not use a forwarded header as proof.

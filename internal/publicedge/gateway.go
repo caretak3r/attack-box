@@ -46,7 +46,7 @@ func gatewayModelName(s string, local bool) (string, bool) {
 
 // gatewayRequestModel resolves the deployment path and the body model; either one must be listed. No model means the default.
 func gatewayRequestModel(r *http.Request, obj map[string]json.RawMessage) (string, bool) {
-	local := gatewayPersonas[requestPort(r)].local
+	local := requestPersona(r).local
 	model := gatewayModel
 	if d := r.PathValue("deployment"); d != "" {
 		m, ok := gatewayModelName(d, local)
@@ -85,6 +85,21 @@ func requestPort(r *http.Request) int {
 		return port
 	}
 	return 443
+}
+
+// gatewayHostPersonas maps the first label of a Host header on port 443 to the port whose product it names.
+var gatewayHostPersonas = map[string]int{"ollama": 11434, "openwebui": 3000, "litellm": 4000}
+
+// requestPersona answers port 443 like a reverse proxy in front of a product when the Host name starts with that product.
+func requestPersona(r *http.Request) gatewayPersona {
+	port := requestPort(r)
+	if port == 443 {
+		label, _, _ := strings.Cut(strings.ToLower(r.Host), ".")
+		if p, ok := gatewayHostPersonas[label]; ok {
+			port = p
+		}
+	}
+	return gatewayPersonas[port]
 }
 
 type Gateway struct {
@@ -237,7 +252,7 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 		}
 	}()
 
-	persona := gatewayPersonas[requestPort(r)]
+	persona := requestPersona(r)
 	if persona.paths == nil { // a product port sends only the headers of its product
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -460,7 +475,7 @@ func gatewayReadObject(r *http.Request) (map[string]json.RawMessage, int) {
 }
 
 func gatewayModels(w http.ResponseWriter, r *http.Request) {
-	persona := gatewayPersonas[requestPort(r)]
+	persona := requestPersona(r)
 	var entries []string
 	for _, m := range gatewayModelList {
 		owner := "local"
