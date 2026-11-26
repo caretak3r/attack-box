@@ -22,7 +22,7 @@ SINCE 1 hour ago LIMIT 100
 
 ## Models
 
-The gateway serves these model names: `local-instruct-8b`, `gpt-4o`, `gpt-4o-mini`, `gpt-4.1`, `gpt-4.1-mini`, `o3-mini`, `gpt-3.5-turbo`, `claude-3-5-sonnet-20241022`, `claude-3-7-sonnet-20250219`, `claude-sonnet-4-20250514`, `claude-3-5-haiku-20241022`, `llama3.1:8b`, `qwen2.5:7b`, `deepseek-r1:8b`, `mistral:7b`, `text-embedding-3-small`, `text-embedding-3-large`, and `nomic-embed-text`. `/models` lists all of them. `/api/tags` lists the local names with an Ollama tag. A client can add `:latest` to a name. A request without a model uses `local-instruct-8b`. Other names return 404. The answer names the requested model.
+The gateway serves these model names: `local-instruct-8b`, `gpt-4o`, `gpt-4o-mini`, `gpt-4.1`, `gpt-4.1-mini`, `o3-mini`, `gpt-3.5-turbo`, `claude-3-5-sonnet-20241022`, `claude-3-7-sonnet-20250219`, `claude-sonnet-4-20250514`, `claude-3-5-haiku-20241022`, `llama3.1:8b`, `qwen2.5:7b`, `deepseek-r1:8b`, `mistral:7b`, `llama3.3:70b`, `deepseek-r1:70b`, `qwen2.5-coder:32b`, `text-embedding-3-small`, `text-embedding-3-large`, and `nomic-embed-text`. `/models` lists all of them. `/api/tags` lists the local names with an Ollama tag. A client can add `:latest` to a name. A request without a model uses `local-instruct-8b`. Other names return 404. The answer names the requested model.
 
 ## Credentials
 
@@ -62,12 +62,53 @@ The gateway answers a request by the end of its path. It does not learn routes f
 |`/messages`|POST|Anthropic message, with SSE when `stream` is true|
 |`/api/tags`|GET|Ollama model list|
 |`/api/chat`, `/api/generate`|POST|Ollama answer, NDJSON unless `stream` is false|
+|`/api/show`|POST|Ollama model details|
+|`/api/pull`|POST|Ollama progress lines, NDJSON unless `stream` is false|
+|`/api/create`|POST|Ollama `success` status|
+|`/api/delete`|DELETE|Empty 200|
+|`/api/embed`, `/api/embeddings`|POST|Ollama embedding|
 
 Before the ending, the path can contain up to four tokens from this list: `v1`, `v2`, `v3`, `api`, `openai`, `azure`, `llm`, `ai`, `proxy`, `gateway`, `inference`, `litellm`, `ollama`, `anthropic`, `deployments/{deployment}`, and `engines/{model}`. For example, `/v1/api/completions` and `/litellm/anthropic/v1/messages` match, and `http.route` contains that path. A deployment or engine name replaces its token with `{deployment}` or `{model}`. Other paths return 404 with `http.route` set to `/unmatched`. A wrong method on a matched path returns 405.
 
+The Ollama routes from `/api/show` to `/api/embeddings` read the model from `model` or from `name`. `/api/show`, `/api/delete`, `/api/embed`, and `/api/embeddings` return 404 for a name that is not in the model list. `/api/pull` reports a listed model as up to date. For another name it answers `pull model manifest: file does not exist`. The gateway stores nothing. A name from `/api/create` or `/api/pull` does not appear in `/api/tags`, and a deleted model stays in the list. The requested name is in the local request capture only.
+
+## Key on port 443
+
+On port 443, a route family returns 401 with a JSON error until the request contains a credential. Each credential source in the Credentials section is sufficient. The gateway does not examine the value. Thus a client that wants an answer shows the key that it has. The span keeps the route label and has `http.response.status_code` set to 401. The plain ports do not ask for a credential. An unmatched path on port 443 returns 404 without a credential. The container healthcheck sends a fixed credential.
+
+## Fake env file
+
+A `GET` or `HEAD` request for an env file gets a small text file on every port. Such a path contains `/.env` or ends with `.env`. The file contains a fake `OPENAI_API_KEY` and an `OPENAI_BASE_URL` that points to the host and port from the `Host` header. If that header is not a plain name or an IPv4 address, the file has no base URL. The key has the form of an OpenAI key, but no service accepts it. The gateway makes the key from the client IP and from a random value that changes when the service starts. Thus each client gets its own key, and the same client gets the same key until the next start.
+
+The span has `http.route` set to `/.env`, no `attackbox.probe.class`, and the key in `attackbox.canary.key`. Run this query to find a client that sends such a key back:
+
+```sql
+FROM Span SELECT count(*), latest(`client.address`), latest(`server.port`)
+WHERE `service.name` = 'attackbox-public-443'
+  AND `attackbox.credential.value` IN (
+    FROM Span SELECT uniques(`attackbox.canary.key`, 10000)
+    WHERE `service.name` = 'attackbox-public-443' AND `http.route` = '/.env' SINCE 30 days ago)
+FACET `attackbox.credential.value` SINCE 30 days ago
+```
+
+To find the client that fetched a key, select `client.address` from the spans that have that value in `attackbox.canary.key`.
+
+## Port answers
+
+Four plain ports also answer like the server that usually listens on that port. The route families above stay the same on every port. Ports 80 and 443 have no port answers.
+
+|Port|Looks like|`GET` paths|Unmatched request|`Server` header|
+|---|---|---|---|---|
+|11434|Ollama|`/` returns `Ollama is running`. `/api/version` returns JSON. `/api/ps` shows `llama3.3:70b` as loaded.|404 text|none|
+|1234|LM Studio|`/api/v0/models` returns the local model names.|200 with a JSON error that contains the method and the path|none|
+|8000|vLLM|`/health` returns an empty 200. `/version` returns JSON.|404 `{"detail":"Not Found"}`|`uvicorn`|
+|8080|llama.cpp|`/` returns a small HTML page. `/health` returns `{"status":"ok"}`.|404 JSON error|`llama.cpp`|
+
+A port answer path sets `http.route` to that path, for example `/` or `/health`, and such a request has no `attackbox.probe.class`. Use `server.port` to tell the ports apart. All spans keep `attackbox.persona` set to `cloud-gateway`. On port 1234 an unmatched request has `http.route` set to `/unmatched` and status 200. The version numbers are fixed text.
+
 ## Unmatched requests
 
-A request with `http.route` set to `/unmatched` also has `attackbox.probe.class`. The class comes from a fixed list: `proxy`, `root`, `env_file`, `vcs`, `wordpress`, `actuator`, `cgi`, `admin`, `php`, `discovery`, `config_file`, `llm_api`, and `other`. Run this query to see what scanners look for:
+A request with `http.route` set to `/unmatched` also has `attackbox.probe.class`. The class comes from a fixed list: `proxy`, `root`, `env_file`, `vcs`, `wordpress`, `actuator`, `cgi`, `admin`, `php`, `discovery`, `config_file`, `llm_api`, and `other`. An `env_file` request with `GET` or `HEAD` gets the fake env file and is not unmatched. Run this query to see what scanners look for:
 
 ```sql
 FROM Span SELECT count(*)

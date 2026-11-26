@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,7 +29,8 @@ const gatewayModel = "local-instruct-8b"
 // gen_ai.request.model allowlist in deploy/public-otel/config.yaml. Ollama-style names also list in /api/tags.
 var gatewayModelList = []string{gatewayModel, "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "o3-mini", "gpt-3.5-turbo",
 	"claude-3-5-sonnet-20241022", "claude-3-7-sonnet-20250219", "claude-sonnet-4-20250514", "claude-3-5-haiku-20241022",
-	"llama3.1:8b", "qwen2.5:7b", "deepseek-r1:8b", "mistral:7b", "text-embedding-3-small", "text-embedding-3-large", "nomic-embed-text"}
+	"llama3.1:8b", "qwen2.5:7b", "deepseek-r1:8b", "mistral:7b", "llama3.3:70b", "deepseek-r1:70b", "qwen2.5-coder:32b",
+	"text-embedding-3-small", "text-embedding-3-large", "nomic-embed-text"}
 
 // gatewayModelName returns the listed model for a requested name; Ollama clients may add ":latest".
 func gatewayModelName(s string) (string, bool) {
@@ -88,6 +90,8 @@ type Gateway struct {
 	slots  chan struct{}
 	// Capture, when set, keeps raw request lines on local disk; they are never exported.
 	Capture *Capture
+	// canary seeds the fake key of an env-file answer; a new process gives each peer a new key.
+	canary [32]byte
 }
 
 type gatewayFamily struct {
@@ -100,11 +104,56 @@ var gatewayFamilies = [...]gatewayFamily{
 	{"api/generate", http.MethodPost, gatewayOllama(false)},
 	{"api/chat", http.MethodPost, gatewayOllama(true)},
 	{"api/tags", http.MethodGet, gatewayOllamaTags},
+	{"api/show", http.MethodPost, gatewayOllamaManage(true, gatewayOllamaShow)},
+	{"api/pull", http.MethodPost, gatewayOllamaManage(false, gatewayOllamaPull)},
+	{"api/create", http.MethodPost, gatewayOllamaManage(false, func(w http.ResponseWriter, _ string, stream bool) {
+		gatewayOllamaSteps(w, stream, 200, "", `{"status":"success"}`)
+	})},
+	{"api/delete", http.MethodDelete, gatewayOllamaManage(true, func(w http.ResponseWriter, _ string, _ bool) { w.WriteHeader(200) })},
+	{"api/embed", http.MethodPost, gatewayOllamaManage(true, func(w http.ResponseWriter, tag string, _ bool) {
+		gatewayReply(w, 200, gatewayJSONUTF8, `{"model":"`+tag+`","embeddings":[`+gatewayVector+`],"total_duration":14143917,"load_duration":1019500,"prompt_eval_count":1}`)
+	})},
+	{"api/embeddings", http.MethodPost, gatewayOllamaManage(true, func(w http.ResponseWriter, _ string, _ bool) {
+		gatewayReply(w, 200, gatewayJSONUTF8, `{"embedding":`+gatewayVector+`}`)
+	})},
 	{"chat/completions", http.MethodPost, gatewayCompletion(true)},
 	{"completions", http.MethodPost, gatewayCompletion(false)},
 	{"embeddings", http.MethodPost, gatewayEmbeddings},
 	{"messages", http.MethodPost, gatewayMessages},
 	{"models", http.MethodGet, gatewayModels},
+}
+
+// gatewayPersona makes one public port answer like the server that usually listens there.
+type gatewayPersona struct {
+	server   string                      // Server header; "" sends none
+	paths    map[string]http.HandlerFunc // exact GET paths; each path is also its http.route label
+	notFound http.HandlerFunc            // answer to an unmatched request; nil keeps the gateway's 404
+	needKey  bool                        // a route family answers 401 until the client sends any credential
+}
+
+const gatewayJSONUTF8 = "application/json; charset=utf-8"
+
+// Persona paths must match the http.route allowlist in deploy/public-otel/config.yaml.
+var gatewayPersonas = map[int]gatewayPersona{
+	443: {needKey: true}, // hosted gateway: a client that must send a key shows which key it has
+	11434: {paths: map[string]http.HandlerFunc{ // Ollama
+		"/":            gatewayFixed(200, "text/plain; charset=utf-8", "Ollama is running"),
+		"/api/version": gatewayFixed(200, gatewayJSONUTF8, `{"version":"0.12.6"}`),
+		"/api/ps":      gatewayOllamaPS,
+	}},
+	1234: {paths: map[string]http.HandlerFunc{"/api/v0/models": gatewayLMStudioModels}, notFound: gatewayLMStudioNotFound},
+	8000: {server: "uvicorn", notFound: gatewayFixed(404, gatewayJSON, `{"detail":"Not Found"}`), paths: map[string]http.HandlerFunc{ // vLLM
+		"/health":  func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) },
+		"/version": gatewayFixed(200, gatewayJSON, `{"version":"0.10.2"}`),
+	}},
+	8080: {server: "llama.cpp", notFound: gatewayFixed(404, gatewayJSONUTF8, `{"error":{"code":404,"message":"File Not Found","type":"not_found_error"}}`), paths: map[string]http.HandlerFunc{
+		"/":       gatewayFixed(200, "text/html; charset=utf-8", `<!DOCTYPE html><html><head><meta charset="utf-8"><title>llama.cpp - chat</title></head><body><div id="app"></div></body></html>`),
+		"/health": gatewayFixed(200, gatewayJSONUTF8, `{"status":"ok"}`),
+	}},
+}
+
+func gatewayFixed(status int, contentType, body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) { gatewayReply(w, status, contentType, body) }
 }
 
 // gatewayPrefixes must match the http.route allowlist in deploy/public-otel/config.yaml.
@@ -117,7 +166,9 @@ func NewGateway(tracer trace.Tracer) *Gateway {
 	if tracer == nil {
 		tracer = noop.NewTracerProvider().Tracer("attackbox.gateway")
 	}
-	return &Gateway{tracer: tracer, slots: make(chan struct{}, 16)}
+	g := &Gateway{tracer: tracer, slots: make(chan struct{}, 16)}
+	_, _ = rand.Read(g.canary[:]) // never fails
+	return g
 }
 
 // gatewayResolve maps a clean path to a family and a route label built only from allowlisted tokens.
@@ -224,6 +275,10 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	persona := gatewayPersonas[requestPort(r)]
+	if persona.server != "" {
+		w.Header().Set("Server", persona.server)
+	}
 	if r.Method == http.MethodConnect || r.URL.IsAbs() || r.URL.Path == "" || r.URL.Path[0] != '/' || path.Clean(r.URL.Path) != r.URL.Path {
 		gatewayReply(w, http.StatusBadRequest, "text/plain; charset=utf-8", "invalid request target\n")
 		return
@@ -267,8 +322,26 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 
 	if f == nil {
 		drain()
-		gatewayReply(w, http.StatusNotFound, "text/plain; charset=utf-8", "404 page not found\n")
+		get := r.Method == http.MethodGet || r.Method == http.MethodHead
+		if h := persona.paths[r.URL.Path]; h != nil && get {
+			route = r.URL.Path
+			h(w, r)
+		} else if get && gatewayProbe(r) == "env_file" {
+			route = "/.env"
+			g.envFile(w, r)
+		} else if persona.notFound != nil {
+			persona.notFound(w, r)
+		} else {
+			gatewayReply(w, http.StatusNotFound, "text/plain; charset=utf-8", "404 page not found\n")
+		}
 		return
+	}
+	if persona.needKey {
+		if source, _, _ := gatewayCredential(r); source == "" {
+			drain()
+			gatewayReply(w, http.StatusUnauthorized, gatewayJSON, gatewayNoKey)
+			return
+		}
 	}
 	if r.Method != f.method && (f.method != http.MethodGet || r.Method != http.MethodHead) {
 		allow := f.method
@@ -480,6 +553,39 @@ func gatewayCompletion(chat bool) http.HandlerFunc {
 
 const gatewayInvalid = `{"error":{"message":"invalid request","type":"invalid_request_error"}}`
 const gatewayNoModel = `{"error":{"message":"model not found","type":"not_found_error"}}`
+const gatewayNoKey = `{"error":{"message":"No API key provided. Send it in the Authorization header as a Bearer token.","type":"authentication_error"}}`
+const gatewayVector = `[0.0123,-0.0456,0.0789,-0.0012,0.0345,-0.0678,0.0901,-0.0234]`
+
+// envFile answers an env-file probe with a fake key and the base URL the client used. The key is not valid anywhere.
+// It depends on the peer and is recorded on the span, so a later request that presents it shows who fetched it.
+func (g *Gateway) envFile(w http.ResponseWriter, r *http.Request) {
+	sum := sha256.Sum256(append(g.canary[:], ClientAddress(r.RemoteAddr)...))
+	s := strings.NewReplacer("-", "A", "_", "B").Replace(base64.RawURLEncoding.EncodeToString(sum[:]))
+	key := "sk-" + s[:20] + "T3BlbkFJ" + s[20:40]
+	trace.SpanFromContext(r.Context()).SetAttributes(attribute.String("attackbox.canary.key", key))
+	body := "APP_ENV=production\nOPENAI_API_KEY=" + key + "\n"
+	if gatewayHost(r.Host) {
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		body += "OPENAI_BASE_URL=" + scheme + "://" + r.Host + "/v1\n"
+	}
+	gatewayReply(w, 200, "text/plain; charset=utf-8", body)
+}
+
+// gatewayHost accepts a Host header that is safe to repeat in an answer: a name or an IPv4 address, with or without a port.
+func gatewayHost(h string) bool {
+	if h == "" || len(h) > 255 {
+		return false
+	}
+	for _, c := range []byte(h) {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '-' || c == ':') {
+			return false
+		}
+	}
+	return true
+}
 
 // gatewayTrace records only server-chosen values: the listed model when the client named one, and the parsed stream flag.
 func gatewayTrace(r *http.Request, obj map[string]json.RawMessage, model string, stream bool) {
@@ -527,7 +633,7 @@ func gatewayEmbeddings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	gatewayTrace(r, obj, model, false)
-	gatewayReply(w, 200, gatewayJSON, `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.0123,-0.0456,0.0789,-0.0012,0.0345,-0.0678,0.0901,-0.0234]}],"model":"`+model+`","usage":{"prompt_tokens":1,"total_tokens":1}}`)
+	gatewayReply(w, 200, gatewayJSON, `{"object":"list","data":[{"object":"embedding","index":0,"embedding":`+gatewayVector+`}],"model":"`+model+`","usage":{"prompt_tokens":1,"total_tokens":1}}`)
 }
 
 func gatewayMessages(w http.ResponseWriter, r *http.Request) {
@@ -570,6 +676,40 @@ func gatewayMessages(w http.ResponseWriter, r *http.Request) {
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 }
 
+// gatewayHostedModel reports a hosted API name, which a local model server does not list.
+func gatewayHostedModel(m string) bool {
+	return strings.HasPrefix(m, "gpt-") || strings.HasPrefix(m, "o3-") || strings.HasPrefix(m, "claude-") || strings.HasPrefix(m, "text-embedding-")
+}
+
+// gatewayLMStudioModels answers LM Studio's native model list with the local-style models.
+func gatewayLMStudioModels(w http.ResponseWriter, _ *http.Request) {
+	var b strings.Builder
+	b.WriteString(`{"object":"list","data":[`)
+	n := 0
+	for _, m := range gatewayModelList {
+		if gatewayHostedModel(m) {
+			continue
+		}
+		if n > 0 {
+			b.WriteByte(',')
+		}
+		n++
+		fmt.Fprintf(&b, `{"id":"%s","object":"model","type":"llm","publisher":"lmstudio-community","arch":"llama","compatibility_type":"gguf","quantization":"Q4_K_M","state":"not-loaded","max_context_length":8192}`, m)
+	}
+	b.WriteString(`]}`)
+	gatewayReply(w, 200, gatewayJSONUTF8, b.String())
+}
+
+// gatewayLMStudioNotFound answers as LM Studio does: status 200 and the request line in the error text.
+func gatewayLMStudioNotFound(w http.ResponseWriter, r *http.Request) {
+	target := r.URL.Path
+	if len(target) > 256 {
+		target = target[:256]
+	}
+	body, _ := json.Marshal(map[string]string{"error": "Unexpected endpoint or method. (" + gatewayPublicMethod(r.Method) + " " + target + ")"})
+	gatewayReply(w, 200, gatewayJSONUTF8, string(body))
+}
+
 // gatewayOllamaTag gives a model the tag form Ollama reports.
 func gatewayOllamaTag(m string) string {
 	if strings.Contains(m, ":") {
@@ -578,25 +718,105 @@ func gatewayOllamaTag(m string) string {
 	return m + ":latest"
 }
 
+const gatewayOllamaModified = "2025-06-03T10:42:17Z"
+
+// gatewayOllamaDetails returns the "details" member and the size of a tag. The parameter count comes from a tag such
+// as "llama3.3:70b"; a tag without one counts as 8.
+func gatewayOllamaDetails(tag string) (details string, size int64) {
+	params := int64(8)
+	if _, s, ok := strings.Cut(tag, ":"); ok {
+		_, _ = fmt.Sscanf(s, "%db", &params)
+	}
+	return fmt.Sprintf(`"details":{"parent_model":"","format":"gguf","family":"llama","families":["llama"],"parameter_size":"%d.0B","quantization_level":"Q4_K_M"}`, params),
+		params*615091200 + int64(len(tag))<<22
+}
+
+// gatewayOllamaEntry is one model object of /api/tags or /api/ps; extra holds the members that only one of them has.
+func gatewayOllamaEntry(tag, extra string) string {
+	details, size := gatewayOllamaDetails(tag)
+	return fmt.Sprintf(`{"name":"%s","model":"%s","size":%d,"digest":"%x",%s,%s}`, tag, tag, size, sha256.Sum256([]byte(tag)), details, extra)
+}
+
 // gatewayOllamaTags lists the local-style models only; hosted API names are not Ollama tags.
 func gatewayOllamaTags(w http.ResponseWriter, _ *http.Request) {
 	var b strings.Builder
 	b.WriteString(`{"models":[`)
-	n := 0
 	for _, m := range gatewayModelList {
-		if strings.HasPrefix(m, "gpt-") || strings.HasPrefix(m, "o3-") || strings.HasPrefix(m, "claude-") || strings.HasPrefix(m, "text-embedding-") {
+		if gatewayHostedModel(m) {
 			continue
 		}
-		if n > 0 {
+		if b.Len() > len(`{"models":[`) {
 			b.WriteByte(',')
 		}
-		n++
-		tag := gatewayOllamaTag(m)
-		fmt.Fprintf(&b, `{"name":"%s","model":"%s","modified_at":"2024-08-01T00:00:00Z","size":%d,"digest":"%x","details":{"parent_model":"","format":"gguf","family":"llama","families":["llama"],"parameter_size":"8.0B","quantization_level":"Q4_K_M"}}`,
-			tag, tag, 4920734272-int64(n)*73400320, sha256.Sum256([]byte(tag)))
+		b.WriteString(gatewayOllamaEntry(gatewayOllamaTag(m), `"modified_at":"`+gatewayOllamaModified+`"`))
 	}
 	b.WriteString(`]}`)
 	gatewayReply(w, 200, gatewayJSON, b.String())
+}
+
+// gatewayOllamaPS shows the largest model as loaded in GPU memory.
+func gatewayOllamaPS(w http.ResponseWriter, _ *http.Request) {
+	const tag = "llama3.3:70b"
+	_, size := gatewayOllamaDetails(tag)
+	gatewayReply(w, 200, gatewayJSONUTF8, `{"models":[`+gatewayOllamaEntry(tag, fmt.Sprintf(`"expires_at":"%s","size_vram":%d`, time.Now().UTC().Add(4*time.Minute).Format(time.RFC3339Nano), size))+`]}`)
+}
+
+// gatewayOllamaManage reads the model of an Ollama management request; older clients send it as "name".
+// reply gets the listed tag. When listed is false it also gets "" for a name that is not in the list.
+func gatewayOllamaManage(listed bool, reply func(w http.ResponseWriter, tag string, stream bool)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		obj, status := gatewayReadObject(r)
+		if status != 0 {
+			gatewayReply(w, status, gatewayJSON, `{"error":"invalid request"}`)
+			return
+		}
+		raw := obj["model"]
+		if raw == nil {
+			raw = obj["name"]
+		}
+		var name string
+		stream, ok := gatewayStream(obj["stream"])
+		if !ok || json.Unmarshal(raw, &name) != nil || name == "" {
+			gatewayReply(w, 400, gatewayJSON, `{"error":"invalid request"}`)
+			return
+		}
+		model, found := gatewayModelName(name)
+		if !found && listed {
+			gatewayReply(w, 404, gatewayJSON, `{"error":"model not found"}`)
+			return
+		}
+		tag := ""
+		if found {
+			gatewayTrace(r, obj, model, stream)
+			tag = gatewayOllamaTag(model)
+		}
+		reply(w, tag, stream || obj["stream"] == nil)
+	}
+}
+
+// gatewayOllamaSteps sends progress lines and a last line as NDJSON, or only the last line when the client set "stream": false.
+func gatewayOllamaSteps(w http.ResponseWriter, stream bool, status int, steps, last string) {
+	if stream {
+		gatewayReply(w, 200, "application/x-ndjson", steps+last+"\n")
+		return
+	}
+	gatewayReply(w, status, gatewayJSONUTF8, last)
+}
+
+func gatewayOllamaShow(w http.ResponseWriter, tag string, _ bool) {
+	details, _ := gatewayOllamaDetails(tag)
+	gatewayReply(w, 200, gatewayJSONUTF8, `{"modelfile":"# Modelfile generated by \"ollama show\"\nFROM `+tag+`\n","parameters":"num_ctx 8192","template":"{{ .Prompt }}",`+details+
+		`,"model_info":{"general.architecture":"llama"},"capabilities":["completion"],"modified_at":"`+gatewayOllamaModified+`"}`)
+}
+
+// gatewayOllamaPull reports a listed model as up to date. Another name fails as it does when the registry does not have it.
+func gatewayOllamaPull(w http.ResponseWriter, tag string, stream bool) {
+	const start = `{"status":"pulling manifest"}` + "\n"
+	if tag == "" {
+		gatewayOllamaSteps(w, stream, 404, start, `{"error":"pull model manifest: file does not exist"}`)
+		return
+	}
+	gatewayOllamaSteps(w, stream, 200, start+`{"status":"verifying sha256 digest"}`+"\n"+`{"status":"writing manifest"}`+"\n", `{"status":"success"}`)
 }
 
 // gatewayOllama follows Ollama's defaults: streaming NDJSON unless the client sets "stream": false.

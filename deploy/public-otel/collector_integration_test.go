@@ -153,7 +153,7 @@ func TestPublicCollectorSanitizesAndBindsIdentity(t *testing.T) {
 		str("attackbox.request.content_type", "application/json; token=private-marker"), num("http.request.body.size", -1),
 		str("http.request.body.size", "private-marker"), str("gen_ai.request.model", "private-marker"), str("attackbox.request.stream", "true"),
 		num("attackbox.request.query_params", -1), num("attackbox.request.query_params", 65), str("attackbox.request.query_params", "private-marker"),
-		str("attackbox.probe.class", "private-marker"), num("attackbox.probe.class", 1),
+		str("attackbox.probe.class", "private-marker"), num("attackbox.probe.class", 1), str("attackbox.canary.key", "private-marker"),
 	} {
 		s := span("public.request", byte(10+i), num("server.port", 443), str("attackbox.persona", "cloud-gateway"), str("http.route", "/v1/models"), str("http.request.method", "GET"), num("http.response.status_code", 200), invalid)
 		for _, base := range []*common.KeyValue{contentType, queryParams} {

@@ -49,7 +49,7 @@ func TestCaptureRecordsRawTargetLocally(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := captureRecord{Time: "2026-11-25T12:00:00Z", Peer: "203.0.113.9", Method: "GET", Target: "/.env?key=fixture-secret", Host: "example.com",
-		UserAgent: "scanner/1.0\x1b[31m", Route: "/unmatched", Status: 404, Probe: "env_file", Port: 443, Proto: "HTTP/1.1"}
+		UserAgent: "scanner/1.0\x1b[31m", Route: "/.env", Status: 200, Port: 443, Proto: "HTTP/1.1"}
 	if got.Time != want.Time || got.Peer != want.Peer || got.Method != want.Method || got.Target != want.Target ||
 		got.Host != want.Host || got.UserAgent != want.UserAgent || got.Route != want.Route ||
 		got.Status != want.Status || got.Probe != want.Probe || got.Port != want.Port || got.Proto != want.Proto {
@@ -271,6 +271,7 @@ func TestCaptureWithMatchedRoute(t *testing.T) {
 	body := `{"model":"local-instruct-8b","messages":[{"role":"user","content":"test"}]}`
 	r := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "Bearer test")
 	rec := httptest.NewRecorder()
 	g.ServeHTTP(rec, r)
 
@@ -320,7 +321,7 @@ func TestCaptureKeepsBodyThatNoHandlerReads(t *testing.T) {
 	g := NewGateway(nil)
 	g.Capture = c
 	w := httptest.NewRecorder()
-	g.ServeHTTP(w, httptest.NewRequest("GET", "/v1/models", strings.NewReader("probe-body")))
+	g.ServeHTTP(w, httptest.NewRequest("GET", "/v1/models?key=test", strings.NewReader("probe-body")))
 	_ = c.Close()
 	files, _ := filepath.Glob(filepath.Join(dir, "capture-*.jsonl"))
 	if len(files) != 1 {
