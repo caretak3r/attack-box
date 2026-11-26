@@ -20,7 +20,7 @@ PUBLIC_GROUP=abx-public-otel
 CAPTURE_ROOT=/var/lib/attackbox-public-capture
 CAPTURE_DIR=$CAPTURE_ROOT/requests
 # Published ports as public:container. 443 is TLS; the others are plain HTTP on 20000 + public port.
-PUBLIC_PORTS=(443:8443 80:20080 1234:21234 8000:28000 8080:28080 11434:31434)
+PUBLIC_PORTS=(443:8443 80:20080 1234:21234 3000:23000 4000:24000 8000:28000 8080:28080 8188:28188 8888:28888 11434:31434)
 
 usage() {
   cat >&2 <<'USAGE'
@@ -591,7 +591,7 @@ verify_public_bindings() {
     expected+=("${pair#*:}/tcp -> $public_ip:${pair%%:*}")
   done
   expected=$(printf '%s\n' "${expected[@]}" | sort)
-  [[ $actual == "$expected" ]] || fail "public ports are not bound exactly to the six published ports on $public_ip"
+  [[ $actual == "$expected" ]] || fail "public ports are not bound exactly to the ten published ports on $public_ip"
   mounts=$(docker inspect --type container --format '{{range .Mounts}}{{println .Type .Source .Destination .RW}}{{end}}' "$container" | sed '/^$/d' | sort) || fail 'cannot inspect public mounts'
   [[ $mounts == $'bind /etc/attackbox-public/tls /run/secrets false\nbind /run/attackbox-public-otel /run/attackbox-public-otel false\nbind /var/lib/attackbox-public-capture/requests /var/lib/attackbox-public-capture true' ]] || fail 'public mounts must contain only read-only public TLS and socket directories and the capture directory'
   network=$(marker_value project.network_id)
@@ -1200,7 +1200,7 @@ run_stage() {
   cleanup_work
   stage_in_progress=false
   trap - EXIT
-  note "staged public project $project on $public_ip ports 443 (TLS), 80, 1234, 8000, 8080, 11434 (plain HTTP); verified local TLS trust, hostname and leaf pin"
+  note "staged public project $project on $public_ip ports 443 (TLS), 80, 1234, 3000, 4000, 8000, 8080, 8188, 8888, 11434 (plain HTTP); verified local TLS trust, hostname and leaf pin"
   note 'not claimed: provider firewall state, public ingress or New Relic ingestion'
 }
 

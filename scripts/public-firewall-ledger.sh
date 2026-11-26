@@ -93,7 +93,7 @@ def check_state(s):
         require(re.fullmatch(r"[0-9a-f]{64}", s[key]))
     require(rid(s["ssh_id"]))
     require(type(s["ports"]) is list and len(s["ports"]) > 0)
-    allowed = {80, 443, 1234, 8000, 8080, 11434}
+    allowed = {80, 443, 1234, 3000, 4000, 8000, 8080, 8188, 8888, 11434}
     require(all(type(p) is int and p in allowed for p in s["ports"]))
     require(len(s["ports"]) == len(set(s["ports"])))
     require(s["ports"] == sorted(s["ports"]))

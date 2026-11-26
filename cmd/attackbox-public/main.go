@@ -33,7 +33,7 @@ const externalPort = 443
 // A plain-HTTP public port p listens in the container on plainOffset+p, because the unprivileged user cannot bind port 80.
 const plainOffset = 20000
 
-var plainPorts = [...]int{80, 1234, 8000, 8080, 11434}
+var plainPorts = [...]int{80, 1234, 3000, 4000, 8000, 8080, 8188, 8888, 11434}
 
 const requestRate = 1
 const requestBurst = 4

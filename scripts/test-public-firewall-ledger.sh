@@ -146,13 +146,13 @@ rollback_case && rollback_case || fail 'idempotent closure'
 closed
 
 new_case multiport
-open_case '443,80,1234,8000,8080,11434' || fail '6-port cutover'
-jq -se '[.[].port] == ["80","443","1234","8000","8080","11434"]' "$posts" >/dev/null || fail 'not one POST per port in ascending order'
-jq -e '.version==3 and .phase=="open" and .ports==[80,443,1234,8000,8080,11434] and
-  .rules=={"80":110,"443":93,"1234":1264,"8000":8030,"8080":8110,"11434":11464}' "$journal" >/dev/null || fail '6-port state'
-jq -e 'length==7' "$inventory" >/dev/null || fail '6 public + SSH'
-rollback_case || fail '6-port rollback'
-[[ $(wc -l <"$deletes") -eq 6 ]] || fail 'not one DELETE per owned rule'
+open_case '443,80,1234,3000,4000,8000,8080,8188,8888,11434' || fail '10-port cutover'
+jq -se '[.[].port] == ["80","443","1234","3000","4000","8000","8080","8188","8888","11434"]' "$posts" >/dev/null || fail 'not one POST per port in ascending order'
+jq -e '.version==3 and .phase=="open" and .ports==[80,443,1234,3000,4000,8000,8080,8188,8888,11434] and
+  .rules=={"80":110,"443":93,"1234":1264,"3000":3030,"4000":4030,"8000":8030,"8080":8110,"8188":8218,"8888":8918,"11434":11464}' "$journal" >/dev/null || fail '10-port state'
+jq -e 'length==11' "$inventory" >/dev/null || fail '10 public + SSH'
+rollback_case || fail '10-port rollback'
+[[ $(wc -l <"$deletes") -eq 10 ]] || fail 'not one DELETE per owned rule'
 closed
 
 # The third POST creates its rule but loses the reply: all three rules must go.
@@ -192,7 +192,7 @@ done
 no_write
 
 new_case args
-for profile in '80,443,1234,3000,4891,5000,6333,6334,8000,8001,8002,8080,8500,8501,11434,19530'; do reject open_case "$profile"; done
+for profile in '80,443,1234,3000,4000,4891,5000,6333,6334,8000,8080,8188,8500,8501,8888,11434,19530'; do reject open_case "$profile"; done
 
 for scenario in wrongip wrongfw shared unseenattachment countdrift missingmeta truncated nextpage prevpage dupkey multijson prepostdrift; do
   new_case "$scenario"; fault=$scenario
