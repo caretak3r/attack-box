@@ -355,6 +355,57 @@ func TestGatewayRouteFamilies(t *testing.T) {
 	}
 }
 
+func TestGatewayPortPersonas(t *testing.T) {
+	for _, tc := range []struct {
+		port                      int
+		method, path, route       string
+		status                    int
+		contentType, body, server string
+	}{
+		{11434, "GET", "/", "/", 200, "text/plain; charset=utf-8", "Ollama is running", ""},
+		{11434, "GET", "/api/version", "/api/version", 200, gatewayJSONUTF8, `{"version":"0.12.6"}`, ""},
+		{11434, "POST", "/", "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found\n", ""},
+		{443, "GET", "/", "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found\n", ""},
+		{443, "GET", "/api/version", "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found\n", ""},
+		{80, "GET", "/health", "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found\n", ""},
+		{1234, "GET", "/", "/unmatched", 200, gatewayJSONUTF8, `{"error":"Unexpected endpoint or method. (GET /)"}`, ""},
+		{1234, "POST", `/a"b`, "/unmatched", 200, gatewayJSONUTF8, `{"error":"Unexpected endpoint or method. (POST /a\"b)"}`, ""},
+		{8000, "GET", "/health", "/health", 200, "", "", "uvicorn"},
+		{8000, "GET", "/version", "/version", 200, gatewayJSON, `{"version":"0.10.2"}`, "uvicorn"},
+		{8000, "GET", "/nope", "/unmatched", 404, gatewayJSON, `{"detail":"Not Found"}`, "uvicorn"},
+		{8080, "GET", "/health", "/health", 200, gatewayJSONUTF8, `{"status":"ok"}`, "llama.cpp"},
+		{8080, "POST", "/health", "/unmatched", 404, gatewayJSONUTF8, `{"error":{"code":404,"message":"File Not Found","type":"not_found_error"}}`, "llama.cpp"},
+	} {
+		t.Run(fmt.Sprintf("%d %s %s", tc.port, tc.method, tc.path), func(t *testing.T) {
+			rec := tracetest.NewSpanRecorder()
+			tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+			defer tp.Shutdown(t.Context())
+			r := httptest.NewRequest(tc.method, "/", nil)
+			r.URL.Path = tc.path
+			w := httptest.NewRecorder()
+			NewGateway(tp.Tracer("test")).ServeHTTP(w, r.WithContext(WithPort(r.Context(), tc.port)))
+			if w.Code != tc.status || w.Header().Get("Content-Type") != tc.contentType || w.Body.String() != tc.body || w.Header().Get("Server") != tc.server {
+				t.Fatalf("got %d %q server %q %s", w.Code, w.Header().Get("Content-Type"), w.Header().Get("Server"), w.Body.String())
+			}
+			for _, a := range rec.Ended()[0].Attributes() {
+				if a.Key == "http.route" && a.Value.AsString() != tc.route {
+					t.Fatalf("route = %q, want %q", a.Value.AsString(), tc.route)
+				}
+			}
+		})
+	}
+
+	// The native LM Studio list has the local-style names only, and a generic family keeps working on a persona port.
+	for path, want := range map[string][2]string{"/api/v0/models": {`"id":"local-instruct-8b"`, "gpt-4o"}, "/v1/models": {`"id":"gpt-4o"`, "Unexpected endpoint"}} {
+		r := httptest.NewRequest("GET", path, nil)
+		w := httptest.NewRecorder()
+		NewGateway(nil).ServeHTTP(w, r.WithContext(WithPort(r.Context(), 1234)))
+		if w.Code != 200 || !strings.Contains(w.Body.String(), want[0]) || strings.Contains(w.Body.String(), want[1]) {
+			t.Errorf("port 1234 %s: %d %s", path, w.Code, w.Body.String())
+		}
+	}
+}
+
 func TestGatewayCredential(t *testing.T) {
 	// Fixtures are built here so that no credential-shaped literal exists in the source.
 	fill := strings.Repeat("a1", 12)
