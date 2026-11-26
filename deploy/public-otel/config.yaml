@@ -30,15 +30,15 @@ processors:
       - 'IsInt(span.attributes["http.request.body.size"]) and span.attributes["http.request.body.size"] < 0'
       - 'span.attributes["gen_ai.request.model"] != nil and not IsString(span.attributes["gen_ai.request.model"])'
       # Model names come from the gateway's fixed list (gatewayModelList), never from the request.
-      - 'IsString(span.attributes["gen_ai.request.model"]) and not IsMatch(span.attributes["gen_ai.request.model"], "^(local-instruct-8b|gpt-4o|gpt-4o-mini|gpt-4[.]1|gpt-4[.]1-mini|o3-mini|gpt-3[.]5-turbo|claude-3-5-sonnet-20241022|claude-3-7-sonnet-20250219|claude-sonnet-4-20250514|claude-3-5-haiku-20241022|llama3[.]1:8b|qwen2[.]5:7b|deepseek-r1:8b|mistral:7b|text-embedding-3-small|text-embedding-3-large|nomic-embed-text)$")'
+      - 'IsString(span.attributes["gen_ai.request.model"]) and not IsMatch(span.attributes["gen_ai.request.model"], "^(local-instruct-8b|gpt-4o|gpt-4o-mini|gpt-4[.]1|gpt-4[.]1-mini|o3-mini|gpt-3[.]5-turbo|claude-3-5-sonnet-20241022|claude-3-7-sonnet-20250219|claude-sonnet-4-20250514|claude-3-5-haiku-20241022|llama3[.]1:8b|qwen2[.]5:7b|deepseek-r1:8b|mistral:7b|llama3[.]3:70b|deepseek-r1:70b|qwen2[.]5-coder:32b|text-embedding-3-small|text-embedding-3-large|nomic-embed-text)$")'
       - 'span.attributes["attackbox.request.stream"] != nil and not IsBool(span.attributes["attackbox.request.stream"])'
       - 'span.name == "public.request" and span.attributes["attackbox.persona"] != "cloud-gateway"'
       - 'span.attributes["attackbox.persona"] != nil and span.attributes["attackbox.persona"] != "cloud-gateway"'
       - 'span.name == "public.request" and (span.attributes["http.request.method"] == nil or not IsString(span.attributes["http.request.method"]))'
       - 'span.attributes["http.request.method"] != nil and IsString(span.attributes["http.request.method"]) and not IsMatch(span.attributes["http.request.method"], "^(GET|HEAD|POST|PUT|DELETE|CONNECT|OPTIONS|TRACE|PATCH|_OTHER)$")'
       - 'span.name == "public.request" and (span.attributes["http.route"] == nil or not IsString(span.attributes["http.route"]))'
-      # Route labels are built by the gateway from allowlisted prefix tokens and family suffixes, or are fixed port persona paths (gatewayPersonas).
-      - 'span.attributes["http.route"] != nil and IsString(span.attributes["http.route"]) and not IsMatch(span.attributes["http.route"], "^(/unmatched|/|/health|/version|/api/version|/api/ps|/api/v0/models|(/(v1|v2|v3|api|openai|azure|llm|ai|proxy|gateway|inference|litellm|ollama|anthropic|deployments/[{]deployment[}]|engines/[{]model[}])){0,4}/(models|chat/completions|completions|embeddings|messages|api/tags|api/chat|api/generate))$")'
+      # Route labels are built by the gateway from allowlisted prefix tokens and family suffixes, or are fixed: port persona paths (gatewayPersonas) and the env-file answer.
+      - 'span.attributes["http.route"] != nil and IsString(span.attributes["http.route"]) and not IsMatch(span.attributes["http.route"], "^(/unmatched|/|/health|/version|/api/version|/api/ps|/api/v0/models|/[.]env|(/(v1|v2|v3|api|openai|azure|llm|ai|proxy|gateway|inference|litellm|ollama|anthropic|deployments/[{]deployment[}]|engines/[{]model[}])){0,4}/(models|chat/completions|completions|embeddings|messages|api/tags|api/chat|api/generate|api/show|api/pull|api/create|api/delete|api/embed|api/embeddings))$")'
       - 'span.name == "public.request" and not IsInt(span.attributes["attackbox.request.query_params"])'
       - 'span.attributes["attackbox.request.query_params"] != nil and (not IsInt(span.attributes["attackbox.request.query_params"]) or span.attributes["attackbox.request.query_params"] < 0 or span.attributes["attackbox.request.query_params"] > 64)'
       - 'span.attributes["attackbox.probe.class"] != nil and not IsString(span.attributes["attackbox.probe.class"])'
@@ -47,6 +47,8 @@ processors:
       - 'span.attributes["attackbox.credential.source"] != nil and (not IsString(span.attributes["attackbox.credential.source"]) or not IsMatch(span.attributes["attackbox.credential.source"], "^(authorization|proxy-authorization|x-api-key|api-key|x-goog-api-key|query)$"))'
       - 'span.attributes["attackbox.credential.type"] != nil and (not IsString(span.attributes["attackbox.credential.type"]) or not IsMatch(span.attributes["attackbox.credential.type"], "^(anthropic|openai|google|aws|huggingface|groq|xai|replicate|jwt|github|basic|token)$"))'
       - 'span.attributes["attackbox.credential.value"] != nil and (not IsString(span.attributes["attackbox.credential.value"]) or not IsMatch(span.attributes["attackbox.credential.value"], "^[!-~]{1,512}$") or span.attributes["attackbox.credential.type"] == nil)'
+      # The gateway makes this fake key for an env-file answer; it has a fixed form and holds no client text.
+      - 'span.attributes["attackbox.canary.key"] != nil and (not IsString(span.attributes["attackbox.canary.key"]) or not IsMatch(span.attributes["attackbox.canary.key"], "^sk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}$"))'
       - 'span.name == "public.request" and (span.attributes["http.response.status_code"] == nil or not IsInt(span.attributes["http.response.status_code"]))'
       - 'span.attributes["http.response.status_code"] != nil and IsInt(span.attributes["http.response.status_code"]) and (span.attributes["http.response.status_code"] < 100 or span.attributes["http.response.status_code"] > 599)'
       - 'span.name == "public.connection" and not IsString(span.attributes["attackbox.connection.outcome"])'
@@ -76,7 +78,7 @@ processors:
       - set(scope.name, "attackbox-public")
       - set(scope.version, "${env:ATTACKBOX_PUBLIC_RELEASE_VERSION}")
       - set(scope.schema_url, "")
-      - keep_keys(span.attributes, ["server.port", "attackbox.persona", "http.route", "http.request.method", "http.response.status_code", "client.address", "attackbox.request.content_type", "http.request.body.size", "gen_ai.request.model", "attackbox.request.stream", "attackbox.request.query_params", "attackbox.probe.class", "attackbox.credential.source", "attackbox.credential.type", "attackbox.credential.value"]) where span.name == "public.request"
+      - keep_keys(span.attributes, ["server.port", "attackbox.persona", "http.route", "http.request.method", "http.response.status_code", "client.address", "attackbox.request.content_type", "http.request.body.size", "gen_ai.request.model", "attackbox.request.stream", "attackbox.request.query_params", "attackbox.probe.class", "attackbox.credential.source", "attackbox.credential.type", "attackbox.credential.value", "attackbox.canary.key"]) where span.name == "public.request"
       - keep_keys(span.attributes, ["server.port", "attackbox.accepted_requests", "attackbox.rate_limited_requests", "attackbox.pre_http_connections", "attackbox.rejected_connections", "attackbox.captured_requests", "attackbox.capture_dropped", "attackbox.otel_dropped_spans_total", "attackbox.otel_export_failed_spans_total"]) where span.name == "public.health"
       - keep_keys(span.attributes, ["server.port", "client.address", "attackbox.connection.outcome", "attackbox.tls.sni"]) where span.name == "public.connection"
       # Every public.request attribute is bounded by the filter above; 512 keeps a full credential value.

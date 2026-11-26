@@ -55,6 +55,7 @@ func healthcheck(ctx context.Context, certPath, address string) error {
 			return fmt.Errorf("invalid local probe: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer healthcheck") // port 443 answers 401 without a credential
 		resp, err := client.Do(req)
 		if err != nil {
 			return fmt.Errorf("local HTTPS probe failed: %w", err)

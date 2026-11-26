@@ -1,11 +1,14 @@
 package publicedge
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -15,6 +18,7 @@ import (
 func TestGatewayModelsRoute(t *testing.T) {
 	g := NewGateway(nil)
 	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer test") // port 443 is the default port, and it answers 401 without a credential
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, req)
 	if w.Code != 200 {
@@ -30,6 +34,7 @@ func TestGatewayChatCompletion(t *testing.T) {
 	body := `{"model":"local-instruct-8b","messages":[{"role":"user","content":"test"}]}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test")
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, req)
 	if w.Code != 200 {
@@ -45,6 +50,7 @@ func TestGatewayStreamingChatCompletion(t *testing.T) {
 	body := `{"model":"local-instruct-8b","messages":[{"role":"user","content":"test"}],"stream":true}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test")
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, req)
 	if w.Code != 200 {
@@ -63,6 +69,7 @@ func TestGatewayCompletion(t *testing.T) {
 	body := `{"model":"local-instruct-8b","prompt":"test"}`
 	req := httptest.NewRequest("POST", "/v1/completions", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test")
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, req)
 	if w.Code != 200 {
@@ -78,6 +85,7 @@ func TestGatewayAzureDeployment(t *testing.T) {
 	body := `{"messages":[{"role":"user","content":"test"}]}`
 	req := httptest.NewRequest("POST", "/openai/deployments/local-instruct-8b/chat/completions", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test")
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, req)
 	if w.Code != 200 {
@@ -93,6 +101,7 @@ func TestGatewayRejectsUnknownModel(t *testing.T) {
 	body := `{"model":"unknown","messages":[{"role":"user","content":"test"}]}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test")
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, req)
 	if w.Code != 404 {
@@ -105,6 +114,7 @@ func TestGatewayRejectsInvalidRequest(t *testing.T) {
 	body := `{"model":"local-instruct-8b"}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test")
 	w := httptest.NewRecorder()
 	g.ServeHTTP(w, req)
 	if w.Code != 400 {
@@ -168,6 +178,7 @@ func TestGatewayReadObjectRejectsInvalid(t *testing.T) {
 func TestGatewayReadObjectRejectsOversized(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/completions", strings.NewReader(`{"prompt":"`+strings.Repeat("x", gatewayBodyLimit)+`"}`))
 	req.ContentLength = -1
+	req.Header.Set("Authorization", "Bearer test")
 	w := httptest.NewRecorder()
 	NewGateway(nil).ServeHTTP(w, req)
 	if w.Code != http.StatusRequestEntityTooLarge {
@@ -282,13 +293,14 @@ func TestGatewayRequestEvidence(t *testing.T) {
 					defer c.Close()
 					g.Capture = c
 				}
-				g.ServeHTTP(httptest.NewRecorder(), r)
+				// Port 80: port 443 needs a credential, and a credential adds attributes to each case.
+				g.ServeHTTP(httptest.NewRecorder(), r.WithContext(WithPort(r.Context(), 80)))
 				spans := rec.Ended()
 				if len(spans) != 1 || spans[0].Name() != "public.request" {
 					t.Fatal("missing public.request span")
 				}
 				want := attribute.NewSet(append([]attribute.KeyValue{
-					attribute.Int("server.port", 443), attribute.String("attackbox.persona", "cloud-gateway"),
+					attribute.Int("server.port", 80), attribute.String("attackbox.persona", "cloud-gateway"),
 					attribute.String("http.route", tc.route), attribute.String("http.request.method", tc.method),
 					attribute.Int("http.response.status_code", tc.status), attribute.String("attackbox.request.content_type", gatewayJSON),
 				}, tc.want...)...)
@@ -328,6 +340,19 @@ func TestGatewayRouteFamilies(t *testing.T) {
 		{"POST", "/api/chat", `{"model":"local-instruct-8b","messages":[{"role":"user","content":"x"}]}`, "/api/chat", 200, "application/x-ndjson", `"done":true`},
 		{"POST", "/ollama/api/generate", `{"model":"local-instruct-8b:latest","prompt":"x","stream":false}`, "/ollama/api/generate", 200, gatewayJSON, `"response":"Ready."`},
 		{"POST", "/api/generate", `{"model":"llama3","prompt":"x"}`, "/api/generate", 404, gatewayJSON, "model not found"},
+		{"GET", "/api/tags", "", "/api/tags", 200, gatewayJSON, `"name":"llama3.3:70b","model":"llama3.3:70b","size":43`},
+		{"GET", "/api/tags", "", "/api/tags", 200, gatewayJSON, `"parameter_size":"8.0B","quantization_level":"Q4_K_M"},"modified_at"`},
+		{"POST", "/api/show", `{"model":"llama3.3:70b"}`, "/api/show", 200, gatewayJSONUTF8, `"parameter_size":"70.0B"`},
+		{"POST", "/api/show", `{"name":"llama3"}`, "/api/show", 404, gatewayJSON, "model not found"},
+		{"POST", "/api/show", `{"stream":false}`, "/api/show", 400, gatewayJSON, "invalid request"},
+		{"POST", "/api/pull", `{"model":"llama3.1:8b"}`, "/api/pull", 200, "application/x-ndjson", `{"status":"writing manifest"}` + "\n" + `{"status":"success"}` + "\n"},
+		{"POST", "/api/pull", `{"name":"other/model:1b"}`, "/api/pull", 200, "application/x-ndjson", `{"status":"pulling manifest"}` + "\n" + `{"error":"pull model manifest: file does not exist"}` + "\n"},
+		{"POST", "/api/pull", `{"model":"other/model:1b","stream":false}`, "/api/pull", 404, gatewayJSONUTF8, "file does not exist"},
+		{"POST", "/api/create", `{"model":"mine","from":"llama3.1:8b","stream":false}`, "/api/create", 200, gatewayJSONUTF8, `{"status":"success"}`},
+		{"DELETE", "/api/delete", `{"model":"mistral:7b"}`, "/api/delete", 200, "", ""},
+		{"POST", "/api/delete", `{"model":"mistral:7b"}`, "/api/delete", 405, "text/plain; charset=utf-8", "Method Not Allowed"},
+		{"POST", "/api/embed", `{"model":"nomic-embed-text","input":"x"}`, "/api/embed", 200, gatewayJSONUTF8, `"model":"nomic-embed-text:latest","embeddings":[[0.0123`},
+		{"POST", "/ollama/api/embeddings", `{"model":"nomic-embed-text","prompt":"x"}`, "/ollama/api/embeddings", 200, gatewayJSONUTF8, `{"embedding":[0.0123`},
 		{"POST", "/xyz/completions", `{"prompt":"x"}`, "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found"},
 		{"POST", "/v1/v1/v1/v1/v1/completions", `{"prompt":"x"}`, "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found"},
 		{"GET", "/9f1c2e7a", "", "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found"},
@@ -338,9 +363,13 @@ func TestGatewayRouteFamilies(t *testing.T) {
 			defer tp.Shutdown(t.Context())
 			r := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
 			w := httptest.NewRecorder()
-			NewGateway(tp.Tracer("test")).ServeHTTP(w, r)
+			// Port 80: port 443 needs a credential.
+			NewGateway(tp.Tracer("test")).ServeHTTP(w, r.WithContext(WithPort(r.Context(), 80)))
 			if w.Code != tc.status || w.Header().Get("Content-Type") != tc.contentType || !strings.Contains(w.Body.String(), tc.contains) {
 				t.Fatalf("got %d %q %s", w.Code, w.Header().Get("Content-Type"), w.Body.String())
+			}
+			if strings.HasPrefix(tc.contentType, gatewayJSON) && !json.Valid(w.Body.Bytes()) {
+				t.Fatalf("answer is not JSON: %s", w.Body.String())
 			}
 			var route string
 			for _, a := range rec.Ended()[0].Attributes() {
@@ -375,6 +404,8 @@ func TestGatewayPortPersonas(t *testing.T) {
 		{8000, "GET", "/nope", "/unmatched", 404, gatewayJSON, `{"detail":"Not Found"}`, "uvicorn"},
 		{8080, "GET", "/health", "/health", 200, gatewayJSONUTF8, `{"status":"ok"}`, "llama.cpp"},
 		{8080, "POST", "/health", "/unmatched", 404, gatewayJSONUTF8, `{"error":{"code":404,"message":"File Not Found","type":"not_found_error"}}`, "llama.cpp"},
+		{443, "GET", "/v1/models", "/v1/models", 401, gatewayJSON, gatewayNoKey, ""},
+		{443, "POST", "/v1/models", "/v1/models", 401, gatewayJSON, gatewayNoKey, ""},
 	} {
 		t.Run(fmt.Sprintf("%d %s %s", tc.port, tc.method, tc.path), func(t *testing.T) {
 			rec := tracetest.NewSpanRecorder()
@@ -403,6 +434,79 @@ func TestGatewayPortPersonas(t *testing.T) {
 		if w.Code != 200 || !strings.Contains(w.Body.String(), want[0]) || strings.Contains(w.Body.String(), want[1]) {
 			t.Errorf("port 1234 %s: %d %s", path, w.Code, w.Body.String())
 		}
+	}
+
+	// Port 443 accepts any credential, and the other ports do not ask for one.
+	for _, tc := range []struct {
+		port         int
+		path, header string
+	}{{443, "/v1/models", "Authorization"}, {443, "/v1/models", "X-Api-Key"}, {443, "/v1/models?key=any", ""}, {80, "/v1/models", ""}, {11434, "/api/tags", ""}} {
+		r := httptest.NewRequest("GET", tc.path, nil)
+		if tc.header != "" {
+			r.Header.Set(tc.header, "any")
+		}
+		w := httptest.NewRecorder()
+		NewGateway(nil).ServeHTTP(w, r.WithContext(WithPort(r.Context(), tc.port)))
+		if w.Code != 200 {
+			t.Errorf("port %d %s %s: %d", tc.port, tc.path, tc.header, w.Code)
+		}
+	}
+
+	r := httptest.NewRequest("GET", "/api/ps", nil)
+	w := httptest.NewRecorder()
+	NewGateway(nil).ServeHTTP(w, r.WithContext(WithPort(r.Context(), 11434)))
+	var ps struct {
+		Models []struct {
+			Name      string
+			SizeVRAM  int64     `json:"size_vram"`
+			ExpiresAt time.Time `json:"expires_at"`
+		}
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &ps); err != nil || len(ps.Models) != 1 || ps.Models[0].Name != "llama3.3:70b" || ps.Models[0].SizeVRAM < 40<<30 || !ps.Models[0].ExpiresAt.After(time.Now()) {
+		t.Errorf("/api/ps: %v %s", err, w.Body.String())
+	}
+}
+
+func TestGatewayEnvFile(t *testing.T) {
+	rec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	defer tp.Shutdown(t.Context())
+	g := NewGateway(tp.Tracer("test"))
+	fetch := func(g *Gateway, method, target, peer, host string) (int, string) {
+		r := httptest.NewRequest(method, target, nil)
+		r.RemoteAddr, r.Host = peer, host
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, r.WithContext(WithPort(r.Context(), 80)))
+		return w.Code, w.Body.String()
+	}
+	const peer, host = "203.0.113.42:1000", "gateway.test:8080"
+	form := regexp.MustCompile(`^APP_ENV=production\nOPENAI_API_KEY=(sk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20})\nOPENAI_BASE_URL=http://gateway[.]test:8080/v1\n$`)
+	_, first := fetch(g, "GET", "/.env", peer, host)
+	m := form.FindStringSubmatch(first)
+	if m == nil {
+		t.Fatalf("env-file answer: %q", first)
+	}
+	attrs := attribute.NewSet(rec.Ended()[0].Attributes()...)
+	if route, _ := attrs.Value("http.route"); route.AsString() != "/.env" {
+		t.Errorf("route = %q", route.AsString())
+	}
+	if key, _ := attrs.Value("attackbox.canary.key"); key.AsString() != m[1] {
+		t.Error("the span does not hold the key that the answer gave")
+	}
+	if _, again := fetch(g, "GET", "/app/.env.production?x=1", "203.0.113.42:2000", host); again != first {
+		t.Error("one peer got two keys")
+	}
+	if _, other := fetch(g, "GET", "/.env", "203.0.113.43:1000", host); other == first || !form.MatchString(other) {
+		t.Error("two peers got one key")
+	}
+	if _, restarted := fetch(NewGateway(nil), "GET", "/.env", peer, host); restarted == first || !form.MatchString(restarted) {
+		t.Error("a new process gave the old key")
+	}
+	if _, body := fetch(g, "GET", "/.env", peer, `bad"host`); body != "APP_ENV=production\nOPENAI_API_KEY="+m[1]+"\n" {
+		t.Errorf("an unsafe Host header reached the answer: %q", body)
+	}
+	if code, _ := fetch(g, "POST", "/.env", peer, host); code != 404 {
+		t.Errorf("POST /.env: %d", code)
 	}
 }
 

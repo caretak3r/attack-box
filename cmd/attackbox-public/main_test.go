@@ -119,7 +119,8 @@ func TestGatewayHTTPSAndTracing(t *testing.T) {
 		{"POST", "/v1/completions", `{"model":"local-instruct-8b","prompt":"test"}`, `"cmpl-`},
 		{"POST", "/openai/deployments/local-instruct-8b/chat/completions", `{"messages":[{"role":"user","content":"test"}]}`, `"chatcmpl-`},
 	} {
-		req, err := http.NewRequestWithContext(ctx, tc.method, "https://"+addr+tc.path, strings.NewReader(tc.body))
+		// Port 443 answers 401 without a credential.
+		req, err := http.NewRequestWithContext(ctx, tc.method, "https://"+addr+tc.path+"?key=test", strings.NewReader(tc.body))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -395,7 +396,7 @@ func TestHTTP2WorksWhenPlainServeStartsFirst(t *testing.T) {
 	go func() { finished <- a.run(ctx) }()
 
 	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{ForceAttemptHTTP2: true, TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: "localhost", MinVersion: tls.VersionTLS12}}}
-	resp, err := client.Get("https://" + a.listener.Addr().String() + "/v1/models")
+	resp, err := client.Get("https://" + a.listener.Addr().String() + "/v1/models?key=test")
 	if err != nil {
 		t.Errorf("HTTP/2 request: %v", err)
 	} else {
@@ -518,7 +519,7 @@ func TestSIGHUPReloadsCertificate(t *testing.T) {
 	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: "localhost", MinVersion: tls.VersionTLS12}}}
 	defer client.CloseIdleConnections()
 
-	req, _ := http.NewRequestWithContext(ctx, "GET", "https://"+addr+"/v1/models", nil)
+	req, _ := http.NewRequestWithContext(ctx, "GET", "https://"+addr+"/v1/models?key=test", nil)
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -571,7 +572,7 @@ func TestSIGHUPReloadsCertificate(t *testing.T) {
 	newClient := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: newRoots, ServerName: "localhost", MinVersion: tls.VersionTLS12}}}
 	defer newClient.CloseIdleConnections()
 
-	req, _ = http.NewRequestWithContext(ctx, "GET", "https://"+addr+"/v1/models", nil)
+	req, _ = http.NewRequestWithContext(ctx, "GET", "https://"+addr+"/v1/models?key=test", nil)
 	resp, err = newClient.Do(req)
 	if err != nil {
 		t.Fatal("reload failed:", err)

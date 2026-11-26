@@ -119,7 +119,7 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.probe = func(string) bool { return false }         // test clients share the healthcheck's loopback peer
-	a.limiter = newRateLimit(requestRate, 8, time.Now()) // seven requests follow without a pause
+	a.limiter = newRateLimit(requestRate, 9, time.Now()) // eight requests follow without a pause
 	plainAddr := make(map[int]string)
 	for _, port := range []int{8000, 9999} { // 9999 is outside the Collector's port allowlist
 		l, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -164,6 +164,7 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 		{"POST", "/openai/deployments/local-instruct-8b/chat/completions", `{"messages":[{"role":"user","content":"test"}]}`, externalPort},
 		{"GET", "/api/tags", "", 8000},
 		{"GET", "/health", "", 8000}, // port persona path: its route label must pass the Collector
+		{"GET", "/.env", "", 8000},   // env-file answer: its route label and its fake key must pass the Collector
 		{"GET", "/v1/models", "", 9999},
 	} {
 		base := "https://" + addr
@@ -215,7 +216,7 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 
 	seen := make(map[string]bool)
 	health, connection := false, false
-	expected := []string{"/v1/models", "/v1/chat/completions", "/v1/api/completions", "/openai/deployments/{deployment}/chat/completions", "/api/tags", "/health"}
+	expected := []string{"/v1/models", "/v1/chat/completions", "/v1/api/completions", "/openai/deployments/{deployment}/chat/completions", "/api/tags", "/health", "/.env"}
 	for !health || !connection || len(seen) < len(expected) {
 		var req *collector.ExportTraceServiceRequest
 		select {
@@ -239,7 +240,7 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 								captured = attr.Value.GetIntValue()
 							}
 						}
-						if port != externalPort || preHTTP != 1 || captured != 7 {
+						if port != externalPort || preHTTP != 1 || captured != 8 {
 							t.Errorf("health span: port %d, pre-HTTP connections %d, captured %d", port, preHTTP, captured)
 						}
 						continue
@@ -258,7 +259,7 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 						continue
 					}
 					if span.Name == "public.request" {
-						var route, persona, contentType, model, credSource, credType, credValue string
+						var route, persona, contentType, model, credSource, credType, credValue, canary string
 						var port int64
 						var stream bool
 						size, queryParams := int64(-1), int64(-1)
@@ -288,13 +289,15 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 								credType = attr.Value.GetStringValue()
 							case "attackbox.credential.value":
 								credValue = attr.Value.GetStringValue()
+							case "attackbox.canary.key":
+								canary = attr.Value.GetStringValue()
 							}
 						}
 						if persona != "cloud-gateway" {
 							t.Errorf("request span: unexpected persona %q", persona)
 						}
 						wantPort := int64(externalPort)
-						if route == "/api/tags" || route == "/health" {
+						if route == "/api/tags" || route == "/health" || route == "/.env" {
 							wantPort = 8000
 						}
 						if port != wantPort || queryParams != 1 {
@@ -302,6 +305,9 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 						}
 						if credSource != "authorization" || credType != "anthropic" || credValue != credential {
 							t.Errorf("request span credential: source %q type %q value length %d", credSource, credType, len(credValue))
+						}
+						if (route == "/.env") != (len(canary) == 51) {
+							t.Errorf("request span %s: fake key length %d", route, len(canary))
 						}
 						if route == "/v1/chat/completions" && (size != int64(len(chatPayload)) || contentType != "application/json" || model != "local-instruct-8b" || !stream) {
 							t.Error("chat span lost structured request fields on its way to the exporter")
@@ -318,7 +324,7 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 		}
 	}
 	raw, err := os.ReadFile(filepath.Join(cfg.capture, "capture-"+time.Now().UTC().Format("20060102")+".jsonl"))
-	if err != nil || bytes.Count(raw, []byte("\n")) != 7 || !bytes.Contains(raw, []byte(`"port":8000`)) || !bytes.Contains(raw, []byte(`"port":9999`)) || !bytes.Contains(raw, []byte(`"/v1/api/completions?q=`+privateMarker+`"`)) || !bytes.Contains(raw, []byte(`"Bearer `+credential+`"`)) {
+	if err != nil || bytes.Count(raw, []byte("\n")) != 8 || !bytes.Contains(raw, []byte(`"port":8000`)) || !bytes.Contains(raw, []byte(`"port":9999`)) || !bytes.Contains(raw, []byte(`"/v1/api/completions?q=`+privateMarker+`"`)) || !bytes.Contains(raw, []byte(`"Bearer `+credential+`"`)) {
 		t.Fatalf("local capture missing raw targets: %v\n%s", err, raw)
 	}
 }
