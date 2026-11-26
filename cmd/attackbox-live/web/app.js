@@ -18,7 +18,7 @@ const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
 const count = (n) => n.toLocaleString('en-US');
 const plural = (n, word) => `${count(n)} ${word}${n === 1 ? '' : 's'}`;
 
-const view = { window: '1h', who: '', q: '', ip: '', endpoint: '', paused: false, feedKey: '', selected: 0, opener: null };
+const view = { window: '1h', who: '', q: '', ip: '', endpoint: '', port: 0, paused: false, feedKey: '', selected: 0, opener: null };
 const windows = [['15m', '15 min'], ['1h', '1 h'], ['6h', '6 h'], ['24h', '24 h'], ['7d', '7 d']];
 
 // Redraw a block only when its data changed, so keyboard focus and text selection survive the two-second refresh.
@@ -56,7 +56,7 @@ function ipButton(ip, own) {
   const b = el('button', 'link', ip);
   b.type = 'button';
   b.title = 'Show only this source';
-  b.addEventListener('click', (ev) => { ev.stopPropagation(); pick({ ip, endpoint: '' }); });
+  b.addEventListener('click', (ev) => { ev.stopPropagation(); pick({ ip, endpoint: '', port: 0 }); });
   if (!own) return b;
   const box = el('span');
   box.append(b, el('span', 'tag', 'own'));
@@ -80,7 +80,7 @@ function renderWho(v) {
     const b = el('button', '', label);
     b.type = 'button';
     b.setAttribute('aria-pressed', String(view.who === id));
-    b.addEventListener('click', () => pick({ who: id, ip: '', endpoint: '' }));
+    b.addEventListener('click', () => pick({ who: id, ip: '', endpoint: '', port: 0 }));
     seg.append(b);
   }
   const parts = [fact('outside', 'Outside world:', v.outside, ''), fact('', 'Your own machines:', v.own, own.length ? ` (${own.join(', ')})` : ''), seg];
@@ -144,7 +144,7 @@ function renderSources(v) {
 
 function renderScope(v) {
   const box = $('scope');
-  if (!view.ip && !view.endpoint) { box.hidden = true; return; }
+  if (!view.ip && !view.endpoint && !view.port) { box.hidden = true; return; }
   const parts = [];
   if (view.ip) {
     const r = v.top.find((t) => t.ip === view.ip);
@@ -152,13 +152,19 @@ function renderScope(v) {
     parts.push(el('span', 'facts', r
       ? `${plural(r.requests, 'request')}, ${plural(r.connections, 'pre-HTTP connection')}, ${plural(r.endpoints, 'endpoint')}, ${plural(r.user_agents, 'user-agent')}. First seen ${clock(r.first)}, last seen ${clock(r.last)}.`
       : 'No event from this source in the window.'));
+  } else if (view.port) {
+    const r = v.ports.find((p) => p.port === view.port);
+    parts.push(el('span', 'subject', `Port ${view.port}`));
+    parts.push(el('span', 'facts', r
+      ? `${plural(r.requests, 'request')}, ${plural(r.connections, 'pre-HTTP connection')}, ${plural(r.ips, 'source')}.${r.last ? ` Last seen ${clock(r.last)}.` : ''}`
+      : 'No event on this port in the window.'));
   } else {
     parts.push(el('span', 'subject', `Endpoint ${view.endpoint}`));
     parts.push(el('span', 'facts', `${plural(v.requests + v.connections, 'event')} from ${plural(v.ips, 'source')}.`));
   }
   const clear = el('button', '', 'Show all traffic');
   clear.type = 'button';
-  clear.addEventListener('click', () => pick({ ip: '', endpoint: '' }));
+  clear.addEventListener('click', () => pick({ ip: '', endpoint: '', port: 0 }));
   box.replaceChildren(...parts, clear);
   box.hidden = false;
 }
@@ -258,13 +264,28 @@ function renderTables(v) {
       const b = el('button', 'link', e.id);
       b.type = 'button';
       b.title = 'Show only this endpoint';
-      b.addEventListener('click', () => pick({ endpoint: e.id, ip: '' }));
+      b.addEventListener('click', () => pick({ endpoint: e.id, ip: '', port: 0 }));
       return row([[b, 'wide'], [count(e.count), 'num'], [count(e.ips), 'num']]);
     }) : [emptyRow('No endpoint in this window.', 3)]);
 }
 
+function renderPorts(v) {
+  if (!changed('ports', [v.ports, view.port])) return;
+  table('ports', [['Port'], ['Requests', 'num'], ['Pre-HTTP', 'num'], ['Sources', 'num'], ['Last seen']],
+    v.ports.length ? v.ports.map((p) => {
+      const b = el('button', 'link', String(p.port));
+      b.type = 'button';
+      b.title = 'Show only this port';
+      b.setAttribute('aria-pressed', String(p.port === view.port));
+      b.addEventListener('click', () => pick({ port: p.port === view.port ? 0 : p.port, ip: '', endpoint: '' }));
+      const tr = row([[b], [count(p.requests), 'num'], [count(p.connections), 'num'], [count(p.ips), 'num'], [p.last ? clock(p.last) : '']]);
+      if (p.port === view.port) tr.className = 'selected';
+      return tr;
+    }) : [emptyRow('No port configured.', 5)]);
+}
+
 function renderFeed(v) {
-  const key = `${view.window}|${view.who}|${view.q}|${view.ip}|${view.endpoint}|${v.feed ? v.feed.length : 0}|${v.feed && v.feed[0] ? v.feed[0].seq : 0}`;
+  const key = `${view.window}|${view.who}|${view.q}|${view.ip}|${view.endpoint}|${view.port}|${v.feed ? v.feed.length : 0}|${v.feed && v.feed[0] ? v.feed[0].seq : 0}`;
   if (key === view.feedKey) return;
   view.feedKey = key;
   const rows = (v.feed || []).map((e) => {
@@ -373,12 +394,13 @@ async function tick(force) {
   clearTimeout(timer);
   if (!view.paused || force) {
     try {
-      const p = new URLSearchParams({ window: view.window, who: view.who, q: view.q, ip: view.ip, endpoint: view.endpoint });
+      const p = new URLSearchParams({ window: view.window, who: view.who, q: view.q, ip: view.ip, endpoint: view.endpoint, port: view.port || '' });
       const res = await fetch(`api/state?${p}`);
       if (!res.ok) throw new Error(String(res.status));
       const v = await res.json();
       v.top = v.top || [];
       v.endpoints = v.endpoints || [];
+      v.ports = v.ports || [];
       renderSources(v);
       renderWho(v);
       renderScope(v);
@@ -386,6 +408,7 @@ async function tick(force) {
       renderTimeline(v);
       renderFlow(v);
       renderTables(v);
+      renderPorts(v);
       renderFeed(v);
       $('offline').hidden = true;
     } catch (err) {

@@ -36,6 +36,7 @@ The source address is the TCP peer of the connection. The gateway ignores forwar
 | Source status | Shows if each data source is connected and when it last gave data. |
 | Time window and filter | Select the period. Enter text to match a source address, path, user-agent, route, probe class, or status. |
 | Outside world and own machines | Counts the events and sources of the window on each side. The page shows outside traffic only, until you select **Own machines** or **Both**. Rows from your own addresses carry the label `own`. |
+| Listener ports | Shows traffic on each configured listener port with request count, pre-HTTP connection count, source count, and last seen time. Select a port to see only its traffic. |
 | Sources to endpoints | Shows which source addresses reached which port and endpoint. Line width shows the event count. Select a source or an endpoint to see only its traffic. |
 | Sources and Endpoints tables | Show the same data as text, with counts, the last time seen, and the most used user-agent. |
 | Requests and connections | Shows the newest 300 events of the selection. Select a time to open the full event: query parameters, headers, and body. |
@@ -52,6 +53,7 @@ Select **Pause** to stop the refresh while you read.
 | `-dir` | none | Read capture files from a local directory. SSH is not used. |
 | `-days` | `2` | UTC days of capture files to load, from 1 to 7. |
 | `-own` | none | Addresses of your own machines, separated by commas: your egress address and the host. The page counts their traffic apart from outside traffic and shows outside traffic by default. Without this option, your tests count as outside traffic. |
+| `-ports` | `80,443,1234,8000,8080,11434` | Comma-separated listener ports always listed in the ports table, from 1 to 16 ports, each 1 to 65535. |
 | `-service` | `attackbox-public-443` | New Relic service name of the gateway. |
 | `-keep` | `200000` | Events kept in memory. |
 

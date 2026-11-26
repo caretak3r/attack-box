@@ -223,6 +223,14 @@ type ipRow struct {
 	Endpoints   int       `json:"endpoints"`
 }
 
+type portRow struct {
+	Port        int       `json:"port"`
+	Requests    int       `json:"requests"`
+	Connections int       `json:"connections"`
+	IPs         int       `json:"ips"`
+	Last        time.Time `json:"last,omitzero"`
+}
+
 type node struct {
 	ID    string `json:"id"`
 	Count int    `json:"count"`
@@ -257,13 +265,14 @@ type view struct {
 	FlowTargets []node                  `json:"flow_targets"`
 	FlowLinks   []link                  `json:"flow_links"`
 	Feed        []event                 `json:"feed"`
+	Ports       []portRow               `json:"ports"`
 }
 
 const other = "other"
 
 // state aggregates the events of one window. who selects outside traffic (default), "own" or "all";
-// ip and endpoint match exactly; q matches a substring.
-func (s *store) state(now time.Time, window time.Duration, who, ip, endpoint, q string) view {
+// ip, endpoint and port match exactly; q matches a substring. ports is the list of configured listener ports.
+func (s *store) state(now time.Time, window time.Duration, who, ip, endpoint, q string, port int, ports []int) view {
 	const buckets = 60
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -287,6 +296,11 @@ func (s *store) state(now time.Time, window time.Duration, who, ip, endpoint, q 
 	eps := map[string]*node{}
 	epIPs := map[link]int{} // Source is the IP, Target the endpoint
 	counted := map[string]bool{}
+	type portAgg struct {
+		row portRow
+		ips map[string]bool
+	}
+	portMap := map[int]*portAgg{}
 	for i := len(s.events) - 1; i >= 0; i-- {
 		e := &s.events[i]
 		if e.Time.Before(since) {
@@ -307,6 +321,21 @@ func (s *store) state(now time.Time, window time.Duration, who, ip, endpoint, q 
 		}
 		if (who != "all" && e.Own != (who == "own")) || (ip != "" && e.IP != ip) || (endpoint != "" && e.Endpoint != endpoint) ||
 			(q != "" && !strings.Contains(e.hay, q)) {
+			continue
+		}
+		// Counted before the port filter, so the ports table still shows the other ports while one is selected.
+		pa := portMap[e.Port]
+		if pa == nil {
+			pa = &portAgg{row: portRow{Port: e.Port, Last: e.Time}, ips: map[string]bool{}}
+			portMap[e.Port] = pa
+		}
+		if e.Kind == "connection" {
+			pa.row.Connections++
+		} else {
+			pa.row.Requests++
+		}
+		pa.ips[e.IP] = true
+		if port != 0 && e.Port != port {
 			continue
 		}
 		a := ips[e.IP]
@@ -414,6 +443,16 @@ func (s *store) state(now time.Time, window time.Duration, who, ip, endpoint, q 
 	if len(v.Endpoints) > topSize {
 		v.Endpoints = v.Endpoints[:topSize]
 	}
+	for _, p := range ports {
+		if portMap[p] == nil {
+			portMap[p] = &portAgg{row: portRow{Port: p}, ips: map[string]bool{}}
+		}
+	}
+	for _, pa := range portMap {
+		pa.row.IPs = len(pa.ips)
+		v.Ports = append(v.Ports, pa.row)
+	}
+	sort.Slice(v.Ports, func(i, j int) bool { return v.Ports[i].Port < v.Ports[j].Port })
 	return v
 }
 
@@ -640,7 +679,7 @@ var windows = map[string]time.Duration{"15m": 15 * time.Minute, "1h": time.Hour,
 
 // handler serves the page and the JSON API. It accepts only the loopback names in hosts,
 // so a web page on another origin cannot read captured data through DNS rebinding.
-func handler(st *store, hosts map[string]bool) http.Handler {
+func handler(st *store, hosts map[string]bool, ports []int) http.Handler {
 	mux := http.NewServeMux()
 	web, _ := fs.Sub(webFS, "web")
 	mux.Handle("/", http.FileServerFS(web))
@@ -654,7 +693,11 @@ func handler(st *store, hosts map[string]bool) http.Handler {
 		if !ok {
 			window = time.Hour
 		}
-		writeJSON(w, st.state(time.Now(), window, q.Get("who"), q.Get("ip"), q.Get("endpoint"), clip(q.Get("q"), 200)))
+		port, _ := strconv.Atoi(q.Get("port"))
+		if port < 1 || port > 65535 {
+			port = 0
+		}
+		writeJSON(w, st.state(time.Now(), window, q.Get("who"), q.Get("ip"), q.Get("endpoint"), clip(q.Get("q"), 200), port, ports))
 	})
 	mux.HandleFunc("/api/event", func(w http.ResponseWriter, r *http.Request) {
 		seq, _ := strconv.ParseUint(r.URL.Query().Get("seq"), 10, 64)
@@ -702,9 +745,23 @@ func main() {
 	days := flag.Int("days", 2, "UTC days of capture files to load (1 to 7)")
 	service := flag.String("service", "attackbox-public-443", "New Relic service name of the public gateway")
 	port := flag.Int("port", 443, "listener port for records that do not carry one")
+	portsFlag := flag.String("ports", "80,443,1234,8000,8080,11434", "comma-separated listener ports always listed")
 	keep := flag.Int("keep", 200000, "events kept in memory")
 	own := flag.String("own", "", "comma-separated addresses of your own machines, for example your egress address and the host; the page shows their traffic apart from outside traffic")
 	flag.Parse()
+	var ports []int
+	for _, s := range strings.Split(*portsFlag, ",") {
+		p, parseErr := strconv.Atoi(strings.TrimSpace(s))
+		if parseErr != nil || p < 1 || p > 65535 {
+			fmt.Fprintln(os.Stderr, "attackbox-live: -ports must be 1 to 16 comma-separated ports, each 1 to 65535")
+			os.Exit(2)
+		}
+		ports = append(ports, p)
+	}
+	if len(ports) < 1 || len(ports) > 16 {
+		fmt.Fprintln(os.Stderr, "attackbox-live: -ports must be 1 to 16 comma-separated ports, each 1 to 65535")
+		os.Exit(2)
+	}
 
 	hosts, err := loopbackHosts(*listen)
 	c := &capture{ssh: *alias, dir: *remote, days: *days, port: *port, lines: map[string]int{}}
@@ -743,7 +800,7 @@ func main() {
 		st.setStatus("newrelic", "off", "set NEW_RELIC_API_KEY and NEW_RELIC_ACCOUNT_ID to see pre-HTTP connections", time.Time{})
 	}
 
-	srv := &http.Server{Addr: *listen, Handler: handler(st, hosts), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: *listen, Handler: handler(st, hosts, ports), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
 		_ = srv.Close()

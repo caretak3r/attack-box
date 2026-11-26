@@ -75,7 +75,7 @@ func TestStateAggregatesAndFilters(t *testing.T) {
 	add(event{Time: now.Add(-2 * time.Minute), Kind: "connection", Source: "newrelic", id: "c1", IP: "203.0.113.1", Outcome: "tls_failed"})
 	add(event{Time: now.Add(-3 * time.Hour), Kind: "connection", Source: "newrelic", id: "c0", IP: "203.0.113.3", Outcome: "no_data"})
 
-	v := st.state(now, time.Hour, "", "", "", "")
+	v := st.state(now, time.Hour, "", "", "", "", 0, nil)
 	if v.Requests != 3 || v.Connections != 1 || v.IPs != 2 || len(v.Feed) != 4 {
 		t.Fatalf("requests=%d connections=%d ips=%d feed=%d", v.Requests, v.Connections, v.IPs, len(v.Feed))
 	}
@@ -89,13 +89,13 @@ func TestStateAggregatesAndFilters(t *testing.T) {
 	if strings.Contains(string(raw), "secret-body") {
 		t.Fatal("the state view must not carry bodies")
 	}
-	if v := st.state(now, time.Hour, "", "203.0.113.2", "", ""); v.Requests != 1 || v.Connections != 0 {
+	if v := st.state(now, time.Hour, "", "203.0.113.2", "", "", 0, nil); v.Requests != 1 || v.Connections != 0 {
 		t.Fatalf("ip filter: %+v", v)
 	}
-	if v := st.state(now, time.Hour, "", "", ":443 pre-HTTP tls_failed", ""); v.Requests != 0 || v.Connections != 1 {
+	if v := st.state(now, time.Hour, "", "", ":443 pre-HTTP tls_failed", "", 0, nil); v.Requests != 0 || v.Connections != 1 {
 		t.Fatalf("endpoint filter: %+v", v)
 	}
-	if v := st.state(now, time.Hour, "", "", "", "ZGRAB"); v.Requests != 1 {
+	if v := st.state(now, time.Hour, "", "", "", "ZGRAB", 0, nil); v.Requests != 1 {
 		t.Fatalf("text filter: %+v", v)
 	}
 	if e, ok := st.find(4); !ok || e.Body != "secret-body" {
@@ -111,7 +111,7 @@ func TestStateSeparatesOwnTraffic(t *testing.T) {
 		st.add(event{Time: now.Add(-time.Minute), Kind: "request", Source: "capture", IP: ip})
 	}
 	for who, want := range map[string]int{"": 1, "own": 2, "all": 3} {
-		v := st.state(now, time.Hour, who, "", "", "")
+		v := st.state(now, time.Hour, who, "", "", "", 0, nil)
 		if v.Requests != want || v.Outside != (tally{1, 1}) || v.Mine != (tally{2, 1}) {
 			t.Fatalf("who=%q: requests=%d outside=%+v own=%+v", who, v.Requests, v.Outside, v.Mine)
 		}
@@ -129,6 +129,61 @@ func TestStoreKeepsNewestEvents(t *testing.T) {
 	}
 }
 
+func TestPortsTableAndFiltering(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	st := newStore(1000)
+	st.own = map[string]bool{"198.51.100.9": true} // own traffic must not count while the page shows outside traffic
+	st.add(event{Time: now.Add(-10 * time.Minute), Kind: "request", Source: "capture", IP: "203.0.113.1", Port: 443, Endpoint: ":443 /v1"})
+	st.add(event{Time: now.Add(-8 * time.Minute), Kind: "request", Source: "capture", IP: "203.0.113.2", Port: 8080, Endpoint: ":8080 /test"})
+	st.add(event{Time: now.Add(-6 * time.Minute), Kind: "connection", Source: "newrelic", IP: "203.0.113.3", Port: 8080, Endpoint: ":8080 pre-HTTP", id: "c1"})
+	st.add(event{Time: now.Add(-4 * time.Minute), Kind: "request", Source: "capture", IP: "203.0.113.1", Port: 11434, Endpoint: ":11434 /api"})
+	st.add(event{Time: now.Add(-2 * time.Minute), Kind: "request", Source: "capture", IP: "198.51.100.9", Port: 80, Endpoint: ":80 /own"})
+	ports := []int{80, 443, 1234, 8000, 8080, 11434}
+	v := st.state(now, time.Hour, "", "", "", "", 0, ports)
+	if len(v.Ports) != 6 {
+		t.Fatalf("ports table should have 6 rows, got %d", len(v.Ports))
+	}
+	var p443, p8080, p80 portRow
+	for _, p := range v.Ports {
+		if p.Port == 443 {
+			p443 = p
+		} else if p.Port == 8080 {
+			p8080 = p
+		} else if p.Port == 80 {
+			p80 = p
+		}
+	}
+	if p443.Requests != 1 || p443.Connections != 0 || p443.IPs != 1 {
+		t.Fatalf("port 443 = %+v", p443)
+	}
+	if p8080.Requests != 1 || p8080.Connections != 1 || p8080.IPs != 2 {
+		t.Fatalf("port 8080 = %+v", p8080)
+	}
+	if p80.Requests != 0 || p80.Connections != 0 || p80.IPs != 0 {
+		t.Fatalf("port 80 should be zero, got %+v", p80)
+	}
+	vFiltered := st.state(now, time.Hour, "", "", "", "", 8080, ports)
+	if vFiltered.Requests != 1 || vFiltered.Connections != 1 || len(vFiltered.Feed) != 2 {
+		t.Fatalf("port=8080 filter: requests=%d connections=%d feed=%d", vFiltered.Requests, vFiltered.Connections, len(vFiltered.Feed))
+	}
+	if len(vFiltered.Endpoints) != 2 {
+		t.Fatalf("port=8080 filter endpoints = %+v", vFiltered.Endpoints)
+	}
+	if len(vFiltered.Ports) != 6 {
+		t.Fatalf("port filter should not narrow ports table, got %d rows", len(vFiltered.Ports))
+	}
+	var p8080Filtered portRow
+	for _, p := range vFiltered.Ports {
+		if p.Port == 8080 {
+			p8080Filtered = p
+			break
+		}
+	}
+	if p8080Filtered.Requests != 1 || p8080Filtered.Connections != 1 || p8080Filtered.IPs != 2 {
+		t.Fatalf("port 8080 in filtered view = %+v", p8080Filtered)
+	}
+}
+
 func TestHandlerRefusesOtherOriginsAndMethods(t *testing.T) {
 	hosts, err := loopbackHosts("127.0.0.1:8765")
 	if err != nil {
@@ -137,7 +192,7 @@ func TestHandlerRefusesOtherOriginsAndMethods(t *testing.T) {
 	if _, err := loopbackHosts("0.0.0.0:8765"); err == nil {
 		t.Fatal("accepted a non-loopback listen address")
 	}
-	h := handler(newStore(1000), hosts)
+	h := handler(newStore(1000), hosts, []int{80, 443})
 	do := func(method, host, target string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, target, nil)
 		r.Host = host
