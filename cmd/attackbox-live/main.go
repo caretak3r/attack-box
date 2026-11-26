@@ -63,6 +63,7 @@ type event struct {
 	BodyBytes     int64       `json:"body_bytes,omitempty"`
 	BodyTruncated bool        `json:"body_truncated,omitempty"`
 	BodySHA256    string      `json:"body_sha256,omitempty"`
+	Preview       string      `json:"preview,omitempty"`
 	Headers       [][2]string `json:"headers,omitempty"`
 	Body          string      `json:"body,omitempty"`
 
@@ -73,6 +74,63 @@ type event struct {
 func clip(s string, n int) string {
 	if len(s) > n {
 		return strings.ToValidUTF8(s[:n], "")
+	}
+	return s
+}
+
+// extractPreview derives a plain-text preview from the request body for the feed.
+func extractPreview(body string) string {
+	if body == "" {
+		return ""
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(body), &obj); err == nil {
+		if s, ok := obj["prompt"].(string); ok && s != "" {
+			return s
+		}
+		if msgs, ok := obj["messages"].([]any); ok && len(msgs) > 0 {
+			if last, ok := msgs[len(msgs)-1].(map[string]any); ok {
+				if content, ok := last["content"].(string); ok && content != "" {
+					return content
+				}
+				if parts, ok := last["content"].([]any); ok {
+					var texts []string
+					for _, p := range parts {
+						if pm, ok := p.(map[string]any); ok {
+							if text, ok := pm["text"].(string); ok && text != "" {
+								texts = append(texts, text)
+							}
+						}
+					}
+					if len(texts) > 0 {
+						return strings.Join(texts, " ")
+					}
+				}
+			}
+		}
+		if s, ok := obj["input"].(string); ok && s != "" {
+			return s
+		}
+		if arr, ok := obj["input"].([]any); ok && len(arr) > 0 {
+			if s, ok := arr[0].(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return body
+}
+
+// cleanPreview makes one line of at most 160 runes; only the start of the text is read.
+func cleanPreview(s string) string {
+	s = strings.ToValidUTF8(s[:min(len(s), 1024)], "")
+	s = strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if r < ' ' || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)), " ")
+	if r := []rune(s); len(r) > 160 {
+		return string(r[:160]) + "…"
 	}
 	return s
 }
@@ -93,8 +151,9 @@ func (e *event) finish() {
 	default:
 		e.Endpoint = p + "/unmatched"
 	}
+	e.Preview = cleanPreview(extractPreview(e.Body))
 	e.hay = strings.ToLower(strings.Join([]string{e.IP, e.Method, e.Target, e.Host, e.UserAgent, e.Route,
-		e.Probe, e.Outcome, e.Model, strconv.Itoa(e.Status)}, "\n"))
+		e.Probe, e.Outcome, e.Model, strconv.Itoa(e.Status), e.Body}, "\n"))
 }
 
 // parseCapture reads one line of the gateway capture file.
@@ -745,7 +804,7 @@ func main() {
 	days := flag.Int("days", 2, "UTC days of capture files to load (1 to 7)")
 	service := flag.String("service", "attackbox-public-443", "New Relic service name of the public gateway")
 	port := flag.Int("port", 443, "listener port for records that do not carry one")
-	portsFlag := flag.String("ports", "80,443,1234,8000,8080,11434", "comma-separated listener ports always listed")
+	portsFlag := flag.String("ports", "80,443,1234,3000,4000,8000,8080,8188,8888,11434", "comma-separated listener ports always listed")
 	keep := flag.Int("keep", 200000, "events kept in memory")
 	own := flag.String("own", "", "comma-separated addresses of your own machines, for example your egress address and the host; the page shows their traffic apart from outside traffic")
 	flag.Parse()

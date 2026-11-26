@@ -293,7 +293,13 @@ function renderFeed(v) {
     if (e.kind === 'connection') {
       what.append(el('span', 'pre', `no HTTP request: ${e.outcome}`), e.sni ? ` (SNI ${e.sni})` : '');
     } else {
-      what.append(el('span', 'method', e.method || '?'), el('span', 'mono', e.target || `${e.route} (path not exported)`));
+      const line1 = el('div');
+      line1.append(el('span', 'method', e.method || '?'), el('span', 'mono', e.target || `${e.route} (path not exported)`));
+      what.append(line1);
+      if (e.preview) {
+        const line2 = el('div', 'preview', e.preview);
+        what.append(line2);
+      }
     }
     const open = el('button', 'link', clock(e.time));
     open.type = 'button';

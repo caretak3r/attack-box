@@ -165,6 +165,7 @@ tbody tr.selected { background: color-mix(in oklch, var(--accent) 18%, var(--sur
 .s5 { color: var(--bad); }
 .pre { color: var(--connection); }
 .method { color: var(--muted); margin-right: 6px; }
+.preview { color: var(--muted); font-size: 12px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; }
 
 .detail {
   position: fixed; top: 0; right: 0; bottom: 0; z-index: 3;

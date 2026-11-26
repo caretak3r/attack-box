@@ -86,8 +86,8 @@ func TestStateAggregatesAndFilters(t *testing.T) {
 		t.Fatalf("feed head = %+v, links = %d", v.Feed[0], len(v.FlowLinks))
 	}
 	raw, _ := json.Marshal(v)
-	if strings.Contains(string(raw), "secret-body") {
-		t.Fatal("the state view must not carry bodies")
+	if strings.Contains(string(raw), `"body":"`) {
+		t.Fatal("the state view must not carry body fields in the feed")
 	}
 	if v := st.state(now, time.Hour, "", "203.0.113.2", "", "", 0, nil); v.Requests != 1 || v.Connections != 0 {
 		t.Fatalf("ip filter: %+v", v)
@@ -247,5 +247,95 @@ func TestNewRelicRowsBecomeEvents(t *testing.T) {
 	_, ok3 := n.event(rows[2])
 	if !ok1 || !ok2 || ok3 || c.Endpoint != ":443 pre-HTTP not_tls" || r.Endpoint != ":443 /unmatched (vcs)" || r.Status != 404 || r.IP != "203.0.113.7" {
 		t.Fatalf("connection=%+v request=%+v ok=%v,%v,%v", c, r, ok1, ok2, ok3)
+	}
+}
+
+func TestPreviewExtraction(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"prompt", `{"prompt":"Tell me a joke"}`, "Tell me a joke"},
+		{"messages string content", `{"messages":[{"role":"user","content":"Hello"}]}`, "Hello"},
+		{"messages parts content", `{"messages":[{"role":"user","content":[{"type":"text","text":"First"},{"type":"text","text":"Second"}]}]}`, "First Second"},
+		{"input string", `{"input":"What is 2+2?"}`, "What is 2+2?"},
+		{"input array", `{"input":["First item","Second item"]}`, "First item"},
+		{"non-json body", "plain text request", "plain text request"},
+		{"empty body", "", ""},
+		{"whitespace collapse", `{"prompt":"Line 1\n\t  Line 2\r\n  Line 3"}`, "Line 1 Line 2 Line 3"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := cleanPreview(extractPreview(tc.body))
+			if got != tc.want {
+				t.Errorf("extractPreview(%q) = %q, want %q", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPreviewClipping(t *testing.T) {
+	long := strings.Repeat("a", 200)
+	got := cleanPreview(long)
+	r := []rune(got)
+	if len(r) != 161 || !strings.HasSuffix(got, "…") {
+		t.Errorf("long preview has %d runes, want 161 with ellipsis", len(r))
+	}
+}
+
+func TestStateFeedHasPreviewNotBody(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	st := newStore(1000)
+	add := func(e event) {
+		e.Port = 443
+		e.finish()
+		st.add(e)
+	}
+	add(event{Time: now.Add(-1 * time.Minute), Kind: "request", Source: "capture", IP: "203.0.113.1", Method: "POST", Target: "/v1/chat/completions", Body: `{"prompt":"secret test"}`})
+	add(event{Time: now.Add(-2 * time.Minute), Kind: "request", Source: "capture", IP: "203.0.113.2", Method: "POST", Target: "/api", Body: `{"messages":[{"role":"user","content":"another secret"}]}`})
+	add(event{Time: now.Add(-3 * time.Minute), Kind: "request", Source: "capture", IP: "203.0.113.3", Method: "GET", Target: "/health"})
+
+	v := st.state(now, time.Hour, "", "", "", "", 0, nil)
+	if len(v.Feed) != 3 {
+		t.Fatalf("feed length = %d, want 3", len(v.Feed))
+	}
+	raw, _ := json.Marshal(v.Feed)
+	if strings.Contains(string(raw), "secret") && !strings.Contains(string(raw), "preview") {
+		t.Fatal("feed must not contain body field with secrets")
+	}
+	for _, e := range v.Feed {
+		if e.Body != "" {
+			t.Fatal("feed must not contain body field")
+		}
+	}
+	if v.Feed[0].Preview != "secret test" || v.Feed[1].Preview != "another secret" || v.Feed[2].Preview != "" {
+		t.Errorf("previews = %q, %q, %q", v.Feed[0].Preview, v.Feed[1].Preview, v.Feed[2].Preview)
+	}
+}
+
+func TestTextFilterMatchesBody(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	st := newStore(1000)
+	add := func(e event) {
+		e.Port = 443
+		e.finish()
+		st.add(e)
+	}
+	add(event{Time: now.Add(-1 * time.Minute), Kind: "request", Source: "capture", IP: "203.0.113.1", Method: "POST", Target: "/api", Body: `{"prompt":"unicorn rainbow"}`})
+	add(event{Time: now.Add(-2 * time.Minute), Kind: "request", Source: "capture", IP: "203.0.113.2", Method: "GET", Target: "/health?check=ok"})
+	add(event{Time: now.Add(-3 * time.Minute), Kind: "request", Source: "capture", IP: "203.0.113.3", Method: "POST", Target: "/api", Body: `{"prompt":"normal request"}`})
+
+	v := st.state(now, time.Hour, "", "", "", "unicorn", 0, nil)
+	if v.Requests != 1 {
+		t.Errorf("text filter 'unicorn' found %d requests, want 1", v.Requests)
+	}
+	if len(v.Feed) != 1 || v.Feed[0].IP != "203.0.113.1" {
+		t.Errorf("text filter matched wrong request")
+	}
+
+	v = st.state(now, time.Hour, "", "", "", "check", 0, nil)
+	if v.Requests != 1 || v.Feed[0].IP != "203.0.113.2" {
+		t.Errorf("text filter 'check' should match query string")
 	}
 }
