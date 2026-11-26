@@ -1,6 +1,6 @@
 # Inspect public HTTPS traffic
 
-The isolated public gateway publishes six TCP ports on the public IPv4 address. Port 443 uses TLS and maps to container port 8443. Ports 80, 1234, 8000, 8080, and 11434 use plain HTTP. Each plain port maps to container port 20000 plus the public port. All ports give the same synthetic responses, and each record keeps the port that the request used.
+The isolated public gateway publishes ten TCP ports on the public IPv4 address. Port 443 uses TLS and maps to container port 8443. Ports 80, 1234, 3000, 4000, 8000, 8080, 8188, 8888, and 11434 use plain HTTP. Each plain port maps to container port 20000 plus the public port. All ports give the same synthetic responses to the route families, and each record keeps the port that the request used.
 
 For a release with structured request spans, open **Query your data** in New Relic. Select the ingest account. Run this NRQL query:
 
@@ -23,6 +23,24 @@ SINCE 1 hour ago LIMIT 100
 ## Models
 
 The gateway serves these model names: `local-instruct-8b`, `gpt-4o`, `gpt-4o-mini`, `gpt-4.1`, `gpt-4.1-mini`, `o3-mini`, `gpt-3.5-turbo`, `claude-3-5-sonnet-20241022`, `claude-3-7-sonnet-20250219`, `claude-sonnet-4-20250514`, `claude-3-5-haiku-20241022`, `llama3.1:8b`, `qwen2.5:7b`, `deepseek-r1:8b`, `mistral:7b`, `llama3.3:70b`, `deepseek-r1:70b`, `qwen2.5-coder:32b`, `text-embedding-3-small`, `text-embedding-3-large`, and `nomic-embed-text`. `/models` lists all of them. `/api/tags` lists the local names with an Ollama tag. A client can add `:latest` to a name. A request without a model uses `local-instruct-8b`. Other names return 404. The answer names the requested model.
+
+The names that start with `gpt-`, `o3-`, `claude-`, or `text-embedding-` are hosted API names. A local model server does not have them. Thus ports 11434, 1234, 8000, and 8080 do not list them and return 404 for them, and the Ollama routes return 404 for them on every port.
+
+## Answer text
+
+The gateway runs no model. It selects a fixed answer from the text of the last user message, so that a client that tests a model with a short prompt gets the answer that a model usually gives. The rules are in `internal/publicedge/answer.go`:
+
+|Prompt|Answer|
+|---|---|
+|A greeting such as `hi`, `hello`, or `test`, or no text|`Hello! How can I assist you today?`|
+|`Say hello in one word.`|`Hello.`|
+|`Say`, `Reply with`, `Repeat`, or `Print`, then a short text of letters, digits, and simple punctuation|That text|
+|A sum of two small whole numbers, for example `What is 2+2?`|`2 + 2 = 4`|
+|A question about the identity of the model|A sentence for the model family|
+|The capital of France, why the sky is blue, a joke|A fixed sentence|
+|All other text, and text longer than 200 bytes|A request for more details|
+
+The gateway does not run the prompt and does not send it to a program or to a model. The answer comes in pieces that look like tokens. A token limit from the client (`options.num_predict`, `max_tokens`, or `max_completion_tokens`) cuts the answer, and the answer then reports that the limit stopped it. The `deepseek-r1` names send a fixed reasoning text first on the Ollama routes, unless the request has `"think": false`. Each answer waits for a short time for each token, and a larger model waits longer. The token counts and the times in the answer agree with that wait.
 
 ## Credentials
 
@@ -67,14 +85,31 @@ The gateway answers a request by the end of its path. It does not learn routes f
 |`/api/create`|POST|Ollama `success` status|
 |`/api/delete`|DELETE|Empty 200|
 |`/api/embed`, `/api/embeddings`|POST|Ollama embedding|
+|`/mcp`|POST|Model Context Protocol answer, one JSON-RPC message for each request|
 
 Before the ending, the path can contain up to four tokens from this list: `v1`, `v2`, `v3`, `api`, `openai`, `azure`, `llm`, `ai`, `proxy`, `gateway`, `inference`, `litellm`, `ollama`, `anthropic`, `deployments/{deployment}`, and `engines/{model}`. For example, `/v1/api/completions` and `/litellm/anthropic/v1/messages` match, and `http.route` contains that path. A deployment or engine name replaces its token with `{deployment}` or `{model}`. Other paths return 404 with `http.route` set to `/unmatched`. A wrong method on a matched path returns 405.
 
 The Ollama routes from `/api/show` to `/api/embeddings` read the model from `model` or from `name`. `/api/show`, `/api/delete`, `/api/embed`, and `/api/embeddings` return 404 for a name that is not in the model list. `/api/pull` reports a listed model as up to date. For another name it answers `pull model manifest: file does not exist`. The gateway stores nothing. A name from `/api/create` or `/api/pull` does not appear in `/api/tags`, and a deleted model stays in the list. The requested name is in the local request capture only.
 
-## Key on port 443
+The Ollama answers were compared with Ollama 0.40.11: the status codes, the headers, the order of the members, and the error text. A request to `/api/generate` without a prompt, or to `/api/chat` without messages, gets the answer that reports a loaded model. An embedding has 768 values and depends on the input text only. One case is different from Ollama: `/api/pull` with `"stream": false` for an unknown name returns 404, where Ollama returns 500, because a 5xx status marks the span as an error.
 
-On port 443, a route family returns 401 with a JSON error until the request contains a credential. Each credential source in the Credentials section is sufficient. The gateway does not examine the value. Thus a client that wants an answer shows the key that it has. The span keeps the route label and has `http.response.status_code` set to 401. The plain ports do not ask for a credential. An unmatched path on port 443 returns 404 without a credential. The container healthcheck sends a fixed credential.
+## MCP endpoint
+
+A path that ends with `/mcp` answers the Model Context Protocol over HTTP. `initialize` returns the protocol version, a server name, and an `Mcp-Session-Id` header. `tools/list` returns four tools: `run_command`, `read_file`, `query_database`, and `http_request`. `tools/call` returns an error result. The gateway runs no command, reads no file, and opens no connection. The tool name and the arguments of a call are in the local request capture only.
+
+The span has `http.route` set to the `/mcp` path and `attackbox.mcp.method` set to `initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`, or `other`. Run this query to see what clients do:
+
+```sql
+FROM Span SELECT count(*), uniqueCount(`client.address`)
+WHERE `service.name` = 'attackbox-public-443' AND `attackbox.mcp.method` IS NOT NULL
+FACET `attackbox.mcp.method`, `server.port` SINCE 7 days ago
+```
+
+## Key on ports 443, 3000, and 4000
+
+On port 443, a route family returns 401 with a JSON error until the request contains a credential. Each credential source in the Credentials section is sufficient. The gateway does not examine the value. Thus a client that wants an answer shows the key that it has. The span keeps the route label and has `http.response.status_code` set to 401. An unmatched path on port 443 returns 404 without a credential. The container healthcheck sends a fixed credential.
+
+Ports 3000 and 4000 do the same with the error text of their product. Port 4000 thus accepts each key that a client tries, for example a default key from the product documents. The other plain ports do not ask for a credential.
 
 ## Fake env file
 
@@ -95,16 +130,22 @@ To find the client that fetched a key, select `client.address` from the spans th
 
 ## Port answers
 
-Four plain ports also answer like the server that usually listens on that port. The route families above stay the same on every port. Ports 80 and 443 have no port answers.
+Eight plain ports also answer like the server that usually listens on that port. The route families above stay the same on every port. Ports 80 and 443 have no port answers.
 
-|Port|Looks like|`GET` paths|Unmatched request|`Server` header|
+|Port|Looks like|Fixed paths|Unmatched request|`Server` header|
 |---|---|---|---|---|
 |11434|Ollama|`/` returns `Ollama is running`. `/api/version` returns JSON. `/api/ps` shows `llama3.3:70b` as loaded.|404 text|none|
 |1234|LM Studio|`/api/v0/models` returns the local model names.|200 with a JSON error that contains the method and the path|none|
 |8000|vLLM|`/health` returns an empty 200. `/version` returns JSON.|404 `{"detail":"Not Found"}`|`uvicorn`|
 |8080|llama.cpp|`/` returns a small HTML page. `/health` returns `{"status":"ok"}`.|404 JSON error|`llama.cpp`|
+|3000|Open WebUI|`/` returns the page shell. `/health`, `/api/version`, and `/api/config` return JSON. `/api/config` reports that no account exists. `POST /api/v1/auths/signup` returns a random session token. `POST /api/v1/auths/signin` returns 400.|404 `{"detail":"Not Found"}`|`uvicorn`|
+|4000|LiteLLM proxy|`/` returns the API page. `/health/liveliness`, `/health/liveness`, and `/health/readiness` return JSON.|404 `{"detail":"Not Found"}`|`uvicorn`|
+|8188|ComfyUI|`/` returns the page shell. `/system_stats`, `/queue`, `/history`, and `/prompt` return JSON, also below `/api`. `POST /prompt` returns a random prompt ID.|404 text|`Python/3.12 aiohttp/3.12.15`|
+|8888|Jupyter Server|`/`, `/lab`, and `/tree` go to `/login`. `/login` returns the form, and `POST /login` returns 401. `/api` returns the version. Six paths below `/api` return 403.|404 JSON error|`TornadoServer/6.5.2`|
 
 A port answer path sets `http.route` to that path, for example `/` or `/health`, and such a request has no `attackbox.probe.class`. Use `server.port` to tell the ports apart. All spans keep `attackbox.persona` set to `cloud-gateway`. On port 1234 an unmatched request has `http.route` set to `/unmatched` and status 200. The version numbers are fixed text.
+
+A product port sends only the headers of its product. Ports 80 and 443 also send `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. The session token from the Open WebUI sign-up opens nothing. A client that sends it later has a credential of type `jwt`. A queued ComfyUI workflow and a Jupyter password are in the local request capture only; nothing runs a workflow. Only the Ollama answers were compared with the real server. The answers of the other products follow their documents.
 
 ## Unmatched requests
 

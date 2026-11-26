@@ -334,25 +334,25 @@ func TestGatewayRouteFamilies(t *testing.T) {
 		{"POST", "/v1/messages", `{"model":"local-instruct-8b","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"x"}]}`, "/v1/messages", 200, "text/event-stream", "event: message_stop"},
 		{"POST", "/v1/messages", `{"model":"claude-3","max_tokens":8,"messages":[{"role":"user","content":"x"}]}`, "/v1/messages", 404, gatewayJSON, "not_found_error"},
 		{"POST", "/v1/messages", `{"model":"local-instruct-8b","messages":[{"role":"user","content":"x"}]}`, "/v1/messages", 400, gatewayJSON, "invalid_request_error"},
-		{"GET", "/api/tags", "", "/api/tags", 200, gatewayJSON, `"local-instruct-8b:latest"`},
-		{"GET", "/api/tags", "", "/api/tags", 200, gatewayJSON, `"name":"deepseek-r1:8b"`},
-		{"POST", "/api/chat", `{"model":"qwen2.5:7b","stream":false,"messages":[{"role":"user","content":"x"}]}`, "/api/chat", 200, gatewayJSON, `"model":"qwen2.5:7b"`},
+		{"GET", "/api/tags", "", "/api/tags", 200, gatewayJSONUTF8, `"local-instruct-8b:latest"`},
+		{"GET", "/api/tags", "", "/api/tags", 200, gatewayJSONUTF8, `"name":"deepseek-r1:8b"`},
+		{"POST", "/api/chat", `{"model":"qwen2.5:7b","stream":false,"messages":[{"role":"user","content":"x"}]}`, "/api/chat", 200, gatewayJSONUTF8, `"model":"qwen2.5:7b"`},
 		{"POST", "/api/chat", `{"model":"local-instruct-8b","messages":[{"role":"user","content":"x"}]}`, "/api/chat", 200, "application/x-ndjson", `"done":true`},
-		{"POST", "/ollama/api/generate", `{"model":"local-instruct-8b:latest","prompt":"x","stream":false}`, "/ollama/api/generate", 200, gatewayJSON, `"response":"Ready."`},
-		{"POST", "/api/generate", `{"model":"llama3","prompt":"x"}`, "/api/generate", 404, gatewayJSON, "model not found"},
-		{"GET", "/api/tags", "", "/api/tags", 200, gatewayJSON, `"name":"llama3.3:70b","model":"llama3.3:70b","size":43`},
-		{"GET", "/api/tags", "", "/api/tags", 200, gatewayJSON, `"parameter_size":"8.0B","quantization_level":"Q4_K_M"},"modified_at"`},
-		{"POST", "/api/show", `{"model":"llama3.3:70b"}`, "/api/show", 200, gatewayJSONUTF8, `"parameter_size":"70.0B"`},
-		{"POST", "/api/show", `{"name":"llama3"}`, "/api/show", 404, gatewayJSON, "model not found"},
-		{"POST", "/api/show", `{"stream":false}`, "/api/show", 400, gatewayJSON, "invalid request"},
+		{"POST", "/ollama/api/generate", `{"model":"local-instruct-8b:latest","prompt":"x","stream":false}`, "/ollama/api/generate", 200, gatewayJSONUTF8, `"response":"I'm here to help!`},
+		{"POST", "/api/generate", `{"model":"llama3","prompt":"x"}`, "/api/generate", 404, gatewayJSONUTF8, "model 'llama3' not found"},
+		{"GET", "/api/tags", "", "/api/tags", 200, gatewayJSONUTF8, `"name":"llama3.3:70b","model":"llama3.3:70b","modified_at":"2026-`},
+		{"GET", "/api/tags", "", "/api/tags", 200, gatewayJSONUTF8, `"parameter_size":"8.0B","quantization_level":"Q4_K_M","context_length":131072`},
+		{"POST", "/api/show", `{"model":"llama3.3:70b"}`, "/api/show", 200, gatewayJSONUTF8, `"parameter_size":"70.6B"`},
+		{"POST", "/api/show", `{"name":"llama3"}`, "/api/show", 404, gatewayJSONUTF8, "model 'llama3' not found"},
+		{"POST", "/api/show", `{"stream":false}`, "/api/show", 400, gatewayJSONUTF8, "model is required"},
 		{"POST", "/api/pull", `{"model":"llama3.1:8b"}`, "/api/pull", 200, "application/x-ndjson", `{"status":"writing manifest"}` + "\n" + `{"status":"success"}` + "\n"},
 		{"POST", "/api/pull", `{"name":"other/model:1b"}`, "/api/pull", 200, "application/x-ndjson", `{"status":"pulling manifest"}` + "\n" + `{"error":"pull model manifest: file does not exist"}` + "\n"},
 		{"POST", "/api/pull", `{"model":"other/model:1b","stream":false}`, "/api/pull", 404, gatewayJSONUTF8, "file does not exist"},
 		{"POST", "/api/create", `{"model":"mine","from":"llama3.1:8b","stream":false}`, "/api/create", 200, gatewayJSONUTF8, `{"status":"success"}`},
 		{"DELETE", "/api/delete", `{"model":"mistral:7b"}`, "/api/delete", 200, "", ""},
 		{"POST", "/api/delete", `{"model":"mistral:7b"}`, "/api/delete", 405, "text/plain; charset=utf-8", "Method Not Allowed"},
-		{"POST", "/api/embed", `{"model":"nomic-embed-text","input":"x"}`, "/api/embed", 200, gatewayJSONUTF8, `"model":"nomic-embed-text:latest","embeddings":[[0.0123`},
-		{"POST", "/ollama/api/embeddings", `{"model":"nomic-embed-text","prompt":"x"}`, "/ollama/api/embeddings", 200, gatewayJSONUTF8, `{"embedding":[0.0123`},
+		{"POST", "/api/embed", `{"model":"nomic-embed-text","input":"x"}`, "/api/embed", 200, gatewayJSONUTF8, `"model":"nomic-embed-text:latest","embeddings":[[`},
+		{"POST", "/ollama/api/embeddings", `{"model":"nomic-embed-text","prompt":"x"}`, "/ollama/api/embeddings", 200, gatewayJSONUTF8, `{"embedding":[`},
 		{"POST", "/xyz/completions", `{"prompt":"x"}`, "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found"},
 		{"POST", "/v1/v1/v1/v1/v1/completions", `{"prompt":"x"}`, "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found"},
 		{"GET", "/9f1c2e7a", "", "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found"},
@@ -392,8 +392,8 @@ func TestGatewayPortPersonas(t *testing.T) {
 		contentType, body, server string
 	}{
 		{11434, "GET", "/", "/", 200, "text/plain; charset=utf-8", "Ollama is running", ""},
-		{11434, "GET", "/api/version", "/api/version", 200, gatewayJSONUTF8, `{"version":"0.12.6"}`, ""},
-		{11434, "POST", "/", "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found\n", ""},
+		{11434, "GET", "/api/version", "/api/version", 200, gatewayJSONUTF8, `{"version":"0.40.11"}`, ""},
+		{11434, "POST", "/", "/unmatched", 404, "text/plain", "404 page not found", ""},
 		{443, "GET", "/", "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found\n", ""},
 		{443, "GET", "/api/version", "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found\n", ""},
 		{80, "GET", "/health", "/unmatched", 404, "text/plain; charset=utf-8", "404 page not found\n", ""},
@@ -426,8 +426,8 @@ func TestGatewayPortPersonas(t *testing.T) {
 		})
 	}
 
-	// The native LM Studio list has the local-style names only, and a generic family keeps working on a persona port.
-	for path, want := range map[string][2]string{"/api/v0/models": {`"id":"local-instruct-8b"`, "gpt-4o"}, "/v1/models": {`"id":"gpt-4o"`, "Unexpected endpoint"}} {
+	// A local model server lists the local-style names only, and a generic family keeps working on a persona port.
+	for path, want := range map[string][2]string{"/api/v0/models": {`"id":"local-instruct-8b"`, "gpt-4o"}, "/v1/models": {`"owned_by":"organization_owner"`, "gpt-4o"}} {
 		r := httptest.NewRequest("GET", path, nil)
 		w := httptest.NewRecorder()
 		NewGateway(nil).ServeHTTP(w, r.WithContext(WithPort(r.Context(), 1234)))

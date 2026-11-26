@@ -19,7 +19,7 @@ processors:
       - 'Len(span.links) > 0'
       - 'spanevent.name == spanevent.name'
       - 'span.attributes["server.port"] == nil or not IsInt(span.attributes["server.port"])'
-      - 'not IsMatch(String(span.attributes["server.port"]), "^(80|443|1234|8000|8080|11434)$") or resource.attributes["service.name"] != "attackbox-public-443"'
+      - 'not IsMatch(String(span.attributes["server.port"]), "^(80|443|1234|3000|4000|8000|8080|8188|8888|11434)$") or resource.attributes["service.name"] != "attackbox-public-443"'
       - 'span.attributes["client.address"] != nil and not IsString(span.attributes["client.address"])'
       # Canonical IPv4 octets; keep local, shared, and non-unicast peers out of this public stream.
       - 'IsString(span.attributes["client.address"]) and not IsMatch(span.attributes["client.address"], "^([1-9][0-9]?|1[0-9]{2}|2[01][0-9]|22[0-3])([.](0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}$")'
@@ -38,7 +38,7 @@ processors:
       - 'span.attributes["http.request.method"] != nil and IsString(span.attributes["http.request.method"]) and not IsMatch(span.attributes["http.request.method"], "^(GET|HEAD|POST|PUT|DELETE|CONNECT|OPTIONS|TRACE|PATCH|_OTHER)$")'
       - 'span.name == "public.request" and (span.attributes["http.route"] == nil or not IsString(span.attributes["http.route"]))'
       # Route labels are built by the gateway from allowlisted prefix tokens and family suffixes, or are fixed: port persona paths (gatewayPersonas) and the env-file answer.
-      - 'span.attributes["http.route"] != nil and IsString(span.attributes["http.route"]) and not IsMatch(span.attributes["http.route"], "^(/unmatched|/|/health|/version|/api/version|/api/ps|/api/v0/models|/[.]env|(/(v1|v2|v3|api|openai|azure|llm|ai|proxy|gateway|inference|litellm|ollama|anthropic|deployments/[{]deployment[}]|engines/[{]model[}])){0,4}/(models|chat/completions|completions|embeddings|messages|api/tags|api/chat|api/generate|api/show|api/pull|api/create|api/delete|api/embed|api/embeddings))$")'
+      - 'span.attributes["http.route"] != nil and IsString(span.attributes["http.route"]) and not IsMatch(span.attributes["http.route"], "^(/unmatched|/|/health|/version|/api/version|/api/ps|/api/v0/models|/[.]env|/api/config|/api/v1/auths/sign(up|in)|/health/(liveliness|liveness|readiness)|(/api)?/(system_stats|queue|history|prompt)|/login|/lab|/tree|/api|/api/(status|kernels|contents|sessions|terminals|kernelspecs)|(/(v1|v2|v3|api|openai|azure|llm|ai|proxy|gateway|inference|litellm|ollama|anthropic|deployments/[{]deployment[}]|engines/[{]model[}])){0,4}/(models|chat/completions|completions|embeddings|messages|api/tags|api/chat|api/generate|api/show|api/pull|api/create|api/delete|api/embed|api/embeddings|mcp))$")'
       - 'span.name == "public.request" and not IsInt(span.attributes["attackbox.request.query_params"])'
       - 'span.attributes["attackbox.request.query_params"] != nil and (not IsInt(span.attributes["attackbox.request.query_params"]) or span.attributes["attackbox.request.query_params"] < 0 or span.attributes["attackbox.request.query_params"] > 64)'
       - 'span.attributes["attackbox.probe.class"] != nil and not IsString(span.attributes["attackbox.probe.class"])'
@@ -49,6 +49,8 @@ processors:
       - 'span.attributes["attackbox.credential.value"] != nil and (not IsString(span.attributes["attackbox.credential.value"]) or not IsMatch(span.attributes["attackbox.credential.value"], "^[!-~]{1,512}$") or span.attributes["attackbox.credential.type"] == nil)'
       # The gateway makes this fake key for an env-file answer; it has a fixed form and holds no client text.
       - 'span.attributes["attackbox.canary.key"] != nil and (not IsString(span.attributes["attackbox.canary.key"]) or not IsMatch(span.attributes["attackbox.canary.key"], "^sk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}$"))'
+      # The gateway picks this label from a fixed set of MCP method names; another method is "other".
+      - 'span.attributes["attackbox.mcp.method"] != nil and (not IsString(span.attributes["attackbox.mcp.method"]) or not IsMatch(span.attributes["attackbox.mcp.method"], "^(initialize|notifications/initialized|ping|tools/list|tools/call|other)$"))'
       - 'span.name == "public.request" and (span.attributes["http.response.status_code"] == nil or not IsInt(span.attributes["http.response.status_code"]))'
       - 'span.attributes["http.response.status_code"] != nil and IsInt(span.attributes["http.response.status_code"]) and (span.attributes["http.response.status_code"] < 100 or span.attributes["http.response.status_code"] > 599)'
       - 'span.name == "public.connection" and not IsString(span.attributes["attackbox.connection.outcome"])'
@@ -78,7 +80,7 @@ processors:
       - set(scope.name, "attackbox-public")
       - set(scope.version, "${env:ATTACKBOX_PUBLIC_RELEASE_VERSION}")
       - set(scope.schema_url, "")
-      - keep_keys(span.attributes, ["server.port", "attackbox.persona", "http.route", "http.request.method", "http.response.status_code", "client.address", "attackbox.request.content_type", "http.request.body.size", "gen_ai.request.model", "attackbox.request.stream", "attackbox.request.query_params", "attackbox.probe.class", "attackbox.credential.source", "attackbox.credential.type", "attackbox.credential.value", "attackbox.canary.key"]) where span.name == "public.request"
+      - keep_keys(span.attributes, ["server.port", "attackbox.persona", "http.route", "http.request.method", "http.response.status_code", "client.address", "attackbox.request.content_type", "http.request.body.size", "gen_ai.request.model", "attackbox.request.stream", "attackbox.request.query_params", "attackbox.probe.class", "attackbox.credential.source", "attackbox.credential.type", "attackbox.credential.value", "attackbox.canary.key", "attackbox.mcp.method"]) where span.name == "public.request"
       - keep_keys(span.attributes, ["server.port", "attackbox.accepted_requests", "attackbox.rate_limited_requests", "attackbox.pre_http_connections", "attackbox.rejected_connections", "attackbox.captured_requests", "attackbox.capture_dropped", "attackbox.otel_dropped_spans_total", "attackbox.otel_export_failed_spans_total"]) where span.name == "public.health"
       - keep_keys(span.attributes, ["server.port", "client.address", "attackbox.connection.outcome", "attackbox.tls.sni"]) where span.name == "public.connection"
       # Every public.request attribute is bounded by the filter above; 512 keeps a full credential value.
