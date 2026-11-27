@@ -2,6 +2,7 @@ package publicedge
 
 import (
 	"crypto/rand"
+	_ "embed"
 	"encoding/base64"
 	"fmt"
 	"net/http"
@@ -53,6 +54,8 @@ var gatewayPersonas = map[int]gatewayPersona{
 			"/api/version": gatewayFixed(200, gatewayJSON, `{"version":"0.6.36"}`),
 			// "onboarding" says that no account exists yet: the first sign-up becomes the administrator.
 			"/api/config": gatewayFixed(200, gatewayJSON, `{"status":true,"name":"Open WebUI","version":"0.6.36","default_locale":"","oauth":{"providers":{}},"features":{"auth":true,"auth_trusted_header":false,"enable_signup_password_confirmation":false,"enable_ldap":false,"enable_api_key":true,"enable_signup":true,"enable_login_form":true,"enable_websocket":true,"enable_version_update_check":true},"onboarding":true}`),
+			// The page shell links this icon, and scanners identify the product by its hash.
+			"/static/favicon.png": gatewayFixed(200, "image/png", gatewayOpenWebUIFavicon),
 		},
 		posts: map[string]http.HandlerFunc{
 			"/api/v1/auths/signup": gatewayOpenWebUISignup,
@@ -138,6 +141,12 @@ func gatewayComfyQueue(w http.ResponseWriter, _ *http.Request) {
 }
 
 const gatewayComfyStats = `{"system": {"os": "posix", "ram_total": 134985633792, "ram_free": 118341234688, "comfyui_version": "0.3.68", "required_frontend_version": "1.28.8", "python_version": "3.12.3 (main, Aug 14 2025, 17:47:21) [GCC 13.3.0]", "pytorch_version": "2.8.0+cu128", "embedded_python": false, "argv": ["main.py", "--listen", "0.0.0.0"]}, "devices": [{"name": "cuda:0 NVIDIA RTX A6000 : cudaMallocAsync", "type": "cuda", "index": 0, "vram_total": 51041271808, "vram_free": 5368709120, "torch_vram_total": 0, "torch_vram_free": 0}]}`
+
+// The icon of Open WebUI v0.6.36 (backend/open_webui/static/favicon.png), not changed.
+// Copyright (c) 2023-2025 Timothy Jaeryang Baek (Open WebUI), Open WebUI License.
+//
+//go:embed openwebui_favicon.png
+var gatewayOpenWebUIFavicon string
 
 const gatewayOpenWebUIPage = `<!doctype html>
 <html lang="en">

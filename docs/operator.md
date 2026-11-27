@@ -138,7 +138,7 @@ Eight plain ports also answer like the server that usually listens on that port.
 |1234|LM Studio|`/api/v0/models` returns the local model names.|200 with a JSON error that contains the method and the path|none|
 |8000|vLLM|`/health` returns an empty 200. `/version` returns JSON.|404 `{"detail":"Not Found"}`|`uvicorn`|
 |8080|llama.cpp|`/` returns a small HTML page. `/health` returns `{"status":"ok"}`.|404 JSON error|`llama.cpp`|
-|3000|Open WebUI|`/` returns the page shell. `/health`, `/api/version`, and `/api/config` return JSON. `/api/config` reports that no account exists. `POST /api/v1/auths/signup` returns a random session token. `POST /api/v1/auths/signin` returns 400.|404 `{"detail":"Not Found"}`|`uvicorn`|
+|3000|Open WebUI|`/` returns the page shell. `/static/favicon.png` returns the icon of the product. `/health`, `/api/version`, and `/api/config` return JSON. `/api/config` reports that no account exists. `POST /api/v1/auths/signup` returns a random session token. `POST /api/v1/auths/signin` returns 400.|404 `{"detail":"Not Found"}`|`uvicorn`|
 |4000|LiteLLM proxy|`/` returns the API page. `/health/liveliness`, `/health/liveness`, and `/health/readiness` return JSON.|404 `{"detail":"Not Found"}`|`uvicorn`|
 |8188|ComfyUI|`/` returns the page shell. `/system_stats`, `/queue`, `/history`, and `/prompt` return JSON, also below `/api`. `POST /prompt` returns a random prompt ID.|404 text|`Python/3.12 aiohttp/3.12.15`|
 |8888|Jupyter Server|`/`, `/lab`, and `/tree` go to `/login`. `/login` returns the form, and `POST /login` returns 401. `/api` returns the version. Six paths below `/api` return 403.|404 JSON error|`TornadoServer/6.5.2`|

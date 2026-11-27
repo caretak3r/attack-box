@@ -1,7 +1,9 @@
 package publicedge
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -259,6 +261,12 @@ func TestGatewayProductPorts(t *testing.T) {
 		rec := gatewayDo(t, tc.port, tc.method, tc.target, tc.body)
 		if rec.Code != tc.status || rec.Header().Get("Server") != tc.server || !strings.Contains(rec.Body.String(), tc.want) || rec.Header().Get("Cache-Control") != "" {
 			t.Errorf("%d %s %s = %d %q %s", tc.port, tc.method, tc.target, rec.Code, rec.Header().Get("Server"), rec.Body)
+		}
+	}
+	// The icon must keep the bytes of Open WebUI 0.6.36 on port 3000 and for the host name on port 443.
+	for _, rec := range []*httptest.ResponseRecorder{gatewayDo(t, 3000, "GET", "/static/favicon.png", ""), gatewayDo(t, 443, "GET", "/static/favicon.png", "", "Host", "openwebui.gateway.test")} {
+		if sum := fmt.Sprintf("%x", sha256.Sum256(rec.Body.Bytes())); rec.Code != 200 || rec.Header().Get("Content-Type") != "image/png" || sum != "443e444984c0df30efa5d649cc9c1bc73a81aa01b9ec8e75f1c22dd245c89732" {
+			t.Errorf("Open WebUI icon = %d %q %s", rec.Code, rec.Header().Get("Content-Type"), sum)
 		}
 	}
 	if loc := gatewayDo(t, 8888, "GET", "/", "").Header().Get("Location"); loc != "/login?next=%2Flab" {

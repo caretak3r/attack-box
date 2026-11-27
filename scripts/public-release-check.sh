@@ -117,6 +117,7 @@ paths=(
   internal/observability/tracing.go internal/observability/tracing_test.go
   internal/publicedge/gateway.go internal/publicedge/gateway_test.go internal/publicedge/capture.go internal/publicedge/capture_test.go
   internal/publicedge/answer.go internal/publicedge/answer_test.go internal/publicedge/ollama.go internal/publicedge/personas.go internal/publicedge/mcp.go
+  internal/publicedge/openwebui_favicon.png
   scripts/public-firewall-ledger.sh scripts/test-public-firewall-ledger.sh
   deploy/public-compose.sh deploy/public-otel/config.yaml deploy/public-otel/prepare-socket.sh deploy/public-otel/collector_integration_test.go
   deploy/otel/version.env deploy/systemd/attackbox-public-otel.service deploy/systemd/attackbox-public.service
