@@ -306,3 +306,206 @@ func TestDrainSingleRecordDoesNotWaitForFullBatch(t *testing.T) {
 		t.Fatal("quiet record waited for a batch or flush interval")
 	}
 }
+
+type fakeRejectedStore struct {
+	mu       sync.Mutex
+	rejected []shipper.Entry
+	reasons  []string
+	putErr   error
+}
+
+func (s *fakeRejectedStore) Put(e shipper.Entry, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.putErr != nil {
+		return s.putErr
+	}
+	s.rejected = append(s.rejected, e)
+	s.reasons = append(s.reasons, reason)
+	return nil
+}
+
+func (s *fakeRejectedStore) snapshot() ([]shipper.Entry, []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.rejected), slices.Clone(s.reasons)
+}
+
+type statusBatchSink struct {
+	batchSink
+	status int
+	calls  int
+}
+
+func (s *statusBatchSink) ShipRecords(records []telemetry.Record) error {
+	s.calls++
+	if s.status == 0 || s.status == 202 {
+		return nil
+	}
+	if s.status == 400 || s.status == 413 || s.status == 422 {
+		return &telemetry.RecordRejection{Reason: "http_4xx"}
+	}
+	return errors.New("http error")
+}
+
+func TestDrainHTTP400QuarantinesPermanentRejection(t *testing.T) {
+	entries := []shipper.Entry{eventEntry(t, 1), eventEntry(t, 2)}
+	store := &fakeRejectedStore{}
+	s := &statusBatchSink{status: 400}
+	n, blocked, err := deliver(context.Background(), s, entries, 0, store)
+	if n != 2 || blocked || err != nil {
+		t.Fatalf("400: n=%d blocked=%v err=%v", n, blocked, err)
+	}
+	rejected, reasons := store.snapshot()
+	if len(rejected) != 2 || reasons[0] != "http_4xx" || reasons[1] != "http_4xx" {
+		t.Fatalf("quarantine: %d records, reasons %v", len(rejected), reasons)
+	}
+}
+
+func TestDrainHTTP401BlocksWithoutQuarantine(t *testing.T) {
+	entries := []shipper.Entry{eventEntry(t, 1)}
+	store := &fakeRejectedStore{}
+	s := &statusBatchSink{status: 401}
+	n, blocked, err := deliver(context.Background(), s, entries, 0, store)
+	if n != 0 || !blocked || err != nil {
+		t.Fatalf("401: n=%d blocked=%v err=%v (want blocked, no ack)", n, blocked, err)
+	}
+	rejected, _ := store.snapshot()
+	if len(rejected) != 0 {
+		t.Fatal("401 must not quarantine (account issue)")
+	}
+}
+
+func TestDrainHTTP403BlocksWithoutQuarantine(t *testing.T) {
+	entries := []shipper.Entry{eventEntry(t, 1)}
+	store := &fakeRejectedStore{}
+	s := &statusBatchSink{status: 403}
+	n, blocked, err := deliver(context.Background(), s, entries, 0, store)
+	if n != 0 || !blocked || err != nil {
+		t.Fatalf("403: n=%d blocked=%v err=%v", n, blocked, err)
+	}
+	rejected, _ := store.snapshot()
+	if len(rejected) != 0 {
+		t.Fatal("403 must not quarantine (auth issue)")
+	}
+}
+
+func TestDrainHTTP413QuarantinesPermanentRejection(t *testing.T) {
+	entries := []shipper.Entry{eventEntry(t, 1), eventEntry(t, 2)}
+	store := &fakeRejectedStore{}
+	s := &statusBatchSink{status: 413}
+	n, blocked, err := deliver(context.Background(), s, entries, 0, store)
+	if n != 2 || blocked || err != nil {
+		t.Fatalf("413: n=%d blocked=%v err=%v", n, blocked, err)
+	}
+	rejected, reasons := store.snapshot()
+	if len(rejected) != 2 || reasons[0] != "http_4xx" {
+		t.Fatalf("quarantine: %d records, reason %v", len(rejected), reasons)
+	}
+}
+
+func TestDrainHTTP429BlocksAndRetries(t *testing.T) {
+	entries := []shipper.Entry{eventEntry(t, 1)}
+	store := &fakeRejectedStore{}
+	s := &statusBatchSink{status: 429}
+	n, blocked, err := deliver(context.Background(), s, entries, 0, store)
+	if n != 0 || !blocked || err != nil {
+		t.Fatalf("429: n=%d blocked=%v err=%v (want retry, no quarantine)", n, blocked, err)
+	}
+	rejected, _ := store.snapshot()
+	if len(rejected) != 0 {
+		t.Fatal("429 is transient, must not quarantine")
+	}
+}
+
+func TestDrainHTTP5xxBlocksAndRetries(t *testing.T) {
+	for _, status := range []int{500, 502, 503, 504} {
+		t.Run(string(rune('0'+status/100))+"xx", func(t *testing.T) {
+			entries := []shipper.Entry{eventEntry(t, 1)}
+			store := &fakeRejectedStore{}
+			s := &statusBatchSink{status: status}
+			n, blocked, err := deliver(context.Background(), s, entries, 0, store)
+			if n != 0 || !blocked || err != nil {
+				t.Fatalf("%d: n=%d blocked=%v err=%v", status, n, blocked, err)
+			}
+			rejected, _ := store.snapshot()
+			if len(rejected) != 0 {
+				t.Fatalf("%d is transient, must not quarantine", status)
+			}
+		})
+	}
+}
+
+func TestDrainCrashAndReplayIdempotent(t *testing.T) {
+	entries := []shipper.Entry{
+		eventEntry(t, 1), metricEntry(t, 2, "count"), eventEntry(t, 3), metricEntry(t, 4, "count"),
+	}
+	var batches [][]telemetry.Record
+	s := &batchSink{ship: func(records []telemetry.Record) error {
+		batches = append(batches, records)
+		return nil
+	}}
+	// First delivery
+	n, blocked, err := deliver(context.Background(), s, entries, 0)
+	if n != 4 || blocked || err != nil {
+		t.Fatalf("first: n=%d blocked=%v err=%v", n, blocked, err)
+	}
+	// Replay after crash (before ack)
+	n, blocked, err = deliver(context.Background(), s, entries, 0)
+	if n != 4 || blocked || err != nil {
+		t.Fatalf("replay: n=%d blocked=%v err=%v", n, blocked, err)
+	}
+	if len(batches) != 2 {
+		t.Fatalf("got %d batches, want 2", len(batches))
+	}
+	// Record IDs must be stable across replay
+	for i := range batches[0] {
+		if batches[0][i].ID != batches[1][i].ID {
+			t.Errorf("record %d ID changed: %s → %s", i, batches[0][i].ID, batches[1][i].ID)
+		}
+	}
+}
+
+func TestDrainFullQuarantineStopsDrain(t *testing.T) {
+	entries := []shipper.Entry{eventEntry(t, 1), eventEntry(t, 2)}
+	store := &fakeRejectedStore{putErr: errors.New("quarantine full")}
+	s := &statusBatchSink{status: 400}
+	n, blocked, err := deliver(context.Background(), s, entries, 0, store)
+	if n != 0 || blocked || err == nil {
+		t.Fatalf("full quarantine: n=%d blocked=%v err=%v (want error, no ack)", n, blocked, err)
+	}
+	if err.Error() != "retain rejected record at seq 1: quarantine full" {
+		t.Fatalf("wrong error: %v", err)
+	}
+}
+
+func TestDrainHostProgressUnderBaitFailure(t *testing.T) {
+	// This test verifies that when permanent rejection causes batch splitting,
+	// all records get quarantined individually, not leaving some blocked
+	baitEntry := eventEntry(t, 1)
+	baitEntry.Role = shipper.RoleBait
+	hostEntry := eventEntry(t, 2)
+	hostEntry.Role = shipper.RoleRuntime
+	entries := []shipper.Entry{baitEntry, hostEntry}
+
+	s := &statusBatchSink{status: 400}
+	store := &fakeRejectedStore{}
+
+	n, blocked, err := deliver(context.Background(), s, entries, 0, store)
+	// With permanent rejection and quarantine, both records should be acknowledged after quarantine
+	if n != 2 || blocked || err != nil {
+		t.Fatalf("n=%d blocked=%v err=%v (want 2 acked after quarantine)", n, blocked, err)
+	}
+	rejected, _ := store.snapshot()
+	if len(rejected) != 2 {
+		t.Fatalf("quarantined %d records, want 2 (batch splits and quarantines both)", len(rejected))
+	}
+	// Verify both roles were quarantined
+	roles := map[shipper.Role]bool{}
+	for _, r := range rejected {
+		roles[r.Role] = true
+	}
+	if !roles[shipper.RoleBait] || !roles[shipper.RoleRuntime] {
+		t.Fatal("both bait and host records must be quarantined")
+	}
+}
