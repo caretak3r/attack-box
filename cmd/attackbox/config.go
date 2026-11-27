@@ -67,16 +67,17 @@ type config struct {
 	// There is no environment variable; zero keeps their defaults, and tests set it.
 	beat time.Duration
 
-	maxSessions  int
-	maxBody      int64
-	maxLogBody   int
-	fullEvidence bool
-	maxPerSource int
-	maxInFlight  int
-	holdSilent   time.Duration
-	idleInterval time.Duration
-	maxStream    time.Duration
-	timing       bool // realistic response pacing; ATTACKBOX_TIMING, default true
+	maxSessions            int
+	maxBody                int64
+	maxLogBody             int
+	fullEvidence           bool
+	skipSelfProbeDetection bool
+	maxPerSource           int
+	maxInFlight            int
+	holdSilent             time.Duration
+	idleInterval           time.Duration
+	maxStream              time.Duration
+	timing                 bool // realistic response pacing; ATTACKBOX_TIMING, default true
 
 	readHeaderTimeout time.Duration
 	readTimeout       time.Duration
@@ -130,29 +131,30 @@ func loadConfig(getenv func(string) string) (config, error) {
 	}
 
 	c := config{
-		instance:          env("INSTANCE", "attackbox"),
-		secretFile:        env("SECRET_FILE", ""),
-		nrDisabled:        flag("NR_DISABLED", false),
-		nrKey:             strings.TrimSpace(getenv("ATTACKBOX_NR_LICENSE_KEY")),
-		nrLogURL:          env("NR_LOG_URL", ""),
-		nrMetricURL:       env("NR_METRIC_URL", ""),
-		spoolSocket:       env("SPOOL_SOCKET", ""),
-		spoolQueue:        num("SPOOL_QUEUE", telemetry.DefaultSpoolQueue, spoolQueueCap),
-		spoolTimeout:      dur("SPOOL_TIMEOUT", telemetry.DefaultSpoolTimeout),
-		maxSessions:       num("MAX_SESSIONS", 10000, maxSessionsCap),
-		maxBody:           int64(num("MAX_BODY_BYTES", 1<<20, maxBodyCap)),
-		maxLogBody:        num("MAX_LOG_BODY", 128<<10, maxLogBodyCap),
-		fullEvidence:      flag("FULL_EVIDENCE", true),
-		maxPerSource:      num("MAX_PER_SOURCE", 8, maxPerSourceCap),
-		maxInFlight:       num("MAX_IN_FLIGHT", 256, maxInFlightCap),
-		holdSilent:        dur("HOLD_SILENT", 150*time.Second),
-		idleInterval:      dur("IDLE_INTERVAL", 45*time.Second),
-		maxStream:         dur("MAX_STREAM", 180*time.Second),
-		timing:            flag("TIMING", true),
-		readHeaderTimeout: dur("READ_HEADER_TIMEOUT", 10*time.Second),
-		readTimeout:       dur("READ_TIMEOUT", 30*time.Second),
-		idleTimeout:       dur("IDLE_TIMEOUT", 60*time.Second),
-		shutdownTimeout:   dur("SHUTDOWN_TIMEOUT", 15*time.Second),
+		instance:               env("INSTANCE", "attackbox"),
+		secretFile:             env("SECRET_FILE", ""),
+		nrDisabled:             flag("NR_DISABLED", false),
+		nrKey:                  strings.TrimSpace(getenv("ATTACKBOX_NR_LICENSE_KEY")),
+		nrLogURL:               env("NR_LOG_URL", ""),
+		nrMetricURL:            env("NR_METRIC_URL", ""),
+		spoolSocket:            env("SPOOL_SOCKET", ""),
+		spoolQueue:             num("SPOOL_QUEUE", telemetry.DefaultSpoolQueue, spoolQueueCap),
+		spoolTimeout:           dur("SPOOL_TIMEOUT", telemetry.DefaultSpoolTimeout),
+		maxSessions:            num("MAX_SESSIONS", 10000, maxSessionsCap),
+		maxBody:                int64(num("MAX_BODY_BYTES", 1<<20, maxBodyCap)),
+		maxLogBody:             num("MAX_LOG_BODY", 128<<10, maxLogBodyCap),
+		fullEvidence:           flag("FULL_EVIDENCE", true),
+		skipSelfProbeDetection: flag("SKIP_SELF_PROBE_DETECTION", false),
+		maxPerSource:           num("MAX_PER_SOURCE", 8, maxPerSourceCap),
+		maxInFlight:            num("MAX_IN_FLIGHT", 256, maxInFlightCap),
+		holdSilent:             dur("HOLD_SILENT", 150*time.Second),
+		idleInterval:           dur("IDLE_INTERVAL", 45*time.Second),
+		maxStream:              dur("MAX_STREAM", 180*time.Second),
+		timing:                 flag("TIMING", true),
+		readHeaderTimeout:      dur("READ_HEADER_TIMEOUT", 10*time.Second),
+		readTimeout:            dur("READ_TIMEOUT", 30*time.Second),
+		idleTimeout:            dur("IDLE_TIMEOUT", 60*time.Second),
+		shutdownTimeout:        dur("SHUTDOWN_TIMEOUT", 15*time.Second),
 	}
 	var traceErr error
 	c.tracing, traceErr = observability.FromEnv(getenv)

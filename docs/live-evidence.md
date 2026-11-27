@@ -7,6 +7,8 @@
 
 The capture includes submitted body bytes, parsed request headers, the request URI, request trailers, response header snapshots, and response bytes accepted by the HTTP writer. Submitted credentials remain in this evidence. Server secret files and the New Relic license key are not capture inputs. Keep the New Relic key in the host shipper; do not place it in the bait.
 
+The bait skips all telemetry (edge events, evidence records, and OpenTelemetry spans) for its own health checks: requests from loopback addresses, or requests with User-Agent `attackbox-hostcollector/1` from private addresses. These probes still serve normal responses. Other traffic from private addresses keeps full telemetry.
+
 | Record | When emitted | What it establishes |
 |---|---|---|
 | `request_metadata` | Handler entry | Method, URI, parsed headers, host, protocol, declared length, peer |

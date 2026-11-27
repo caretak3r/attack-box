@@ -60,6 +60,9 @@ type Config struct {
 
 	// TrustedProxies lists peers whose X-Forwarded-For is believed.
 	TrustedProxies []netip.Prefix
+	// SkipSelfProbeDetection disables self-probe filtering for tests.
+	// Production deployments leave this false.
+	SkipSelfProbeDetection bool
 
 	// Timing paces inference replies; the zero value sends at once.
 	Timing Timing
@@ -223,17 +226,17 @@ func (o parseOutcome) name() string {
 
 // call is the state of one request.
 type call struct {
-	s     *Server
-	w     *recorder
-	r     *http.Request
-	id    string
-	start time.Time
-	src   string
-	ua    string
-	key   string
-	style errStyle
-	rc    *http.ResponseController
-
+	s         *Server
+	w         *recorder
+	r         *http.Request
+	id        string
+	start     time.Time
+	src       string
+	ua        string
+	key       string
+	style     errStyle
+	rc        *http.ResponseController
+	selfProbe bool
 	panicked  bool
 	panicInfo string
 
@@ -266,19 +269,28 @@ type call struct {
 
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	rid := randHex(16)
-	ctx, span := s.cfg.Tracer.Start(trace.ContextWithSpanContext(r.Context(), trace.SpanContext{}), "bait.request", trace.WithNewRoot(), trace.WithSpanKind(trace.SpanKindServer), trace.WithAttributes(attribute.String("attackbox.request_id", rid[:16]), attribute.String("attackbox.persona", s.persona), attribute.String("http.request.method", safeMethod(r.Method))))
-	defer span.End()
-	r = r.WithContext(ctx)
 	c := &call{s: s, r: r, id: rid[:16], start: s.cfg.Now(), w: &recorder{ResponseWriter: w, keep: s.logRawLimit()}}
 	c.adm = s.cfg.Responder.Admit() // before any read: a probe delivered after this is not this request's
 	c.rc = http.NewResponseController(w)
 	c.src = s.source(r)
 	c.ua = r.UserAgent()
+	c.selfProbe = s.isSelfProbe(c.src, c.ua)
+
+	tracer := s.cfg.Tracer
+	if c.selfProbe {
+		tracer = noop.NewTracerProvider().Tracer("")
+	}
+	ctx, span := tracer.Start(trace.ContextWithSpanContext(r.Context(), trace.SpanContext{}), "bait.request", trace.WithNewRoot(), trace.WithSpanKind(trace.SpanKindServer), trace.WithAttributes(attribute.String("attackbox.request_id", rid[:16]), attribute.String("attackbox.persona", s.persona), attribute.String("http.request.method", safeMethod(r.Method))))
+	defer span.End()
+	r = r.WithContext(ctx)
+	c.r = r
 	c.key = s.sessionKey(c.src, c.ua, r.Header)
 	c.style = s.styleFor(r.URL.Path)
 	c.endpoint = "/unmatched"
 	s.personaHeaders(c, rid)
-	c.startEvidence()
+	if !c.selfProbe {
+		c.startEvidence()
+	}
 	defer s.finish(c)
 	defer c.recoverPanic()
 	defer c.finalize()
@@ -310,7 +322,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	case c.tooLarge:
 		c.fail(http.StatusRequestEntityTooLarge, "Request body too large", "", "")
 	default:
-		_, responseSpan := s.cfg.Tracer.Start(c.r.Context(), "bait.response")
+		_, responseSpan := tracer.Start(c.r.Context(), "bait.response")
 		func() { defer responseSpan.End(); h(c) }()
 	}
 }
@@ -459,6 +471,26 @@ func (s *Server) trusted(a netip.Addr) bool {
 		if p.Contains(a) {
 			return true
 		}
+	}
+	return false
+}
+
+// isSelfProbe returns true if the request is from our own health checks or
+// monitoring, which should not produce telemetry.
+func (s *Server) isSelfProbe(src, ua string) bool {
+	if s.cfg.SkipSelfProbeDetection {
+		return false
+	}
+	a, err := netip.ParseAddr(src)
+	if err != nil {
+		return false
+	}
+	a = a.Unmap().WithZone("")
+	if a.IsLoopback() {
+		return true
+	}
+	if ua == "attackbox-hostcollector/1" && a.IsPrivate() {
+		return true
 	}
 	return false
 }
