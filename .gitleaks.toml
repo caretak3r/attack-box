@@ -55,3 +55,10 @@ condition = 'AND'
 regexTarget = 'secret'
 paths = ['''(?:^|/)internal/telemetry/redact_test\.go$''']
 regexes = ['''^eyJhbGciOi\.payload\.sig$''']
+
+# Body-capture fixture in the public gateway history (commit a0b641ae91). The tree no longer has it.
+[[allowlists]]
+condition = 'AND'
+regexTarget = 'secret'
+paths = ['''(?:^|/)internal/publicedge/capture_test\.go$''']
+regexes = ['''^sk\-1234567890abcdef1234567890abcdef$''']
