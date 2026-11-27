@@ -22,7 +22,7 @@ const SnapshotPath = "/run/attackbox-monitoring/inventory.json"
 const MaxSnapshotBytes = 64 << 10
 const MaxAge = 90 * time.Second
 
-var units = []string{"attackbox.service", "docker.service", "containerd.service", "falco-modern-bpf.service", "auditd.service", "attackbox-falco-adapter.service", "attackbox-egress-adapter.service", "attackbox-shipper.service", "attackbox-otel.service", "attackbox-hostcollector.service"}
+var units = []string{"attackbox.service", "docker.service", "containerd.service", "falco-modern-bpf.service", "auditd.service", "attackbox-auditfilter.service", "attackbox-falco-adapter.service", "attackbox-egress-adapter.service", "attackbox-shipper.service", "attackbox-otel.service", "attackbox-hostcollector.service"}
 var containers = []string{"attackbox-bait", "attackbox-proxy"}
 
 type Unit struct {
@@ -85,31 +85,38 @@ func collect(ctx context.Context, command command) Snapshot {
 		wg.Add(1)
 		go func() { defer wg.Done(); sem <- struct{}{}; defer func() { <-sem }(); f() }()
 	}
-	for i, name := range units {
-		work(func() {
-			u := Unit{Name: name}
-			data, err := command(ctx, "/usr/bin/systemctl", "show", "--no-pager", "--property=LoadState,ActiveState,SubState", name)
-			// systemctl show can exit nonzero for an explicitly absent unit.
-			if err == nil || bytes.Contains(data, []byte("LoadState=not-found\n")) {
-				for _, line := range strings.Split(string(data), "\n") {
-					k, v, ok := strings.Cut(line, "=")
-					if !ok {
-						continue
-					}
-					switch k {
-					case "LoadState":
-						u.Load = v
-					case "ActiveState":
-						u.Active = v
-					case "SubState":
-						u.Sub = v
-					}
+	work(func() {
+		args := append([]string{"show", "--no-pager", "--property=Id,LoadState,ActiveState,SubState"}, units...)
+		data, _ := command(ctx, "/usr/bin/systemctl", args...)
+		// systemctl may return nonzero for a missing unit. Require a complete,
+		// unique record with its own Id; never assign by response order.
+		found := map[string][]Unit{}
+		for _, block := range strings.Split(strings.TrimSpace(string(data)), "\n\n") {
+			u := Unit{}
+			for _, line := range strings.Split(block, "\n") {
+				k, v, _ := strings.Cut(line, "=")
+				switch k {
+				case "Id":
+					u.Name = v
+				case "LoadState":
+					u.Load = v
+				case "ActiveState":
+					u.Active = v
+				case "SubState":
+					u.Sub = v
 				}
+			}
+			found[u.Name] = append(found[u.Name], u)
+		}
+		for i, name := range units {
+			u := Unit{Name: name}
+			if rows := found[name]; len(rows) == 1 {
+				u = rows[0]
 				u.Known = u.Load != "" && u.Active != "" && u.Sub != ""
 			}
 			s.Units[i] = u
-		})
-	}
+		}
+	})
 	const format = `{"running":{{json .State.Running}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}"none"{{end}},"restarts":{{json .RestartCount}},"oom":{{json .State.OOMKilled}},"runtime":{{json .HostConfig.Runtime}},"memory":{{json .HostConfig.Memory}},"nano_cpus":{{json .HostConfig.NanoCpus}}}`
 	for i, name := range containers {
 		work(func() {

@@ -1,9 +1,9 @@
 [Unit]
-Description=Refresh AttackBox inventory every 15 seconds
+Description=Refresh AttackBox inventory worker every 60 seconds
 
 [Timer]
 OnBootSec=5s
-OnUnitActiveSec=15s
+OnUnitActiveSec=60s
 AccuracySec=1s
 Unit=attackbox-hostcollector-snapshot.service
 

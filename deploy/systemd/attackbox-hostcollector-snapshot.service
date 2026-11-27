@@ -3,9 +3,11 @@ Description=AttackBox fixed privileged inventory snapshot
 After=docker.service
 
 [Service]
-Type=oneshot
+Type=simple
 User=root
-ExecStart=/usr/local/bin/attackbox-hostcollector -snapshot
+ExecStart=/usr/local/bin/attackbox-hostcollector -snapshot-loop
+Restart=on-failure
+RestartSec=5s
 RuntimeDirectory=attackbox-monitoring
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -68,10 +69,7 @@ func TestMissingUnitAndCommandFailures(t *testing.T) {
 		if cmd == "/usr/bin/docker" {
 			return nil, errors.New("absent")
 		}
-		if args[len(args)-1] == "auditd.service" {
-			return []byte("LoadState=not-found\nActiveState=inactive\nSubState=dead\n"), errors.New("absent")
-		}
-		return nil, errors.New("failed")
+		return []byte("Id=auditd.service\nLoadState=not-found\nActiveState=inactive\nSubState=dead\n"), errors.New("absent")
 	})
 	c := New()
 	c.valid = true
@@ -224,10 +222,14 @@ func TestCollectFixedFields(t *testing.T) {
 	s := collect(context.Background(), func(_ context.Context, cmd string, args ...string) ([]byte, error) {
 		switch cmd {
 		case "/usr/bin/systemctl":
-			if len(args) != 4 || args[0] != "show" || args[2] != "--property=LoadState,ActiveState,SubState" {
+			if len(args) != 3+len(units) || args[0] != "show" || args[2] != "--property=Id,LoadState,ActiveState,SubState" {
 				t.Errorf("unexpected systemctl args: %v", args)
 			}
-			return []byte("LoadState=loaded\nActiveState=active\nSubState=running\n"), nil
+			var data strings.Builder
+			for _, name := range args[3:] {
+				fmt.Fprintf(&data, "Id=%s\nLoadState=loaded\nActiveState=active\nSubState=running\n\n", name)
+			}
+			return []byte(data.String()), nil
 		case "/usr/bin/docker":
 			if len(args) != 5 || args[0] != "inspect" || strings.Contains(args[3], ".Config.Env") {
 				t.Errorf("unexpected docker args: %v", args)
@@ -247,4 +249,26 @@ func TestCollectFixedFields(t *testing.T) {
 	b := output(c)
 	requireMetric(t, b, `attackbox_container_restarts{component="attackbox-bait"} 2`)
 	requireMetric(t, b, `attackbox_container_runtime_approved{component="attackbox-bait"} 1`)
+}
+
+func TestBatchUnitIdentityAndDuplicates(t *testing.T) {
+	calls := 0
+	s := collect(context.Background(), func(_ context.Context, cmd string, args ...string) ([]byte, error) {
+		if cmd != "/usr/bin/systemctl" {
+			return nil, errors.New("missing")
+		}
+		calls++
+		return []byte("Id=docker.service\nLoadState=loaded\nActiveState=active\nSubState=running\n\nId=auditd.service\nLoadState=loaded\nActiveState=active\nSubState=running\n\nId=auditd.service\nLoadState=loaded\nActiveState=inactive\nSubState=dead\n"), nil
+	})
+	if calls != 1 {
+		t.Fatal(calls)
+	}
+	for _, u := range s.Units {
+		if u.Name == "docker.service" && !u.Known {
+			t.Fatal(u)
+		}
+		if u.Name != "docker.service" && u.Known {
+			t.Fatal(u)
+		}
+	}
 }
