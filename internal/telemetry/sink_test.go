@@ -161,3 +161,57 @@ func TestJSONLogCountsWriteErrors(t *testing.T) {
 		t.Errorf("errors=%d seen=%d", l.Errors(), seen)
 	}
 }
+
+func TestSafeLabelsAllKeys(t *testing.T) {
+	cases := []struct {
+		key  string
+		good []string
+		bad  []string
+	}{
+		{
+			key:  "persona",
+			good: []string{"openai", "anthropic", "gemini", "test-persona"},
+			bad:  []string{"", "OPENAI", "Open AI", strings.Repeat("a", 49), "open.ai", "open/ai"},
+		},
+		{
+			key:  "probe_id",
+			good: []string{"timeout-silent", "prompt-extraction", "test-123"},
+			bad:  []string{"", "Bad Value!", "probe ID", strings.Repeat("a", 49), "probe.id", "probe/id"},
+		},
+		{
+			key:  "task",
+			good: []string{"credential-access", "shell-execution", "test_task"},
+			bad:  []string{"", "TASK", "task name", strings.Repeat("a", 49), "task.name", "task/name"},
+		},
+		{
+			key:  "stream",
+			good: []string{"edge", "probe", "runtime", "egress", "heartbeat", "transcript"},
+			bad:  []string{"", "EDGE", "edge stream", strings.Repeat("a", 49), "edge.stream"},
+		},
+		{
+			key:  "result",
+			good: []string{"ok", "error", "timeout", "test-result"},
+			bad:  []string{"", "OK", "result value", strings.Repeat("a", 49), "result.value"},
+		},
+		{
+			key:  "reason",
+			good: []string{"timeout", "error", "rejected", "test-reason"},
+			bad:  []string{"", "TIMEOUT", "timeout reason", strings.Repeat("a", 49), "reason.value"},
+		},
+	}
+
+	for _, c := range cases {
+		for _, good := range c.good {
+			got := SafeLabels(map[string]string{c.key: good})
+			if got[c.key] != good {
+				t.Errorf("%s %q = %q, want %q", c.key, good, got[c.key], good)
+			}
+		}
+		for _, bad := range c.bad {
+			got := SafeLabels(map[string]string{c.key: bad})
+			if got[c.key] != "other" {
+				t.Errorf("%s %q = %q, want %q", c.key, bad, got[c.key], "other")
+			}
+		}
+	}
+}
