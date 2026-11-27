@@ -8,17 +8,20 @@ mode=''
 archive=''
 host_binary=''
 host_sha=''
-usage() { echo 'usage: install-monitoring.sh --check|--apply [--archive PATH] [--hostcollector-binary PATH --hostcollector-sha256 SHA256]'; }
+log_budget_binaries=''
+usage() { echo 'usage: install-monitoring.sh --check|--apply [--archive PATH] [--hostcollector-binary PATH --hostcollector-sha256 SHA256] [--log-budget-binaries DIRECTORY]'; }
 while (($#)); do
   case $1 in
     --check|--apply) [[ -z $mode ]] || { usage >&2; exit 2; }; mode=$1; shift ;;
     --archive) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; archive=$2; shift 2 ;;
     --hostcollector-binary) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; host_binary=$2; shift 2 ;;
+    --log-budget-binaries) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; log_budget_binaries=$2; shift 2 ;;
     --hostcollector-sha256) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; host_sha=$2; shift 2 ;;
     *) usage >&2; exit 2 ;;
   esac
 done
 [[ -n $mode ]] || { usage >&2; exit 2; }
+if [[ -n $log_budget_binaries ]]; then bash "$repo_root/scripts/install-log-budget.sh" --check "$log_budget_binaries"; fi
 fail() { echo "monitoring: $*" >&2; exit 1; }
 for command in curl tar python3; do command -v "$command" >/dev/null || fail "missing $command"; done
 case "$(uname -s)/$(uname -m)" in
@@ -118,7 +121,7 @@ for unit in attackbox-hostcollector.service attackbox-hostcollector-snapshot.ser
   install -m 0644 "$repo_root/deploy/systemd/$unit" "/etc/systemd/system/$unit"
 done
 systemctl daemon-reload
-systemctl start attackbox-hostcollector-snapshot.service
+systemctl restart attackbox-hostcollector-snapshot.service
 systemctl enable --now attackbox-hostcollector-snapshot.timer
 systemctl enable attackbox-hostcollector.service
 systemctl restart attackbox-hostcollector.service
@@ -130,3 +133,5 @@ curl --fail --silent --show-error --max-time 5 http://127.0.0.1:9465/metrics >/d
 curl --fail --silent --show-error --max-time 5 http://127.0.0.1:13133/ >/dev/null
 printf '%s\n' 'Collector process healthy. Export and New Relic ingestion remain unverified.' \
   'Shipper drop-in installed; restart shipper separately. Bait overlay not applied.'
+
+if [[ -n $log_budget_binaries ]]; then bash "$repo_root/scripts/install-log-budget.sh" --apply "$log_budget_binaries"; fi

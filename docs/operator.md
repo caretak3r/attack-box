@@ -329,3 +329,7 @@ bash /Users/rohit/attack-box/scripts/test-deploy-ubuntu.sh
 ```
 
 Receipt-enabled host readers retain stable record IDs across replay. Their aggregate admission statistics participate in I02 reports. They do not use legacy producer-boot sequence accounting; source cursor and receipt evidence are separate. `loss_scope=committed` cannot prove remote acceptance or completeness before source retention.
+
+## Evidence ingestion budget
+
+Use `/Users/rohit/attack-box/docs/log-budget.md` for the audit forwarder and bounded local buffers. Monitoring bootstrap accepts `--log-budget-binaries` with a directory of verified Linux host binaries. The policy preserves attack request and response capture. Validate remote receipt and consumption after application.

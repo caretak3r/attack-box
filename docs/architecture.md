@@ -288,3 +288,7 @@ The proxy writes access JSON and parser diagnostics to Docker journald. The Infr
 ### Overnight findings publication
 
 The local Go watcher reads bounded SSH snapshots from the host. A second local Go process reads the private sample file and atomic report. It renders fixed labels and numeric aggregates into a separate findings-only Git repository. Only that repository is committed and pushed. Raw evidence remains on the existing private collection paths. The publisher checks staged paths and commit history, drops inherited Git overrides, retries failed pushes and stops after the final report or at the watch deadline. This path requires the operator Mac and GitHub access. It does not verify New Relic receipt or change public ingress. Setup, limits and verification are in `/Users/rohit/attack-box/docs/overnight-watch.md`.
+
+## Audit collection budget
+
+The optional Go audit forwarder compacts related host audit records before native New Relic forwarding. The persistent inventory worker reduces audit activity from monitoring itself. The bait evidence path stays unchanged. Architecture, retention bounds, filtering conditions, and bootstrap steps: `/Users/rohit/attack-box/docs/log-budget.md`.

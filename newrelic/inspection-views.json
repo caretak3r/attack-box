@@ -165,7 +165,7 @@
     {
       "id": "a03a5e97-78fe-5b92-8a18-de658fc6bbd6",
       "name": "AttackBox / 08 Linux audit file",
-      "query": "sensor_id:srv-000000 AND filePath:\"/var/log/audit/audit.log\"",
+      "query": "sensor_id:srv-000000 AND logtype:linux_audit",
       "selectedEventTypes": [
         "Log",
         "Log_Security"
@@ -174,13 +174,14 @@
         "timestamp",
         "hostname",
         "filePath",
-        "logtype",
+        "audit_event_id",
+        "audit_decision",
         "message"
       ],
       "timeRange": {
         "duration": 1800000
       },
-      "description": "Raw host audit records. Routine collector activity produces substantial volume."
+      "description": "Retained audit groups and filter accounting, including historical raw audit records."
     },
     {
       "id": "ba11dbd6-e6fb-512f-a44d-673fed4d5e09",
