@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Ubuntu 24.04 idempotent deployment for attack-box
 # Non-destructive preflight by default; --apply for mutations; --verify for real validation
-# Both --disable-ssh --console-confirmed required for SSH/cloud-init changes
+# Both --disable-ssh --console-confirmed required for SSH disablement
 
 set -euo pipefail
 
@@ -1186,19 +1186,29 @@ disable_ssh() {
         return 0
     fi
 
-    log "Disabling SSH and cloud-init..."
+    log "Disabling SSH..."
 
     if [[ "$MODE" == "apply" ]]; then
         systemctl stop ssh
         systemctl disable ssh
         systemctl mask ssh
-
-        touch /etc/cloud/cloud-init.disabled
-
-        ok "SSH and cloud-init disabled"
+        ok "SSH disabled"
         warn "Ensure provider console access is working!"
     else
-        warn "Would disable SSH and cloud-init"
+        warn "Would disable SSH"
+    fi
+}
+
+# The egress policy blocks the metadata address. Without its datasource,
+# cloud-init treats the next boot as a new instance: it makes new SSH host keys
+# and puts the image's sshd defaults back.
+disable_cloud_init() {
+    [[ -d /etc/cloud ]] || return 0
+    if [[ "$MODE" == "apply" ]]; then
+        touch /etc/cloud/cloud-init.disabled
+        ok "cloud-init disabled for later boots"
+    else
+        warn "Would disable cloud-init for later boots"
     fi
 }
 
@@ -1508,6 +1518,7 @@ main() {
     prepare_bait
     if [[ "$MODE" != apply ]]; then bash "${SCRIPT_DIR}/bootstrap-infrastructure.sh" --dry-run; fi
     setup_firewall
+    disable_cloud_init
     setup_sysctl
     setup_auditd
     setup_unattended_upgrades
