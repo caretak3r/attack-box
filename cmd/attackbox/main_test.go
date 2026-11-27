@@ -116,12 +116,26 @@ func TestLoadConfigFull(t *testing.T) {
 func TestLoadConfigErrors(t *testing.T) {
 	tmp := t.TempDir()
 	short := filepath.Join(tmp, "short")
-	_ = os.WriteFile(short, []byte("tiny"), 0o600)
+	if err := os.WriteFile(short, []byte("tiny"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	key := bytes.Repeat([]byte{7}, 48)
 	open, group, huge := filepath.Join(tmp, "open"), filepath.Join(tmp, "group"), filepath.Join(tmp, "huge")
-	_ = os.WriteFile(open, key, 0o644)
-	_ = os.WriteFile(group, key, 0o640)
-	_ = os.WriteFile(huge, bytes.Repeat([]byte{7}, 5000), 0o600)
+	if err := os.WriteFile(open, key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(open, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(group, key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(group, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(huge, bytes.Repeat([]byte{7}, 5000), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	dir := filepath.Join(tmp, "dir")
 	_ = os.Mkdir(dir, 0o700)
 	cases := map[string]struct {
