@@ -96,7 +96,11 @@ func (s *State) Save(p Position) error {
 		return errors.New("host evidence: cursor exceeds bound")
 	}
 	// The state lock makes the fixed temporary name private to this writer.
-	if err := s.root.Remove("cursor.pending"); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if _, err := s.root.Lstat("cursor.pending"); err == nil {
+		if err := s.root.Remove("cursor.pending"); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	f, err := s.root.OpenFile("cursor.pending", os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)

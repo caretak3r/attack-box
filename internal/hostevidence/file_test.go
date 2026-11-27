@@ -163,3 +163,31 @@ func TestStateRejectsCorruptionSymlinkAndSecondOwner(t *testing.T) {
 		t.Fatal("followed state symlink")
 	}
 }
+
+func TestNumericRotationDrainsEveryFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.log")
+	os.WriteFile(path, []byte("first\n"), 0600)
+	s, e := OpenState(filepath.Join(dir, "state"), "audit")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	var got []string
+	r := FileReader{Path: path, State: s, NumericRotation: true, Deliver: func(_ context.Context, _ string, b []byte) error { got = append(got, string(b)); return nil }}
+	defer r.Close()
+	if _, e = r.Step(context.Background()); e != nil {
+		t.Fatal(e)
+	}
+	os.Rename(path, path+".2")
+	os.WriteFile(path+".1", []byte("middle\n"), 0600)
+	os.WriteFile(path, []byte("last\n"), 0600)
+	for i := 0; i < 5; i++ {
+		if _, e = r.Step(context.Background()); e != nil {
+			t.Fatal(e)
+		}
+	}
+	if strings.Join(got, "") != "first\nmiddle\nlast\n" {
+		t.Fatal(got)
+	}
+}

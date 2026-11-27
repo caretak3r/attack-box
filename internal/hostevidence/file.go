@@ -10,6 +10,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -20,7 +22,12 @@ type FileReader struct {
 	Path    string
 	State   *State
 	Deliver Deliver
-	file    *os.File
+	// Commit overrides durable checkpointing for a bounded batch consumer. It must
+	// persist output before the final cursor. Nil preserves per-record receipts.
+	Commit func(Position) error
+	// NumericRotation drains .N, .N-1, ... before the current file (auditd).
+	NumericRotation bool
+	file            *os.File
 }
 
 func fileID(info os.FileInfo) string {
@@ -153,7 +160,14 @@ func (r *FileReader) Step(ctx context.Context) (bool, error) {
 			// The old inode has been drained. Keep it in source rotation until
 			// the next line's receipt and cursor commit complete.
 			r.Close()
-			r.file, err = openSource(r.Path)
+			next := r.Path
+			if r.NumericRotation {
+				next, err = r.nextNumeric(id)
+				if err != nil {
+					return false, err
+				}
+			}
+			r.file, err = openSource(next)
 			return false, err
 		}
 		return false, nil
@@ -172,7 +186,11 @@ func (r *FileReader) Step(ctx context.Context) (bool, error) {
 	pos.LastStart = offset
 	pos.Offset = offset + int64(len(line))
 	pos.LastHash = fmt.Sprintf("%x", sha256.Sum256(line))
-	if err := r.State.Save(pos); err != nil {
+	commit := r.Commit
+	if commit == nil {
+		commit = r.State.Save
+	}
+	if err := commit(pos); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -203,4 +221,38 @@ func RunFile(ctx context.Context, state *State, path string, sender Sender) erro
 		}
 	}
 	return ctx.Err()
+}
+
+// nextNumeric refuses a missing link instead of skipping retained rotated files.
+func (r *FileReader) nextNumeric(id string) (string, error) {
+	paths, err := filepath.Glob(r.Path + ".*")
+	if err != nil {
+		return "", err
+	}
+	if len(paths) > 1024 {
+		return "", errors.New("rotation directory exceeds bound")
+	}
+	for _, path := range paths {
+		n, err := strconv.Atoi(strings.TrimPrefix(path, r.Path+"."))
+		if err != nil || n < 1 {
+			continue
+		}
+		st, err := os.Lstat(path)
+		if err != nil || !st.Mode().IsRegular() {
+			continue
+		}
+		if fileID(st) != id {
+			continue
+		}
+		if n == 1 {
+			return r.Path, nil
+		}
+		next := fmt.Sprintf("%s.%d", r.Path, n-1)
+		st, err = os.Lstat(next)
+		if err != nil || !st.Mode().IsRegular() {
+			return "", errors.New("host evidence: numeric rotation gap; cursor retained")
+		}
+		return next, nil
+	}
+	return "", errors.New("host evidence: drained inode absent from rotation; cursor retained")
 }
