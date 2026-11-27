@@ -1348,6 +1348,21 @@ start_bait() {
     ok "Bait service started (Compose --wait ensures readiness)"
 }
 
+# setup_docker stops Docker, which stops attackbox-public.service
+# (PartOf=docker.service), and no unit starts it again. An enabled unit is one
+# the operator wants running; a host without the public gateway has no such unit.
+restore_public_gateway() {
+    systemctl is-enabled --quiet attackbox-public.service 2>/dev/null || return 0
+    log "Restoring the public gateway..."
+    # A fresh Collector start puts its UID back in the reloaded nft set.
+    if systemctl stop attackbox-public-otel.service && systemctl start attackbox-public.service; then
+        ok "Public gateway restarted"
+    else
+        err "Public gateway did not come back"
+        return 1
+    fi
+}
+
 # Enhanced verification
 run_verification_enhanced() {
     log "Running enhanced validation checks..."
@@ -1502,9 +1517,13 @@ main() {
     if [[ "$MODE" == "apply" ]]; then
         start_services
         start_bait
+        # Report a failure after the private checks; do not stop them.
+        local public_gateway=ok
+        restore_public_gateway || public_gateway=failed
         printf '%s\n' "$native_api_key" | bash "${SCRIPT_DIR}/bootstrap-infrastructure.sh" --apply
         unset native_api_key
         run_verification_enhanced
+        [[ "$public_gateway" == ok ]] || { err "Private stack verified, but the public gateway is down: systemctl start attackbox-public.service"; exit 1; }
         disable_ssh
 
         echo ""

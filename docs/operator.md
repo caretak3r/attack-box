@@ -169,6 +169,8 @@ sudo bash /opt/attackbox-src/scripts/deploy-ubuntu.sh --verify
 
 With no mode flag the script performs preflight. `--dry-run` reports proposed setup actions; it is not a runtime rehearsal. `--apply` installs dependencies, users, firewall policy, gVisor, service units, container artifacts, and binaries. It builds before applying the final restrictive egress policy. `--refresh-sets` refreshes allowed endpoint addresses; stale entries remain until ruleset reload or reboot. The script installs its refresh entry point at `/usr/local/sbin/attackbox-deploy`.
 
+`--apply` stops Docker, and this stops the public gateway. When `attackbox-public.service` is enabled, the installer starts the public gateway again after the bait starts. The public ports do not answer during the build. If the public gateway does not start, the installer completes the private checks and then exits with an error.
+
 The installer creates a redaction secret and a self-signed TLS certificate for private checks. It preserves a complete existing key and certificate pair. The host files under `/opt/attackbox/secrets` need owner `65532:65532` and mode `0400`. Compose file-secret settings do not replace host permissions.
 
 The runtime files are `/opt/attackbox/compose.yaml` and `/opt/attackbox/compose.gvisor.yaml`. The host binary is `/usr/local/bin/attackbox-shipper`. Bait runs in its container. Both containers use runsc; verify its configured host-UDS support and the bait socket from the real deployed runtime.
