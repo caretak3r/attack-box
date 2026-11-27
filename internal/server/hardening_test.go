@@ -145,6 +145,7 @@ func TestReadTimeoutDoesNotCutHold(t *testing.T) {
 		c.After = time.After
 		c.StatusHold = 2200 * time.Millisecond
 		c.HoldSilent = 2200 * time.Millisecond
+		c.SkipSelfProbeDetection = true
 	})
 	ts := httptest.NewUnstartedServer(r.h)
 	ts.Config.ReadTimeout = time.Second

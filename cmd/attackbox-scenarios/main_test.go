@@ -64,7 +64,8 @@ func rebuild(t *testing.T, events []telemetry.Event, id, kind string) ([]byte, t
 
 func TestScenariosRealServerEvidence(t *testing.T) {
 	sink := &capture{}
-	app, err := server.New(server.Config{Models: []string{"gpt-4o"}, Responder: responder.New(responder.Config{}, responder.NewStore(responder.StoreConfig{})), Sink: sink, FullEvidence: true, HoldSilent: time.Millisecond, IdleInterval: time.Millisecond, MaxStreamDuration: time.Second})
+	// The test client is on loopback, which the bait otherwise treats as its own health probe.
+	app, err := server.New(server.Config{Models: []string{"gpt-4o"}, Responder: responder.New(responder.Config{}, responder.NewStore(responder.StoreConfig{})), Sink: sink, FullEvidence: true, SkipSelfProbeDetection: true, HoldSilent: time.Millisecond, IdleInterval: time.Millisecond, MaxStreamDuration: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
