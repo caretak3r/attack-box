@@ -1,5 +1,7 @@
 # Security watch debrief — 24 November 2026
 
+[View this archived report](https://silent.engineer/attack-box/findings/?day=2026-11-24) · [All reports](https://silent.engineer/attack-box/findings/). This watch has no public request map.
+
 **Watch: complete · 97 snapshots · last observation Nov 24 05:58:16 EST / 10:58:16 UTC**
 
 Coverage: Nov 23 21:53:16 EST / 02:53:16 UTC to Nov 24 05:58:16 EST / 10:58:16 UTC. Planned final collection: 05:58 Eastern / 10:58 UTC. The first snapshot includes a five-minute baseline.

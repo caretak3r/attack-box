@@ -1,40 +1,42 @@
 # Daily findings — 2026-11-27 UTC
 
-Window: 2026-11-27 00:00:00 to 2026-11-27 20:40:44 UTC (end exclusive).
+Window: 2026-11-27 00:00:00 to 2026-11-27 21:40:27 UTC (end exclusive).
 Partial day. The next refresh replaces these totals.
+
+[View in historical archive](https://silent.engineer/attack-box/findings/?day=2026-11-27) | [All findings](https://silent.engineer/attack-box/findings/)
 
 ## Public request capture
 
 | Observation | Count |
 |---|---:|
-| Capture records | 3235 |
-| Known operator or host | 100 |
+| Capture records | 3531 |
+| Known operator or host | 117 |
 | Local or unknown peer | 0 |
-| Outside HTTP requests | 3135 |
-| Distinct outside addresses | 545 |
+| Outside HTTP requests | 3414 |
+| Distinct outside addresses | 559 |
 
 ## Outside request details
 
 | Observation | Count |
 |---|---:|
-| Environment-file requests | 356 |
-| Version-control probes | 108 |
-| WordPress probes | 32 |
+| Environment-file requests | 564 |
+| Version-control probes | 111 |
+| WordPress probes | 35 |
 | AI discovery probes on unmatched routes | 153 |
-| Model-list requests | 149 |
+| Model-list requests | 155 |
 | Generation or chat requests | 118 |
-| HTTP 2xx | 867 |
-| HTTP 4xx | 2229 |
+| HTTP 2xx | 1059 |
+| HTTP 4xx | 2310 |
 | HTTP 5xx | 0 |
-| Other HTTP status | 39 |
+| Other HTTP status | 45 |
 
 ## Host security logs
 
 | Observation | Count |
 |---|---:|
 | Retained Falco events | 146 |
-| OUTPUT-DROP: | 1195 |
-| CONTAINER-EGRESS-BLOCK: | 2472 |
+| OUTPUT-DROP: | 1234 |
+| CONTAINER-EGRESS-BLOCK: | 2724 |
 | METADATA-BLOCK: | 0 |
 | METADATA-BLOCK-OUT: | 56 |
 
