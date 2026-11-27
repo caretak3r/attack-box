@@ -1,4 +1,53 @@
-# Security debrief — 25 November 2026
+# Daily findings — 2026-11-25 UTC
+
+Window: 2026-11-25 00:00:00 to 2026-11-26 00:00:00 UTC (end exclusive).
+
+## Public request capture
+
+| Observation | Count |
+|---|---:|
+| Capture records | 206 |
+| Known operator or host | 88 |
+| Local or unknown peer | 0 |
+| Outside HTTP requests | 118 |
+| Distinct outside addresses | 60 |
+
+## Outside request details
+
+| Observation | Count |
+|---|---:|
+| Environment-file requests | 3 |
+| Version-control probes | 0 |
+| WordPress probes | 0 |
+| AI discovery probes on unmatched routes | 6 |
+| Model-list requests | 0 |
+| Generation or chat requests | 0 |
+| HTTP 2xx | 0 |
+| HTTP 4xx | 118 |
+| HTTP 5xx | 0 |
+| Other HTTP status | 0 |
+
+## Host security logs
+
+| Observation | Count |
+|---|---:|
+| Retained Falco events | 730 |
+| OUTPUT-DROP: | 6714 |
+| CONTAINER-EGRESS-BLOCK: | 369 |
+| METADATA-BLOCK: | 0 |
+| METADATA-BLOCK-OUT: | 172 |
+
+Request categories select known routes and probes. They do not cover every request. HTTP status counts cover every outside request. Addresses are not people.
+
+Host counts come from the retained Falco file and kernel journal. They are not linked to individual requests. Counts exclude undated Falco rows and connections that ended before HTTP. Retention and capture gaps can reduce totals. These logs do not establish exploit success.
+
+<!-- end daily totals -->
+
+## Historical watch appendix — 25 November 2026
+
+This earlier report used an Eastern time window and included operator probes. Do not add its totals to the UTC counts.
+
+### Security debrief
 
 Updated from New Relic at Nov 25 18:58:46 EST / 23:58:46 UTC. HTTP and connection totals cover the Eastern calendar day through Nov 25 18:57:45 EST / 23:57:45 UTC. The end time trails the query by one minute. Later runs re-query the full day to include delayed arrivals.
 

@@ -25,53 +25,26 @@ Readiness values of -1 mean unknown. A stale Falco cursor can indicate an idle s
 
 Verification: `GOTOOLCHAIN=go1.25.11 go test -race ./cmd/attackbox-watch`, matching `go vet`, independent source review, and a live read-only `-once` baseline. On 2026-11-24 the provider firewall allowed only administrator SSH; public honeypot ingress was closed. The overnight command does not change that state.
 
-## Publish findings to GitHub
+## Update daily findings
 
-The user authorized automatic findings commits and pushes for the watch that ends before 06:00 Eastern on 24 November 2026. The repository is public. The Go publisher at `/Users/rohit/attack-box/cmd/attackbox-findings/main.go` builds a new summary from numeric samples and fixed labels. It does not copy raw reports, request data, identifiers, addresses, headers, responses or captured instructions. Unknown labels are dropped or counted under a fixed warning label.
+Keep one report per UTC date. Do not create a report, branch, or commit for each watch run.
+Private watch snapshots remain separate. The November 24 and 25 Git publishers were time-limited jobs, not the daily reporting workflow.
 
-The legacy publisher uses a separate, fresh repository at `/Users/rohit/attack-box/.vultr/findings-publisher`. The branch is `findings/overnight-20261124`. Its only tracked file is `/Users/rohit/attack-box/.vultr/findings-publisher/findings/2026-11-24/README.md`. No source history is copied. The publisher checks the staged paths and all reachable commit paths before it pushes. It removes inherited Git environment settings and retains configured hooks and signing. Each Git command has a 30-second limit, reduced to the time left before the stop deadline. No force push is used.
-
-The publisher checks once per minute. A changed summary creates a commit. An unchanged summary creates no commit, but a failed push is retried. A lock prevents two local publishers from using the checkout at once. A partial sample write or mismatched report/sample count causes a retry. A final `complete` or `interrupted` report is pushed before the publisher exits. If no final report is published by 06:00 Eastern / 11:00 UTC, it exits with an error. The latest observation time remains visible in GitHub. A successful push does not prove New Relic receipt.
-
-The public report starts with a security debrief: assessment, observed activity, service response, containment, host health and evidence gaps. A recent timeline shows up to 12 collection windows. Exact counters and metrics are in a collapsed evidence appendix. The narrative uses fixed rules from `/Users/rohit/attack-box/cmd/attackbox-findings/debrief.go`. It labels routine polling as an interpretation, external-source traffic as activity that needs review, and denied packets as observations without a proven link to requests. It does not invent attacker intent, exploit success or a sequence that the aggregates cannot establish. Times show EST and UTC for this November campaign.
-
-Build from `/Users/rohit/attack-box`, then run in the existing isolated checkout:
+Use the read-only SSH alias `attackbox`. From the repository root, run:
 
 ```sh
-go build -o /Users/rohit/attack-box/.vultr/attackbox-findings ./cmd/attackbox-findings
-/usr/bin/caffeinate -i /Users/rohit/attack-box/.vultr/attackbox-findings \
-  -source /Users/rohit/attack-box/reports/overnight-20261124 \
-  -checkout /Users/rohit/attack-box/.vultr/findings-publisher \
-  -deadline 2026-11-24T11:00:00Z
+python3 scripts/daily-findings.py YYYY-MM-DD --own "$PRIOR_OPERATOR_IP"
 ```
 
-This command is specific to this watch date and branch. For a new watch, update the destination, branch, report date and deadline, then run the tests. Create a new empty repository; do not clone source history into it. Set the Git author from the operator configuration and set `origin` to the authorized GitHub repository. Do not add credentials to a remote URL. The current process runs detached. Its private log is `/Users/rohit/attack-box/.vultr/findings-publisher.log`; its launch record is `/Users/rohit/attack-box/.vultr/findings-publisher-launch.json`.
+Repeat `--own` for each additional operator address in use that day. The command excludes both ends of the SSH connection automatically.
+If there are no other operator addresses, omit `--own`. Do not put actual addresses in this repository.
 
-Verification: `GOTOOLCHAIN=go1.25.11 go test -race ./cmd/attackbox-findings` and `GOTOOLCHAIN=go1.25.11 go vet ./cmd/attackbox-findings`. Tests use a local bare remote to check failed-push retry, unchanged-content behavior, remote content, staged-file rejection, deleted private history, environment isolation, deadline rejection and data filtering. The live remote branch SHA is compared with the local HEAD after the first push.
+The command reads the retained public request capture, the current Falco log, and the kernel journal on the VPS.
+Only numeric aggregates return to the Mac. The report separates HTTP requests from host signals.
+Neither HTTP success nor a firewall denial establishes a compromise.
 
-## Daily findings on main
-
-On 25 November 2026, the user authorized daily findings on `main`. Use the `-main-date YYYY-MM-DD` mode for this workflow. The implementation is `/Users/rohit/attack-box/cmd/attackbox-findings/mainline.go`. Do not use the legacy orphan branch workflow to publish to `main`.
-
-Use a clean, isolated checkout on a local `findings/` branch with existing `main` ancestry. The publisher checks the exact origin URL and refuses tracked changes or unpublished commits outside the daily report path. It fetches `main`, rebases only its own pending report commits, and pushes without force. Concurrent source changes remain in history. A conflict or policy hook failure stops that attempt; the publisher does not bypass the policy. A lock in the Git directory prevents duplicate publishers for that checkout.
-
-The local process queries New Relic every five minutes. It reads `NEW_RELIC_API_KEY` and `NEW_RELIC_ACCOUNT_ID` from its environment. Do not put a key in arguments, reports or commits. The query needs read access; the process does not send telemetry or change account settings. HTTP responses are bounded to 1 MiB, redirects are refused, and each query has a 30-second deadline.
-
-Public request spans, pre-HTTP connection outcomes and recent health spans come from the port 443 public service. The visitor table requires a recorded transport peer. Older unaddressed spans are counted separately: they include historical loopback health checks and older releases without peer capture. Do not label all of them as visitors or as health checks. Public totals cover the Eastern calendar day. Each query ends one minute before the query time and re-reads the full day, so late arrivals can update earlier totals. The publisher does not add repeated cumulative totals. It distinguishes span records from distinct span IDs. Distinct counts can be estimates above 50,000 IDs. Request facet totals must match the ungrouped total before publication.
-
-The report uses fixed prose and allowed route, status, method and outcome labels. Unknown labels become `other` or `unknown`; arbitrary query text cannot enter Markdown. Source addresses, identities, payloads, credentials, request bodies and response bodies are excluded. HTTP success does not show exploit success. Operator checks can be present. A missing recent heartbeat is stated in the report. Failed queries leave the last successful report with its earlier update time.
-
-The host SSH watcher remains a separate source. Its proxy counts describe the private proxy, not the public decoy. Its legacy `component_count_not_12` warning can occur because the audit filter is now the thirteenth component; confirm individual running-state metrics before describing an outage. The public profile does not capture request or response bodies. No report can recover those bodies from metadata.
-
-Use an explicit future UTC deadline, at most twelve hours away. Set it at least ten minutes after the host watch ends to allow the final publication. The process exits after it publishes a complete or interrupted host watch and the final observation is at least two minutes old. This lets the lagged query pass the final observation time; it does not guarantee that all late telemetry has arrived. On 25 November, the existing host watch ends at 23:53:39 UTC / 18:53:39 Eastern. The publication deadline is 00:03:39 UTC on 26 November. The operator Mac must stay powered on and connected. `caffeinate -i` prevents idle sleep but cannot prevent shutdown or network loss.
-
-Example after the isolated checkout is clean and credentials are in the environment:
-
-```sh
-/usr/bin/caffeinate -i /Users/rohit/attack-box/.vultr/attackbox-findings-main-20261125 \
-  -source /Users/rohit/attack-box/reports/watch-20261125-public443 \
-  -checkout /Users/rohit/.treehouse/attack-box-c0acf2/15/attack-box \
-  -main-date 2026-11-25 -deadline 2026-11-26T00:03:39Z
-```
-
-Verification: from the source checkout, run `go test -race ./cmd/attackbox-findings ./cmd/attackbox-watch`, `go vet ./cmd/attackbox-findings ./cmd/attackbox-watch`, and `git diff --check`. Local bare-remote tests cover source preservation, concurrent main updates, pending report retries, unchanged content, unrelated staging, deleted private history, and a rejecting policy hook. Public-query fixtures check label filtering, day boundaries, GraphQL failures and facet coverage. Compare the first real remote report and commit with the local checkout before reporting publication as active.
+The command replaces the totals in `findings/YYYY-MM-DD/README.md`. It preserves reviewed notes below the daily totals marker.
+Run it after midnight UTC for the previous day, before the seven-day capture retention expires.
+For a partial day, run it again with the same date. Do not add the previous totals.
+Missing capture files or failed reads leave the existing report unchanged. Log rotation can limit coverage.
+The command does not install a schedule, commit, push, or change the VPS.
