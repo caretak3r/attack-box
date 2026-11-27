@@ -332,7 +332,7 @@ cmd_bootstrap() (
   commit=$(cd "$ROOT" && PLATFORM=linux/amd64 bash scripts/local-ci.sh authorize-deploy)
   account=${NEW_RELIC_ACCOUNT_ID:-0}
   [[ $account =~ ^[1-9][0-9]{0,11}$ ]] || die 'invalid NEW_RELIC_ACCOUNT_ID'
-  run="cd /root/attackbox-src && NEW_RELIC_ACCOUNT_ID=$account ./scripts/deploy-ubuntu.sh"
+  run="cd /root/attackbox-src && NEW_RELIC_ACCOUNT_ID=$account ATTACKBOX_RELEASE_VERSION=$commit ./scripts/deploy-ubuntu.sh"
   local files=("${BUNDLE[@]}")
   need jq; need git; need go; need tar; need ssh
   [ -n "$(st instance_id)" ] && [ -n "$(st main_ip)" ] || die "no instance recorded; run create first"

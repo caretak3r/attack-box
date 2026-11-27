@@ -156,6 +156,26 @@ test_public_gateway_restore() (
     [[ ! -s "$tmp/calls" ]] || return 1
     rm -rf "$tmp"
 )
+test_release_version_label() (
+    local tmp
+    tmp=$(mktemp -d)
+    ok() { :; }; err() { :; }
+    systemctl() { printf '%s\n' "$*" >> "$tmp/calls"; }
+    awk '/^set_release_version\(\) \{/ {copy=1} copy {print} copy && /^}/ {exit}' "$DEPLOY_SCRIPT" > "$tmp/function"
+    source "$tmp/function"
+    printf 'ATTACKBOX_HOST_ID=h1\nATTACKBOX_RELEASE_VERSION=old\nATTACKBOX_CAMPAIGN_ID=c1\n' > "$tmp/env"; chmod 600 "$tmp/env"
+    set_release_version "$tmp/env" || return 1
+    [[ ! -e "$tmp/calls" ]] || return 1
+    ATTACKBOX_RELEASE_VERSION=abc123 set_release_version "$tmp/env" || return 1
+    [[ "$(cat "$tmp/env")" == $'ATTACKBOX_HOST_ID=h1\nATTACKBOX_RELEASE_VERSION=abc123\nATTACKBOX_CAMPAIGN_ID=c1' ]] || return 1
+    [[ "$(cat "$tmp/calls")" == 'try-restart attackbox-otel.service' && ! -e "$tmp/env.bak" ]] || return 1
+    ATTACKBOX_RELEASE_VERSION=abc123 set_release_version "$tmp/env" || return 1
+    [[ "$(wc -l < "$tmp/calls")" -eq 1 ]] || return 1
+    ! ATTACKBOX_RELEASE_VERSION='a/b' set_release_version "$tmp/env" || return 1
+    ATTACKBOX_RELEASE_VERSION=abc123 set_release_version "$tmp/absent" || return 1
+    grep -q 'ATTACKBOX_RELEASE_VERSION=\$commit ./scripts/deploy-ubuntu.sh' "${SCRIPT_DIR}/vultr-launch.sh" || return 1
+    rm -rf "$tmp"
+)
 test_bootstrap_before_docker() { local boot_line=$(grep -n "bootstrap_firewall" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:bootstrap_firewall()" | head -1 | cut -d: -f1); local dock_line=$(grep -n "start_docker" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:start_docker()" | head -1 | cut -d: -f1); [[ -n "$boot_line" && -n "$dock_line" && "$boot_line" -lt "$dock_line" ]]; }
 test_docker_before_prepare() { local dock_line=$(grep -n "start_docker" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:start_docker()" | head -1 | cut -d: -f1); local prep_line=$(grep -n "prepare_bait" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:prepare_bait()" | head -1 | cut -d: -f1); [[ -n "$dock_line" && -n "$prep_line" && "$dock_line" -lt "$prep_line" ]]; }
 test_prepare_before_final_firewall() { local prep_line=$(grep -n "^[[:space:]]*prepare_bait$" "$DEPLOY_SCRIPT" | head -1 | cut -d: -f1); local fw_line=$(grep -n "^[[:space:]]*setup_firewall$" "$DEPLOY_SCRIPT" | head -1 | cut -d: -f1); [[ -n "$prep_line" && -n "$fw_line" && "$prep_line" -lt "$fw_line" ]]; }
@@ -234,6 +254,7 @@ main() {
     run_test "Docs no max_clients" test_docs_no_max_clients
     run_test "Docs socket paths" test_docs_socket_paths
     run_test "Public gateway restored after Docker stop" test_public_gateway_restore
+    run_test "Release label follows the deploy" test_release_version_label
     echo ""; echo "=========================================================="; echo "Test Results"; echo "=========================================================="
     echo "Tests run:    $TESTS_RUN"; echo -e "Tests passed: ${GREEN}$TESTS_PASSED${NC}"
     if [[ $TESTS_FAILED -gt 0 ]]; then echo -e "Tests failed: ${RED}$TESTS_FAILED${NC}"; exit 1; else echo -e "Tests failed: 0"; echo ""; echo -e "${GREEN}✓${NC} All tests passed"; exit 0; fi

@@ -167,7 +167,9 @@ sudo bash /opt/attackbox-src/scripts/deploy-ubuntu.sh --apply
 sudo bash /opt/attackbox-src/scripts/deploy-ubuntu.sh --verify
 ```
 
-With no mode flag the script performs preflight. `--dry-run` reports proposed setup actions; it is not a runtime rehearsal. `--apply` installs dependencies, users, firewall policy, gVisor, service units, container artifacts, and binaries. It builds before applying the final restrictive egress policy. `--refresh-sets` refreshes allowed endpoint addresses; stale entries remain until ruleset reload or reboot. The script installs its refresh entry point at `/usr/local/sbin/attackbox-deploy`.
+With no mode flag the script performs preflight. `--dry-run` reports proposed setup actions; it is not a runtime rehearsal. `--apply` installs dependencies, users, firewall policy, gVisor, service units, container artifacts, and binaries. It builds before applying the final restrictive egress policy. `--refresh-sets` refreshes allowed endpoint addresses; stale entries remain until a reboot or a restart of `nftables.service`. A reload of `nftables.service` keeps the set elements (verified on nftables 1.0.9). Do not restart `nftables.service`: a restart flushes the full ruleset, which includes the Docker rules. The script installs its refresh entry point at `/usr/local/sbin/attackbox-deploy`.
+
+When `/etc/attackbox/monitoring.env` exists and the launcher passes `ATTACKBOX_RELEASE_VERSION`, `--apply` sets that one field to the deployed commit and restarts `attackbox-otel.service`. It does not change `ATTACKBOX_DEPLOYMENT_ID` in `/etc/attackbox/shipper-monitoring.env`.
 
 `--apply` stops Docker, and this stops the public gateway. When `attackbox-public.service` is enabled, the installer starts the public gateway again after the bait starts. The public ports do not answer during the build. If the public gateway does not start, the installer completes the private checks and then exits with an error.
 

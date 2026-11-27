@@ -1212,6 +1212,20 @@ disable_cloud_init() {
     fi
 }
 
+# monitoring.env belongs to the operator. Only the release label follows the
+# deploy; the launcher passes the commit in ATTACKBOX_RELEASE_VERSION.
+set_release_version() {
+    local env_file="${1:-/etc/attackbox/monitoring.env}" version="${ATTACKBOX_RELEASE_VERSION:-}"
+    [[ -n "$version" && -f "$env_file" ]] || return 0
+    [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || { err "Invalid ATTACKBOX_RELEASE_VERSION"; return 1; }
+    grep -q '^ATTACKBOX_RELEASE_VERSION=' "$env_file" || return 0
+    ! grep -qx "ATTACKBOX_RELEASE_VERSION=$version" "$env_file" || return 0
+    sed -i.bak "s/^ATTACKBOX_RELEASE_VERSION=.*/ATTACKBOX_RELEASE_VERSION=$version/" "$env_file"
+    rm -f "$env_file.bak"
+    systemctl try-restart attackbox-otel.service
+    ok "Release label set to $version"
+}
+
 
 # Resolve Ubuntu mirrors
 resolve_ubuntu_mirrors() {
@@ -1526,6 +1540,7 @@ main() {
     setup_systemd_units
 
     if [[ "$MODE" == "apply" ]]; then
+        set_release_version
         start_services
         start_bait
         # Report a failure after the private checks; do not stop them.
