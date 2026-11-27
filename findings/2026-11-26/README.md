@@ -2,6 +2,8 @@
 
 Window: 2026-11-26 00:00:00 to 2026-11-27 00:00:00 UTC (end exclusive).
 
+[View in historical archive](https://silent.engineer/attack-box/findings/?day=2026-11-26) | [All findings](https://silent.engineer/attack-box/findings/)
+
 ## Public request capture
 
 | Observation | Count |
