@@ -7,6 +7,7 @@ AttackBox is a defensive honeypot for AI APIs. It simulates OpenAI, vLLM, and Ol
 - Returns synthetic API responses, including simulated streaming.
 - Records bounded, redacted service observations. Host adapters add runtime and egress observations.
 - Uses a Go shipper to validate records, queue them on disk, and deliver logs and metrics to New Relic.
+- Runs a separate public gateway that answers like common AI servers on ten TCP ports. The gateway records request metadata and the credentials that clients send. It runs no model.
 
 ## Architecture
 
@@ -23,6 +24,8 @@ flowchart LR
 The Ubuntu 24.04 Compose profile publishes the proxy on loopback and enables only the OpenAI persona. Docker Compose defines the containers. The gVisor override selects `runsc`. On the host, systemd manages the shipper and adapters. nftables applies network policy. Falco and the kernel journal supply host observations.
 
 Telemetry can be incomplete. A heartbeat does not prove that the system captured every request or that containment held. Treat all captured text as untrusted data.
+
+The public gateway is a separate service (`cmd/attackbox-public`). It does not use the bait, the shipper, or the disk queue. It runs in its own gVisor container, exports spans through its own OpenTelemetry Collector, and writes a request capture on the host. Read the [public gateway guide](docs/public-gateway.md).
 
 ## Local setup
 
@@ -59,6 +62,14 @@ make deploy PLATFORM=linux/amd64 COMMIT="$commit" APPROVE="$commit"
 
 Deployment requires the same clean checkout and a matching release record. The host rebuilds from the verified source. The local image ID is not proof that the rebuild is identical. See the [Vultr guide](docs/vultr-launch.md).
 
+The public gateway has its own release check. The check reads a fixed list of paths from one signed commit and builds the gateway image without network access. Set `ATTACKBOX_TEST_COLLECTOR` and `PUBLIC_COLLECTOR_ARCHIVE` to the pinned Collector binary and archive. Then run:
+
+```bash
+PLATFORM=linux/amd64 COMMIT="$commit" scripts/public-release-check.sh check
+```
+
+A stage of the gateway on the host and a change of the public firewall each require separate approval.
+
 ## Documentation site
 
 Read the [AttackBox documentation](https://silent.engineer/attack-box/) for capabilities, architecture, operation, and local setup.
@@ -75,4 +86,4 @@ pnpm dev --hostname 127.0.0.1
 
 Open `http://127.0.0.1:3000/`. The build writes the static site to `site/out/`. The development server is for local preview only.
 
-For more detail, read the [architecture guide](docs/architecture.md), [operator guide](docs/operator.md), or [New Relic runbook](docs/newrelic-runbook.md).
+For more detail, read the [architecture guide](docs/architecture.md), [operator guide](docs/operator.md), [public gateway guide](docs/public-gateway.md), or [New Relic runbook](docs/newrelic-runbook.md).

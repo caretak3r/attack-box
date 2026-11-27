@@ -79,6 +79,10 @@ The Ubuntu deployment profile applies multiple containment controls. The table l
 
 No capability grants, no privileged mode, and no Docker socket access.
 
+## Public gateway
+
+The public gateway is a second Go service in its own gVisor container. It does not use the bait, the shipper, or the disk queue. It exports spans through its own Collector on the host, and that Collector holds the ingest key. A request capture stays on the host. Read [Public gateway](/public-gateway/) for the ports, the records, and the limits.
+
 ## Traces
 
 The bait and shipper export OTLP traces over a Unix socket to a local OpenTelemetry Collector. The Collector forwards traces to New Relic when configured.

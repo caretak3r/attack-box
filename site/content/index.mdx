@@ -8,6 +8,8 @@ AttackBox is a defensive honeypot for AI service interfaces. It records how clie
 
 AttackBox implements OpenAI, vLLM, and Ollama API personas. The responses are synthetic. AttackBox does not run models, execute client instructions, or contact destinations from request payloads.
 
+A separate public gateway answers on public ports like common AI servers. Its answers are also synthetic.
+
 ## Functions
 
 | Function | What AttackBox does |
@@ -21,6 +23,7 @@ AttackBox implements OpenAI, vLLM, and Ollama API personas. The responses are sy
 The supplied Ubuntu deployment uses an nginx proxy on host loopback and enables only the OpenAI persona. Local development does not need Docker, a VPS, or a New Relic key.
 
 - [Capabilities](/capabilities/) lists API routes, log streams, host evidence, delivery mechanisms, operator tools, and limits.
+- [Public gateway](/public-gateway/) lists the public ports, the answers, the records, and the limits of the gateway.
 - [Architecture](/architecture/) explains the data flow, trust boundaries, containment layers, and what the records can prove.
 - [Operation](/operation/) describes startup, per-request steps, host adapters, heartbeats, health checks, and release gates.
 - [Local setup](/local-setup/) starts a loopback instance with remote telemetry disabled.
