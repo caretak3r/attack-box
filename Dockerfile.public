@@ -1,0 +1,17 @@
+# syntax=docker/dockerfile:1
+FROM cgr.dev/chainguard/go@sha256:f90bc942e1f05e2d6b3b37af550fe50bbac9134a267b529573eddb50996656ab AS builder
+WORKDIR /work
+COPY go.mod go.sum ./
+COPY vendor/ ./vendor/
+COPY cmd/attackbox-public/ ./cmd/attackbox-public/
+COPY internal/publicedge/ ./internal/publicedge/
+COPY internal/observability/ ./internal/observability/
+ARG RELEASE_VERSION
+RUN CGO_ENABLED=0 GOFLAGS=-mod=vendor go build -trimpath \
+    -ldflags="-s -w -X main.version=${RELEASE_VERSION}" \
+    -o /work/out/attackbox-public ./cmd/attackbox-public
+
+FROM cgr.dev/chainguard/static@sha256:8658e9eaeb2294fa0e49b0667f7d66b4e21fa7690b8d2a4c30cd1d013ceb9eb7
+USER 65532:65532
+COPY --from=builder --chown=65532:65532 /work/out/attackbox-public /attackbox-public
+ENTRYPOINT ["/attackbox-public"]

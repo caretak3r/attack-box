@@ -1,0 +1,18 @@
+[Unit]
+Description=AttackBox Public Decoy
+After=docker.service nftables.service attackbox-public-otel.service
+Requires=docker.service nftables.service attackbox-public-otel.service
+PartOf=docker.service attackbox-public-otel.service
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/usr/local/libexec/attackbox-public-compose up
+ExecStopPost=/usr/local/libexec/attackbox-public-compose down
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=150s
+TimeoutStopSec=35s
+
+[Install]
+WantedBy=multi-user.target

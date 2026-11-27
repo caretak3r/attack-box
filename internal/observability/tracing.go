@@ -32,6 +32,7 @@ const exportTimeout = 2 * time.Second
 type Config struct{ Socket, HostID, InstanceID, ContainerID, CampaignID string }
 
 var identity = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+var publicService = regexp.MustCompile(`^attackbox-public-(80|443|1234|3000|4891|5000|6333|6334|8000|8001|8002|8080|8500|8501|11434|19530)$`)
 
 func FromEnv(get func(string) string) (Config, error) {
 	c := Config{get("ATTACKBOX_OTEL_SOCKET"), get("ATTACKBOX_HOST_ID"), get("ATTACKBOX_SERVICE_INSTANCE_ID"), get("ATTACKBOX_CONTAINER_ID"), get("ATTACKBOX_CAMPAIGN_ID")}
@@ -72,7 +73,7 @@ func New(ctx context.Context, c Config, service, version string) (*Runtime, erro
 	if c.Socket == "" {
 		return r, nil
 	}
-	if service != "attackbox-bait" && service != "attackbox-shipper" {
+	if service != "attackbox-bait" && service != "attackbox-shipper" && !publicService.MatchString(service) {
 		return nil, errors.New("unsupported trace service")
 	}
 	// The dialer ignores all remote addresses. Supplying this connection and empty
@@ -100,7 +101,12 @@ func New(ctx context.Context, c Config, service, version string) (*Runtime, erro
 	r.processor, r.conn = p, conn
 	// Explicit options ignore global sampler/resource settings. A caller never
 	// installs this provider globally or extracts attacker propagation headers.
-	r.provider = sdk.NewTracerProvider(sdk.WithoutPanicRecording(), sdk.WithSampler(sdk.AlwaysSample()), sdk.WithResource(resource.NewSchemaless(attrs...)), sdk.WithSpanLimits(sdk.SpanLimits{AttributeValueLengthLimit: 128, AttributeCountLimit: 16, EventCountLimit: 4, LinkCountLimit: 0, AttributePerEventCountLimit: 4, AttributePerLinkCountLimit: 0}), sdk.WithSpanProcessor(p))
+	// The public service exports full credential values (up to 512 bytes); its Collector bounds every other attribute.
+	valueLimit := 128
+	if publicService.MatchString(service) {
+		valueLimit = 512
+	}
+	r.provider = sdk.NewTracerProvider(sdk.WithoutPanicRecording(), sdk.WithSampler(sdk.AlwaysSample()), sdk.WithResource(resource.NewSchemaless(attrs...)), sdk.WithSpanLimits(sdk.SpanLimits{AttributeValueLengthLimit: valueLimit, AttributeCountLimit: 16, EventCountLimit: 4, LinkCountLimit: 0, AttributePerEventCountLimit: 4, AttributePerLinkCountLimit: 0}), sdk.WithSpanProcessor(p))
 	r.Tracer = r.provider.Tracer("attackbox")
 	return r, nil
 }

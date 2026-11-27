@@ -210,3 +210,26 @@ func TestForceFlushDrainsPendingSnapshot(t *testing.T) {
 		t.Fatalf("flushed %d of 300", got)
 	}
 }
+
+func TestPublicServiceIdentityAllowlist(t *testing.T) {
+	cfg := Config{Socket: "/tmp/attackbox-public-otel.sock", HostID: "host-1", InstanceID: "public-1"}
+	for _, service := range []string{
+		"attackbox-public-80", "attackbox-public-443", "attackbox-public-1234", "attackbox-public-3000",
+		"attackbox-public-4891", "attackbox-public-5000", "attackbox-public-6333", "attackbox-public-6334",
+		"attackbox-public-8000", "attackbox-public-8001", "attackbox-public-8002", "attackbox-public-8080",
+		"attackbox-public-8500", "attackbox-public-8501", "attackbox-public-11434", "attackbox-public-19530",
+	} {
+		r, err := New(context.Background(), cfg, service, "test")
+		if err != nil {
+			t.Fatalf("%s: %v", service, err)
+		}
+		if err := r.Close(); err != nil {
+			t.Fatalf("%s: %v", service, err)
+		}
+	}
+	for _, service := range []string{"attackbox-public-22", "attackbox-public-0443", "attackbox-public-99999", "other"} {
+		if _, err := New(context.Background(), cfg, service, "test"); err == nil {
+			t.Fatalf("accepted unapproved service %s", service)
+		}
+	}
+}

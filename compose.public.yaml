@@ -1,0 +1,65 @@
+services:
+  public:
+    image: ${ATTACKBOX_PUBLIC_IMAGE:?set ATTACKBOX_PUBLIC_IMAGE}
+    pull_policy: never
+    platform: linux/amd64
+    container_name: attackbox-public
+    runtime: runsc
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    cpus: 2.0
+    mem_limit: 512m
+    pids_limit: 128
+    ulimits:
+      nofile:
+        soft: 512
+        hard: 512
+    stop_grace_period: 20s
+    restart: on-failure
+    logging:
+      driver: none
+    environment:
+      ATTACKBOX_PUBLIC_OTEL_SOCKET: /run/attackbox-public-otel/otlp.sock
+      ATTACKBOX_HOST_ID: ${ATTACKBOX_HOST_ID:?set ATTACKBOX_HOST_ID}
+      ATTACKBOX_CAMPAIGN_ID: ${ATTACKBOX_CAMPAIGN_ID:?set ATTACKBOX_CAMPAIGN_ID}
+      ATTACKBOX_PUBLIC_TLS_CERT: /run/secrets/fullchain.pem
+      ATTACKBOX_PUBLIC_TLS_KEY: /run/secrets/privkey.pem
+      ATTACKBOX_PUBLIC_CAPTURE_DIR: /var/lib/attackbox-public-capture
+    volumes:
+      - type: bind
+        source: /run/attackbox-public-otel
+        target: /run/attackbox-public-otel
+        read_only: true
+      - type: bind
+        source: /etc/attackbox-public/tls
+        target: /run/secrets
+        read_only: true
+      # Raw requests stay on the host; the app keeps 7 days at up to 256 MiB per day.
+      - type: bind
+        source: /var/lib/attackbox-public-capture/requests
+        target: /var/lib/attackbox-public-capture
+    ports:
+      - "${ATTACKBOX_PUBLIC_BIND_IP:?set ATTACKBOX_PUBLIC_BIND_IP}:443:8443/tcp"
+      - "${ATTACKBOX_PUBLIC_BIND_IP:?set ATTACKBOX_PUBLIC_BIND_IP}:80:20080/tcp"
+      - "${ATTACKBOX_PUBLIC_BIND_IP:?set ATTACKBOX_PUBLIC_BIND_IP}:1234:21234/tcp"
+      - "${ATTACKBOX_PUBLIC_BIND_IP:?set ATTACKBOX_PUBLIC_BIND_IP}:3000:23000/tcp"
+      - "${ATTACKBOX_PUBLIC_BIND_IP:?set ATTACKBOX_PUBLIC_BIND_IP}:4000:24000/tcp"
+      - "${ATTACKBOX_PUBLIC_BIND_IP:?set ATTACKBOX_PUBLIC_BIND_IP}:8000:28000/tcp"
+      - "${ATTACKBOX_PUBLIC_BIND_IP:?set ATTACKBOX_PUBLIC_BIND_IP}:8080:28080/tcp"
+      - "${ATTACKBOX_PUBLIC_BIND_IP:?set ATTACKBOX_PUBLIC_BIND_IP}:8188:28188/tcp"
+      - "${ATTACKBOX_PUBLIC_BIND_IP:?set ATTACKBOX_PUBLIC_BIND_IP}:8888:28888/tcp"
+      - "${ATTACKBOX_PUBLIC_BIND_IP:?set ATTACKBOX_PUBLIC_BIND_IP}:11434:31434/tcp"
+    healthcheck:
+      test: ["CMD", "/attackbox-public", "--healthcheck"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 30s
+    networks: [public]
+
+networks:
+  public:
+    driver: bridge
