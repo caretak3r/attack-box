@@ -126,7 +126,7 @@ The binary supports `-version` and `-stdin-stream runtime|egress`. It does not h
 | `ATTACKBOX_NR_LOG_URL` | `https://log-api.newrelic.com/log/v1` | HTTPS ingest endpoint; no automatic regional selection |
 | `ATTACKBOX_NR_METRIC_URL` | `https://metric-api.newrelic.com/metric/v1` | HTTPS ingest endpoint; no automatic regional selection |
 | `ATTACKBOX_SENSOR_ID` | Lowercase hostname, or `attackbox` if invalid | Stable sensor label on shipper logs and metrics |
-| `ATTACKBOX_DEPLOYMENT_ID` | `unset` | Deployment label on shipper logs and metrics |
+| `ATTACKBOX_DEPLOYMENT_ID` | `unset` | Deployment label on shipper logs and metrics. On a monitored host it is the campaign ID, not a commit |
 | `ATTACKBOX_SPOOL_SOCKET` | `/run/attackbox/spool.sock` | Bait UID 65532; 4 connections, 1 MiB/s, 4 MiB burst |
 | `ATTACKBOX_RUNTIME_SOCKET` | Disabled | Root producer; 2 connections, 256 KiB/s, 4 MiB burst |
 | `ATTACKBOX_EGRESS_SOCKET` | Disabled | Root producer; 2 connections, 128 KiB/s, 4 MiB burst |
@@ -169,7 +169,7 @@ sudo bash /opt/attackbox-src/scripts/deploy-ubuntu.sh --verify
 
 With no mode flag the script performs preflight. `--dry-run` reports proposed setup actions; it is not a runtime rehearsal. `--apply` installs dependencies, users, firewall policy, gVisor, service units, container artifacts, and binaries. It builds before applying the final restrictive egress policy. `--refresh-sets` refreshes allowed endpoint addresses; stale entries remain until a reboot or a restart of `nftables.service`. A reload of `nftables.service` keeps the set elements (verified on nftables 1.0.9). Do not restart `nftables.service`: a restart flushes the full ruleset, which includes the Docker rules. The script installs its refresh entry point at `/usr/local/sbin/attackbox-deploy`.
 
-When `/etc/attackbox/monitoring.env` exists and the launcher passes `ATTACKBOX_RELEASE_VERSION`, `--apply` sets that one field to the deployed commit and restarts `attackbox-otel.service`. It does not change `ATTACKBOX_DEPLOYMENT_ID` in `/etc/attackbox/shipper-monitoring.env`.
+When `/etc/attackbox/monitoring.env` exists and the launcher passes `ATTACKBOX_RELEASE_VERSION`, `--apply` sets that one field to the deployed commit and restarts `attackbox-otel.service`. It does not change `ATTACKBOX_DEPLOYMENT_ID` in `/etc/attackbox/shipper-monitoring.env`. That field is the campaign ID: `deploy/otel/prepare-env.py` copies it from `ATTACKBOX_CAMPAIGN_ID`. Do not set it to a commit. The commit is in `ATTACKBOX_RELEASE_VERSION`.
 
 `--apply` stops Docker, and this stops the public gateway. When `attackbox-public.service` is enabled, the installer starts the public gateway again after the bait starts. The public ports do not answer during the build. If the public gateway does not start, the installer completes the private checks and then exits with an error.
 
