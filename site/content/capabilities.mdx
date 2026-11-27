@@ -24,6 +24,10 @@ The bait answers every inference request from local templates. Responses include
 
 AttackBox does not run models, execute shell commands, call tools, or fetch client-supplied destinations. Responses are synthetic data.
 
+## Public gateway
+
+A separate gateway service answers on public ports like common AI servers. [Public gateway](/public-gateway/) lists its ports, answers, records, and limits.
+
 ## Observation features
 
 The responder records client declarations and measures reply compliance with counter-probes. Probes embed synthetic directives and credentials.
@@ -107,5 +111,5 @@ The read-only root filesystem prevents writes outside `/tmp`. Container resource
 - Fetch client-supplied URLs or destinations
 - Open files or directories from request content
 - Write unbounded logs or queue entries
-- Accept requests from non-loopback sources in the supplied deployment
+- Accept requests from non-loopback sources on the bait in the supplied deployment. The [public gateway](/public-gateway/) is the only public service.
 - Prove complete collection or containment

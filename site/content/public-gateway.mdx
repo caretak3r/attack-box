@@ -1,0 +1,101 @@
+---
+title: Public gateway
+---
+
+# Public gateway
+
+The public gateway is the AttackBox service that accepts connections from the Internet. It answers like common AI servers. It runs no model and no client instruction.
+
+The gateway is separate from the bait. It shares no socket, queue, or key with the bait and the shipper.
+
+## Ports
+
+The gateway listens on ten TCP ports. Port 443 uses TLS. The other ports use plain HTTP.
+
+| Port | Answers like |
+|---|---|
+| 443 | An API gateway that asks for a key |
+| 80 | The same API routes, without a key |
+| 11434 | Ollama |
+| 1234 | LM Studio |
+| 8000 | vLLM |
+| 8080 | llama.cpp |
+| 3000 | Open WebUI |
+| 4000 | LiteLLM proxy |
+| 8188 | ComfyUI |
+| 8888 | Jupyter Server |
+
+A product port also answers the fixed paths of its product, for example a health path or a version path. On port 443, the first label of the `Host` name can select the Ollama, Open WebUI, or LiteLLM answers.
+
+## Route families
+
+The gateway matches a request by the end of its path. All ports answer these route families.
+
+| Path ends with | Answer format |
+|---|---|
+| `/models` | OpenAI model list |
+| `/chat/completions`, `/completions`, `/embeddings` | OpenAI answer, with Server-Sent Events when the client asks for a stream |
+| `/messages` | Anthropic message, with Server-Sent Events when the client asks for a stream |
+| `/api/tags`, `/api/chat`, `/api/generate`, `/api/show`, `/api/pull`, `/api/create`, `/api/delete`, `/api/embed`, `/api/embeddings` | Ollama answer, with NDJSON for a stream |
+| `/mcp` | Model Context Protocol answer over HTTP |
+
+Other paths return 404, and the record gets a probe class from a fixed list.
+
+## Answers
+
+The gateway selects a fixed answer from the text of the last user message. A greeting gets a greeting. A short sum gets its result. All other text gets a request for more details. The answer comes in pieces that look like tokens.
+
+The MCP endpoint lists four tools. A tool call returns an error result. The gateway runs no command, reads no file, and opens no connection.
+
+The gateway stores nothing between requests. A model that a client creates, pulls, or deletes does not change the model list.
+
+## Lures
+
+| Lure | Behavior |
+|---|---|
+| Key request | Ports 443, 3000, and 4000 return 401 until the request contains a credential. The gateway accepts each value. Thus a client shows the key that it has. |
+| Fake env file | A request for an env file path gets a small file with a fake API key. Each client gets its own key. No service accepts the key. |
+
+If a later request contains a fake key, the records connect that request to the client that fetched the file.
+
+## Records
+
+| Record | Content |
+|---|---|
+| Request span | The source address of the TCP peer, the port, the method, a route label, the status, the probe class, the model name, and the first credential as the client sent it. |
+| Connection span | A connection that ended before an HTTP request, with its outcome. Port scans and TLS failures are examples. |
+| Health span | Counters for captured requests, lost capture lines, refused requests, and refused connections. |
+| Request capture | A file on the host for each UTC day. Each line contains the request target, the headers, and the body. |
+
+The source address is the TCP peer. The gateway ignores forwarded-address headers.
+
+A span does not contain prompts, bodies, raw paths, or arbitrary headers. The request capture does contain them, and the gateway does not redact it. The capture stays on the host. Treat it as hostile data: do not open its URLs or run its contents.
+
+## Limits
+
+| Control | Limit |
+|---|---|
+| Request rate | 5 requests each second from all clients together, with a burst of 40. The gateway answers 429 to the others. |
+| Connections | 128 at the same time. |
+| Request body | 64 KiB. |
+| Connection spans | 1 each second, with a burst of 16. A counter keeps the full number. |
+| Request capture | 7 UTC days, and at most 256 MiB each day. |
+
+Bounded queues can lose spans. The records do not prove complete collection.
+
+## Isolation
+
+| Layer | Mechanism |
+|---|---|
+| Container | gVisor runtime, UID 65532, read-only root file system, no capabilities, and no new privileges. |
+| Resources | 2 CPUs, 512 MiB of memory, and 128 processes. |
+| Ingest key | The container holds no ingest key. A Collector on the host holds the key and runs as a separate account. |
+| Release | The release check reads a fixed list of paths from one signed commit. The host verifies the bundle before it installs it. |
+
+## What the gateway does not do
+
+- Run models or inference engines
+- Run a prompt, a tool call, a workflow, or a command
+- Fetch client-supplied URLs or destinations
+- Use a credential that a client sends
+- Share a socket, a queue, or a key with the bait and the shipper

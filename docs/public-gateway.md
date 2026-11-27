@@ -1,4 +1,8 @@
-# Inspect public HTTPS traffic
+# Public gateway
+
+The public gateway is the service that the Internet can reach. Its source is in `cmd/attackbox-public` and `internal/publicedge`. The gateway is separate from the private bait and the shipper. It shares no socket, queue, or key with them. This guide tells you what the gateway answers and how to inspect its records.
+
+## Inspect the traffic
 
 The isolated public gateway publishes ten TCP ports on the public IPv4 address. Port 443 uses TLS and maps to container port 8443. Ports 80, 1234, 3000, 4000, 8000, 8080, 8188, 8888, and 11434 use plain HTTP. Each plain port maps to container port 20000 plus the public port. All ports give the same synthetic responses to the route families, and each record keeps the port that the request used.
 
@@ -161,7 +165,7 @@ FACET `attackbox.probe.class` SINCE 1 day ago
 
 ## Local request capture
 
-The service writes each request line that reaches the gateway to `/var/lib/attackbox-public-capture/requests/capture-YYYYMMDD.jsonl` on the host. Each JSON line contains the time, peer IP, method, raw request target with its query string, `Host`, `User-Agent`, route label, status, probe class, listener port (443), protocol version, request headers, and request body. The service clips the target at 2048 bytes, text header fields at 256 bytes, header names at 64 bytes, and header values at 512 bytes. It stores at most 48 header pairs sorted by canonical name and value order. It records the request body up to the 64 KiB request limit, counts the bytes read, and hashes them with SHA-256. JSON encoding escapes control characters and invalid UTF-8.
+The service writes each request line that reaches the gateway to `/var/lib/attackbox-public-capture/requests/capture-YYYYMMDD.jsonl` on the host. Each JSON line contains the time, peer IP, method, raw request target with its query string, `Host`, `User-Agent`, route label, status, probe class, listener port, protocol version, request headers, and request body. The service clips the target at 2048 bytes, text header fields at 256 bytes, header names at 64 bytes, and header values at 512 bytes. It stores at most 48 header pairs sorted by canonical name and value order. It records the request body up to the 64 KiB request limit, counts the bytes read, and hashes them with SHA-256. JSON encoding escapes control characters and invalid UTF-8.
 
 The service keeps 7 UTC days and writes at most 256 MiB each day. `public.health` counts written lines in `attackbox.captured_requests` and lost lines in `attackbox.capture_dropped`. The parent directory is root-only. A stage creates the directory once. A rollback keeps it. The capture stays on the host. Only the credential fields above go to New Relic.
 
@@ -194,3 +198,31 @@ The service sends at most one connection span each second, with a burst of 16. T
 The service does not export prompts, bodies, query names or values other than a credential, raw paths, arbitrary headers, or received bytes. HTTP parser failures after a TLS handshake produce a `no_request` connection span, not a request span. The service admits at most five requests each second from all clients together, with a burst of 40. It answers 429 to the others and counts them in `attackbox.rate_limited_requests`. Those requests are not captured. Bounded queues can lose spans.
 
 Before live export, confirm who can query spans and how long the account retains exact IP addresses. Use a client with a known egress IP to check the public path after an approved deployment. Do not use a forwarded header as proof.
+
+## Source, checks, and release
+
+|Path|Content|
+|---|---|
+|`cmd/attackbox-public`|The listeners, the limits, the health check, and the span export.|
+|`internal/publicedge`|The route families, the port answers, the answer text, the MCP endpoint, and the request capture.|
+|`compose.public.yaml`, `Dockerfile.public`|The container: gVisor runtime, user 65532, read-only root file system, and no capabilities.|
+|`deploy/public-otel/`, `deploy/systemd/attackbox-public.service`, `deploy/systemd/attackbox-public-otel.service`|The Collector of the gateway and the two host units.|
+|`scripts/public-release-check.sh`, `scripts/verify-public-bundle.sh`, `scripts/public-host-stage.sh`|The release check, the bundle verification, and the host stage with its rollback.|
+
+The gateway container holds no ingest key. It sends spans through a Unix socket to its own Collector on the host. That Collector runs as a separate account and holds the key.
+
+Run the Go tests of the gateway from the repository root:
+
+```bash
+go test -race ./cmd/attackbox-public ./internal/publicedge ./internal/observability ./deploy/public-otel
+```
+
+The Collector tests skip unless `ATTACKBOX_TEST_COLLECTOR` is the absolute path of the pinned Collector binary. `deploy/otel/version.env` contains the Collector version and the archive checksums.
+
+The release check reads a fixed list of paths from one signed commit. A file that is not in the list is not in the release. If you add a source file to the gateway, add it to the `paths` list in `scripts/public-release-check.sh`. If you add a route label, add it to the route allowlist in `deploy/public-otel/config.yaml`.
+
+```bash
+PLATFORM=linux/amd64 COMMIT="$commit" scripts/public-release-check.sh check
+```
+
+The check needs Docker, a clean checkout at that commit, `ATTACKBOX_TEST_COLLECTOR`, and `PUBLIC_COLLECTOR_ARCHIVE`. It runs the tests, builds the image without network access, and writes a release record. The `authorize` and `package` modes also need `APPROVE` set to the same commit ID. A stage on the host and a change of the public firewall each require separate approval.
