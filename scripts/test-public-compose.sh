@@ -126,6 +126,23 @@ for action in up down; do
   fi
   export FAKE_EXIT=0
 done
+unset ATTACKBOX_PUBLIC_BIND_IP DOCKER_HOST
+export DOCKER_HOST=unix:///var/run/docker.sock
+: > "$FAKE_LOG"
+export FAKE_EXIT=42
+/public-compose.sh down >/dev/null 2>&1 || true
+if ! grep -qx -- '--project-name' "$FAKE_LOG" || ! grep -qxF "$project" "$FAKE_LOG"; then
+  fail 'failed cleanup did not use project-scoped command'
+fi
+# Verify no other project names or unscoped resource names appear
+other_project=attackbox-public-ffffffffffffffffffffffff
+if grep -qF "$other_project" "$FAKE_LOG"; then
+  fail 'failed cleanup attempted operation on unrelated project'
+fi
+if grep -qE '(container|network) (stop|rm|remove)' "$FAKE_LOG"; then
+  fail 'failed cleanup attempted unscoped resource operation'
+fi
+export FAKE_EXIT=0
 export FAKE_ID=not-a-container
 rm -f /tmp/notify-argv
 if /public-compose.sh up >/dev/null 2>&1; then fail 'invalid container identity reported success'; fi
