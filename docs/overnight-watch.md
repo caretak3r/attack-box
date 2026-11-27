@@ -48,3 +48,16 @@ Run it after midnight UTC for the previous day, before the seven-day capture ret
 For a partial day, run it again with the same date. Do not add the previous totals.
 Missing capture files or failed reads leave the existing report unchanged. Log rotation can limit coverage.
 The command does not install a schedule, commit, push, or change the VPS.
+
+### Scheduled archive
+
+The operator Mac runs `org.duckdns.attackbox-daily-findings` at 00:15 local time.
+It publishes closed UTC days, not a rolling 24-hour window. It checks up to six previous dates after missed runs.
+Each changed date gets one Markdown report and one public traffic map. Unchanged dates create no commit.
+The [archive dashboard](https://silent.engineer/attack-box/findings/) shows all published dates. Each report links to its own view.
+
+The job uses a fresh checkout of `main`, a private address list, signed commits, and the repository's secret checks.
+The publisher stops if its collector or safety checks differ from the installed copies. Review those changes before reinstalling the publisher.
+Check the job with `launchctl print gui/$(id -u)/org.duckdns.attackbox-daily-findings`.
+To stop it, use `launchctl bootout gui/$(id -u)/org.duckdns.attackbox-daily-findings`.
+The Mac needs a logged-in session, access to the VPS and Git remote, and a signing key that works without interaction.

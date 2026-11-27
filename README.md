@@ -62,6 +62,7 @@ Deployment requires the same clean checkout and a matching release record. The h
 ## Documentation site
 
 Read the [AttackBox documentation](https://silent.engineer/attack-box/) for capabilities, architecture, operation, and local setup.
+Browse the [preserved traffic dashboard](https://silent.engineer/attack-box/findings/) for all reports or select one UTC day.
 
 The static site uses Nextra, Next.js, React, MDX, Mermaid, KaTeX, and Pagefind. Install Node.js 22 or later and pnpm 10. From the repository root, run:
 
