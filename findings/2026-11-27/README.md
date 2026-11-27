@@ -45,3 +45,7 @@ Request categories select known routes and probes. They do not cover every reque
 Host counts come from the retained Falco file and kernel journal. They are not linked to individual requests. Counts exclude undated Falco rows and connections that ended before HTTP. Retention and capture gaps can reduce totals. These logs do not establish exploit success.
 
 <!-- end daily totals -->
+
+## Case study
+
+[One Ollama client’s prompt journey](ollama-prompt-journey.md): a cross-model generation check followed by repeated chat turns.
