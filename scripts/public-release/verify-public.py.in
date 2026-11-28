@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+import hashlib, http.client, json, os, pathlib, re, socket, ssl, subprocess, sys, tempfile, time, urllib.request
+launcher = os.getenv('ATTACKBOX_VULTR_LAUNCH', '@REPO_ROOT@/scripts/vultr-launch.sh')
+folder = pathlib.Path(__file__).resolve().parent
+rev = '@COMMIT@'
+name, ip, egress = '@PUBLIC_NAME@', '@PUBLIC_IP@', '@ADMIN_CIDR@'
+egress = egress.split('/')[0]
+pin = 'D5ADDFC15CD87E9775871A98CD3579F897B16490B0314B24EC76811B38DC1EA1'
+
+def https_check():
+	ledger = json.loads((folder/'firewall/public-firewall-ledger.json').read_text())
+	if ledger['phase'] != 'open' or ledger['commit'] != rev:
+		raise RuntimeError('no matching open rule')
+	if socket.gethostbyname(name) != ip:
+		raise RuntimeError('DNS target changed')
+	for _ in range(30):
+		try:
+			with socket.create_connection((ip, 443), timeout=5) as tcp:
+				pass
+			break
+		except (socket.timeout, ConnectionRefusedError, OSError):
+			time.sleep(5)
+	else:
+		raise RuntimeError('TCP 443 unreachable for 150 s')
+	ctx = ssl.create_default_context()
+	with socket.create_connection((ip, 443), timeout=10) as tcp, ctx.wrap_socket(tcp, server_hostname=name) as tls:
+		leaf = hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest().upper()
+		conn = http.client.HTTPSConnection(name, context=ctx, sock=tls)
+		conn.request('GET', '/v1/models', headers={'User-Agent': f'attackbox-deploy-test/{rev[:12]}', 'Authorization': 'Bearer sk-test'})
+		res = conn.getresponse()
+		body = json.loads(res.read(65537))
+	ids = [m.get('id') for m in body.get('data', [])]
+	if leaf != pin or res.status != 200 or len(ids) != 21 or ids[0] != 'local-instruct-8b' or 'gpt-4o' not in ids:
+		raise RuntimeError(f'unexpected HTTPS result: status={res.status}, pinned={leaf == pin}')
+	time.sleep(1.2)
+	h2 = subprocess.run(['curl', '-sS', '--http2', '--max-time', '10', '-o', '/dev/null', '-w', '%{http_code} %{http_version}',
+						 '-A', f'attackbox-deploy-test/{rev[:12]}', f'https://{name}/v1/models'], capture_output=True, text=True)
+	if h2.stdout.strip() != '401 2':
+		raise RuntimeError(f'HTTP/2 or the key check on 443 failed: {h2.stdout.strip()!r}')
+	byname = subprocess.run(['curl', '-sS', '--max-time', '10', '-A', f'attackbox-deploy-test/{rev[:12]}', f'https://ollama.{name}/'], capture_output=True, text=True)
+	if byname.stdout != 'Ollama is running':
+		raise RuntimeError('the host name ollama on 443 did not give the Ollama answer')
+	plain = [80, 1234, 3000, 4000, 8000, 8080, 8188, 8888, 11434]
+	local, keyed = {1234, 8000, 8080, 11434}, {3000, 4000}
+	for port in plain:
+		for _ in range(10):
+			try:
+				with socket.create_connection((ip, port), timeout=5) as tcp:
+					pass
+				break
+			except (socket.timeout, ConnectionRefusedError, OSError):
+				time.sleep(5)
+		else:
+			raise RuntimeError(f'TCP {port} unreachable')
+		conn = http.client.HTTPConnection(ip, port, timeout=10)
+		conn.request('GET', '/v1/models', headers={'User-Agent': f'attackbox-deploy-test/{rev[:12]}'})
+		res = conn.getresponse()
+		body = json.loads(res.read(65537))
+		conn.close()
+		ids = [m.get('id') for m in body.get('data', [])]
+		expect_len = 9 if port in local else 21
+		expect_status = 401 if port in keyed else 200
+		if res.status != expect_status or len(ids) != (0 if expect_status==401 else expect_len):
+			raise RuntimeError(f'unexpected plain HTTP result on port {port}: status={res.status}')
+	return dict(http=200, http2=True, tls='TLSv1.3', trusted=True, leaf=pin, model='local-instruct-8b', plain_ports=plain, rules=ledger['rules'])
+
+def evidence_count(pattern):
+	sshq = lambda cmd: subprocess.check_output(['/bin/bash', launcher, 'ssh', cmd],stdin=subprocess.DEVNULL,timeout=30,text=True)
+	script = f'''
+set -euo pipefail
+python3 -I - <<'PY'
+import json, re, os
+evidence_root = os.getenv("ATTACKBOX_EVIDENCE_ROOT", "/var/lib")
+egress, rev12 = "{egress}", "{rev[:12]}"
+pat = re.compile(r"""{pattern}""")
+capture = f"{{evidence_root}}/attackbox-public-capture/requests/capture-$(date -u +%Y%m%d).jsonl"
+n = 0
+if __import__("pathlib").Path(capture).exists():
+	with open(capture, "rb") as f:
+		for line in f:
+			r = json.loads(line)
+			if r.get("src_ip") == egress:
+				n += 1
+traces = f"{{evidence_root}}/attackbox-evidence/public-otel/traces.jsonl"
+spans = []
+if __import__("pathlib").Path(traces).exists():
+	with open(traces, "rb") as f:
+		for line in f:
+			if not line.strip(): continue
+			req = json.loads(line)
+			for rs in req.get("resourceSpans", []):
+				for ss in rs.get("scopeSpans", []):
+					for sp in ss.get("spans", []):
+						attrs = {{a["key"]: a.get("value",{{}}) for a in sp.get("attributes",[])}}
+						if attrs.get("service.version",{{}}).get("stringValue") == "{rev}" and attrs.get("campaign.id",{{}}).get("stringValue") == f"https443-{{rev12}}" and attrs.get("client.address",{{}}).get("stringValue") == egress:
+							if pat.search(json.dumps(attrs)):
+								spans.append(1)
+print(n, len(spans))
+PY
+'''
+	out = sshq(script).strip().split()
+	return int(out[0]), int(out[1])
+
+if __name__ == '__main__':
+	os.umask(0o077)
+	proto = https_check()
+	print(f'Public HTTPS: {proto["http"]}, HTTP/2: {proto["http2"]}, TLS: {proto["tls"]}, trusted chain: {proto["trusted"]}, leaf pin: {proto["leaf"]==pin}, model: {proto["model"]}, plain ports: {len(proto["plain_ports"])}, firewall rules: {len(proto["rules"])}')
+	time.sleep(2)
+	captured, n = evidence_count(r'"name".*"public\\.request".*"/v1/(api/)?models"')
+	c, _ = evidence_count(r'"name".*"public\\.connection".*"no_data".*"sni".*"unknown"')
+	print(f'Local capture: {captured} line(s) from {egress}. OTLP traces: {n} public.request on /v1/models and {c} public.connection (no_data, sni=unknown) span(s).')
+	with tempfile.NamedTemporaryFile(dir=folder,mode='w',prefix='.public-',delete=False) as f:
+		tmp = pathlib.Path(f.name)
+		json.dump(dict(proto, captured=captured, spans=n, connections=c, egress=egress, epoch=int(time.time())), f, sort_keys=True)
+		f.write('\n'); f.flush(); os.fsync(f.fileno())
+	try: os.link(tmp, folder/'public-https-receipt.json')
+	except FileExistsError: tmp.unlink(); raise
+	finally: tmp.unlink(missing_ok=True)
+	print('Public HTTPS receipt written.')

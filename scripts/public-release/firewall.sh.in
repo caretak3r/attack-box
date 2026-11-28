@@ -1,0 +1,64 @@
+#!/bin/bash
+set +x
+set -euo pipefail
+umask 077
+export PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+root=@REPO_ROOT@
+rev=@COMMIT@
+sha=@BUNDLE_SHA@
+ip=@PUBLIC_IP@
+ports=@PORTS@
+published="20080/tcp -> $ip:80 21234/tcp -> $ip:1234 23000/tcp -> $ip:3000 24000/tcp -> $ip:4000 28000/tcp -> $ip:8000 28080/tcp -> $ip:8080 28188/tcp -> $ip:8188 28888/tcp -> $ip:8888 31434/tcp -> $ip:11434 8443/tcp -> $ip:443 "
+fw=@FIREWALL_ID@
+id=@INSTANCE_ID@
+folder=@RELEASES_DIR@/$rev
+ledgerdir="$folder/firewall"
+st="$root/.vultr/state.json"
+[[ $(jq -er .instance_id "$st") == "$id" && $(jq -er .firewall_id "$st") == "$fw" && $(jq -er .main_ip "$st") == "$ip" ]]
+ssh_id=@SSH_RULE_ID@
+admin=@ADMIN_CIDR@
+[[ $(jq -er .ssh_rule_id "$st") == "$ssh_id" && $(jq -er .admin_cidr "$st") == "$admin" ]] || { echo 'Management policy changed; refusing cutover.' >&2; exit 1; }
+readonly approved_instance="$id" approved_firewall="$fw" approved_ssh="$ssh_id"
+git -C "$root" -c gpg.minTrustLevel=fully verify-commit "$rev" >/dev/null 2>&1
+[[ $(git -C "$root" log -1 --format=%GF "$rev") == 7026F1FDA2A21BC035F17D3B4D9E5BA7BBE1EB29 ]]
+lib=${ATTACKBOX_FIREWALL_LEDGER:-$folder/public-firewall-ledger.sh}
+[[ -f $lib && ! -L $lib ]]
+launcher=${ATTACKBOX_VULTR_LAUNCH:-$root/scripts/vultr-launch.sh}
+key=${VULTR_API_KEY:-}
+if [[ -z $key ]]; then key=$(sed -nE 's/^(export[[:space:]]+)?VULTR_API_KEY=//p' "$root/.env" | tail -n 1 | tr -d "\"' \r"); fi
+[[ $key =~ ^[A-Za-z0-9._-]+$ ]]
+api() {
+	local method=$1 path=$2 payload=${3:-}
+	local args=(-q --proto '=https' --noproxy '*' -fsS --max-time 15 --max-filesize 4194304)
+	case "$method:$path" in
+		"GET:/instances/$approved_instance"|"GET:/instances?per_page=500"|"GET:/firewalls/$approved_firewall"|"GET:/firewalls/$approved_firewall/rules?per_page=500") /usr/bin/curl "${args[@]}" -K <(printf 'header = "Authorization: Bearer %s"\n' "$key") "https://api.vultr.com/v2$path" ;;
+		"POST:/firewalls/$approved_firewall/rules") [[ ${action:-} == open ]] || return 1; printf '%s' "$payload" | /usr/bin/curl "${args[@]}" -K <(printf 'header = "Authorization: Bearer %s"\n' "$key") -H 'Content-Type: application/json' --data-binary @- "https://api.vultr.com/v2$path" ;;
+		*) return 1 ;;
+	esac
+}
+del() {
+	local p=$1 num=${1##*/}
+	[[ $num =~ ^[1-9][0-9]*$ && $num != "$approved_ssh" && $p == "/firewalls/$approved_firewall/rules/$num" ]] || return 1
+	/usr/bin/curl -q --proto '=https' --noproxy '*' -fsS --max-time 15 -K <(printf 'header = "Authorization: Bearer %s"\n' "$key") -X DELETE "https://api.vultr.com/v2$p" >/dev/null
+}
+action=${1:-}
+case $action in
+	preflight)
+		s=$(_public_fw_check plan "$id" "$fw" "$ip" "$rev" "$sha" "$ports" "$ssh_id" "$admin")
+		[[ $(_public_fw_snapshot "$s" "$id" "$fw") == absent ]]; echo 'Closed baseline verified: recorded SSH /32 only.' ;;
+	open)
+		[[ $# == 2 && $2 == "$sha" ]] || { echo 'Exact bundle SHA required.' >&2; exit 2; }
+		jq -e --arg r "$rev" --arg s "$sha" '.commit==$r and .bundle_sha==$s and .model=="local-instruct-8b" and .private_healthy==true and .isolation==true and .runtime=="runsc" and .public_bind=="@PUBLIC_IP@:443" and .plain_ports==[80,1234,3000,4000,8000,8080,8188,8888,11434] and .observed_plain_ports==9 and .observed_requests>0 and .observed_health>0 and .client_fields==0 and .epoch>(now-1800) and .epoch<=(now+5)' "$folder/staging-receipt.json" >/dev/null
+		/bin/bash "$launcher" ssh "set -eu; cd /var/lib/attackbox-public/ledger; test \"\$(cat status)\" = staged; test \"\$(cat commit)\" = '$rev'; test \"\$(cat bundle_sha)\" = '$sha'; test \"\$(cat bind_ip)\" = '$ip'; cid=\$(docker ps -q --no-trunc --filter \"label=com.docker.compose.project=\$(cat project)\"); test \"\$(docker port \"\$cid\" | LC_ALL=C sort | tr '\\n' ' ')\" = '$published'; for u in attackbox-public.service attackbox-public-otel.service attackbox.service attackbox-shipper.service; do systemctl is-active --quiet \"\$u\"; done"
+		mkdir -p -m 0700 "$ledgerdir"
+		public_firewall_open "$ledgerdir" "$id" "$fw" "$ip" "$rev" "$sha" "$ports" "$ssh_id" "$admin"
+		printf 'Opened and verified owned TCP rules %s.\n' "$(jq -ce .rules "$ledgerdir/public-firewall-ledger.json")" ;;
+	verify-open)
+		s=$(<"$ledgerdir/public-firewall-ledger.json")
+		_public_fw_check state "$s"
+		jq -e --arg g "$fw" --arg i "$id" --arg ip "$ip" --arg r "$rev" --arg b "$sha" --arg a "$admin" --argjson ssh "$ssh_id" '.phase=="open" and .firewall==$g and .instance==$i and .ip==$ip and .commit==$r and .bundle_sha==$b and .management==$a and .ssh_id==$ssh' <<<"$s" >/dev/null
+		[[ $(_public_fw_snapshot "$s" "$id" "$fw") == "$(jq -er '.rules|to_entries|sort_by(.key|tonumber)|map("\(.key)=\(.value)")|join(",")' <<<"$s")" ]] || exit 1
+		echo 'Complete provider readback: management SSH and only the ten owned IPv4 TCP rules.' ;;
+	close) public_firewall_rollback "$ledgerdir" ;;
+	*) echo 'Usage: firewall.sh preflight | open BUNDLE_SHA | verify-open | close' >&2; exit 2 ;;
+esac

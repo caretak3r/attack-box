@@ -1,0 +1,27 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+D=@RELEASES_DIR@
+N=$D/@PREV_RELEASE@
+T=$D/@COMMIT@
+rev=@COMMIT@
+sha=@BUNDLE_SHA@
+nh=/root/attackbox-https443-releases/${N##*/}
+nstage=$(git -C "$N/source" show "${N##*/}:scripts/public-host-stage.sh" | shasum -a 256 | cut -d' ' -f1)
+root=@REPO_ROOT@
+launcher=${ATTACKBOX_VULTR_LAUNCH:-$root/scripts/vultr-launch.sh}
+sshq() { /bin/bash "$launcher" ssh "$@" </dev/null; }
+at() { printf '%s %s\n' "$(date -u +%H:%M:%SZ)" "$*"; }
+
+[[ $sha =~ ^[0-9a-f]{64}$ && $(shasum -a 256 "$T/$rev-amd64.bundle.tar" | cut -d' ' -f1) == "$sha" ]]
+[[ $(sshq "cat /var/lib/attackbox-public/ledger/commit" | tail -1) == "${N##*/}" ]] || { echo "live release is not ${N##*/}; stop" >&2; exit 1; }
+at "verify N open"; /bin/bash "$N/firewall.sh" verify-open
+at "close N"; /bin/bash "$N/firewall.sh" close
+/bin/bash "$N/firewall.sh" preflight
+at "roll back N on host"
+sshq "set -eu; export GNUPGHOME='$nh/trust' GIT_NO_REPLACE_OBJECTS=1; cd '$nh'; echo '$nstage  source/scripts/public-host-stage.sh' | sha256sum --check --status; exec '$nh/source/scripts/public-host-stage.sh' rollback --approve '$(cat "$N/bundle.sha256")'"
+at "stage T"; /bin/bash "$T/stage.sh" > "$T/stage.log" 2>&1 || { tail -20 "$T/stage.log"; exit 1; }
+at "verify staged"; python3 "$T/verify-staged.py" "$rev" "$sha"
+at "open T"; /bin/bash "$T/firewall.sh" open "$sha"
+at "verify public"; python3 "$T/verify-public.py"
+at "done"

@@ -1,0 +1,35 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+export GIT_NO_REPLACE_OBJECTS=1
+root=@REPO_ROOT@
+old=@PREV_RELEASE@
+signer=7026F1FDA2A21BC035F17D3B4D9E5BA7BBE1EB29
+branch=release/public-@COMMIT@
+rev=@COMMIT@
+sha=@BUNDLE_SHA@
+ip=@PUBLIC_IP@
+pubname=@PUBLIC_NAME@
+hostname=@HOSTNAME@
+localdir=@RELEASES_DIR@/$rev
+h="/root/attackbox-https443-releases/$rev"
+oldh="/root/attackbox-https443-releases/$old"
+launcher=${ATTACKBOX_VULTR_LAUNCH:-$root/scripts/vultr-launch.sh}
+sshq() { /bin/bash "$launcher" ssh "$@"; }
+hash() { shasum -a 256 "$1" | cut -d' ' -f1; }
+
+cd "$localdir"
+[[ $(cat bundle.sha256) == "$sha" && $(hash "$rev-amd64.bundle.tar") == "$sha" ]]
+[[ $(git -C source log -1 --format='%H %G? %GF') == "$rev G $signer" ]]
+srchash=$(hash public-source.bundle)
+stagehash=$(git -C source show "$rev:scripts/public-host-stage.sh" | shasum -a 256 | cut -d' ' -f1)
+verifierhash=$(git -C source show "$rev:scripts/verify-public-bundle.sh" | shasum -a 256 | cut -d' ' -f1)
+/bin/bash firewall.sh preflight
+sshq "set -eu; test \"\$(hostname -s)\" = $hostname; test ! -e /var/lib/attackbox-public; test -z \"\$(ss -ltnH 'sport = :443')\"; test \"\$(stat -c %u:%g:%a '$oldh/trust')\" = 0:0:700; umask 077; mkdir -m 0700 '$h'; cd '$h'; set -C; cat > public-source.bundle; echo '$srchash  public-source.bundle' | sha256sum --check --status" < public-source.bundle
+sshq "set -euo pipefail; umask 077; cd '$h'; mkdir -m 0700 trust; export GNUPGHOME='$h/trust' GIT_NO_REPLACE_OBJECTS=1; gpg --homedir '$oldh/trust' --batch --export '$signer' | gpg --batch --import; test \"\$(gpg --batch --with-colons --list-keys | awk -F: '\$1==\"pub\"{primary=1; next} \$1==\"fpr\" && primary{print \$10; primary=0}')\" = '$signer'; printf '%s:6:\\n' '$signer' | gpg --batch --import-ownertrust; git clone --quiet --no-checkout --single-branch --branch '$branch' public-source.bundle source; test \"\$(git -C source rev-parse HEAD)\" = '$rev'; git -C source -c gpg.minTrustLevel=fully verify-commit '$rev'; test \"\$(git -C source log -1 --format='%G? %GF')\" = 'G $signer'; git -C source checkout -q --detach '$rev'; echo '$stagehash  source/scripts/public-host-stage.sh' | sha256sum --check --status; echo '$verifierhash  source/scripts/verify-public-bundle.sh' | sha256sum --check --status"
+gzip -1c "$rev-amd64.bundle.tar" | sshq "set -eu; umask 077; cd '$h'; set -C; gzip -dc > runtime.tar; echo '$sha  runtime.tar' | sha256sum --check --status; echo 'Verified exact runtime SHA-256 on target.'"
+params="--bundle '$h/runtime.tar' --bundle-sha '$sha' --commit '$rev' --verifier '$h/source/scripts/verify-public-bundle.sh' --verifier-sha '$verifierhash' --release-repo '$h/source' --expected-hostname $hostname --public-fqdn $pubname --public-ip $ip --host-id $hostname --campaign-id https443-${rev:0:12} --tls-cert /etc/attackbox-public-identity/fullchain.pem --tls-key /etc/attackbox-public-identity/service.key --license-file /etc/attackbox/otel-license.key"
+invoke="set -eu; export GNUPGHOME='$h/trust' GIT_NO_REPLACE_OBJECTS=1; cd '$h'; echo '$stagehash  source/scripts/public-host-stage.sh' | sha256sum --check --status; exec '$h/source/scripts/public-host-stage.sh'"
+sshq "$invoke check $params"
+/bin/bash firewall.sh preflight
+sshq "$invoke stage $params --approve '$sha'"

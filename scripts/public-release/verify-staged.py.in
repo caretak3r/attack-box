@@ -1,0 +1,87 @@
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+evidence_root = os.getenv('ATTACKBOX_EVIDENCE_ROOT', '/var/lib')
+launcher = os.getenv('ATTACKBOX_VULTR_LAUNCH', '@REPO_ROOT@/scripts/vultr-launch.sh')
+rev, sha = '@COMMIT@', '@BUNDLE_SHA@'
+if not re.fullmatch('[a-f0-9]{40}',rev) or rev!=p.name or not re.fullmatch('[a-f0-9]{64}',sha) or sha!=(p/'bundle.sha256').read_text().strip():
+	sys.exit('Wrong release identity')
+receipt = p/'staging-receipt.json'
+if receipt.exists(): sys.exit('A staging receipt already exists; refusing to replace it')
+verified = (p/(rev+'-amd64.verified')).read_text().split()
+if verified[:2]!=[rev,'linux/amd64'] or len(verified)!=3 or not re.fullmatch('sha256:[a-f0-9]{64}',verified[2]): sys.exit('Invalid verified image receipt')
+subprocess.run(['/bin/bash',str(p/'firewall.sh'),'preflight'],check=True)
+with (p/'host-proof.py').open('rb') as src:
+	result = subprocess.check_output(['/bin/bash', launcher, 'ssh', f'python3 - {rev} {sha} {verified[2]}'],stdin=src,timeout=90)
+host = json.loads(result)
+if host.get('model')!='local-instruct-8b' or host.get('private_healthy') is not True or host.get('isolation') is not True or host.get('credential_raw') is not True or host.get('plain_ports')!=[80,1234,3000,4000,8000,8080,8188,8888,11434] or not isinstance(host.get('capture_lines'),int) or host['capture_lines']<10: sys.exit('Incomplete host proof')
+print(f"Verified on VPS: pinned public HTTPS, model success/refusal, route family variant, unmatched probe, isolated container, private HTTPS, {host['capture_lines']} local capture lines.",flush=True)
+
+sshq = lambda cmd: subprocess.check_output(['/bin/bash', launcher, 'ssh', cmd],stdin=subprocess.DEVNULL,timeout=30,text=True)
+
+def read_otel_traces():
+	script = f'''
+set -euo pipefail
+f=${{ATTACKBOX_EVIDENCE_ROOT:-/var/lib}}/attackbox-evidence/public-otel/traces.jsonl
+if [[ ! -f $f ]]; then echo "[]"; exit 0; fi
+python3 -I - <<'PY'
+import json, sys, os
+evidence_root = os.getenv("ATTACKBOX_EVIDENCE_ROOT", "/var/lib")
+spans = []
+with open(f"{{evidence_root}}/attackbox-evidence/public-otel/traces.jsonl", "rb") as f:
+	for line in f:
+		if not line.strip(): continue
+		req = json.loads(line)
+		for rs in req.get("resourceSpans", []):
+			for ss in rs.get("scopeSpans", []):
+				for sp in ss.get("spans", []):
+					attrs = {{a["key"]: a.get("value",{{}}) for a in sp.get("attributes",[])}}
+					spans.append(attrs)
+print(json.dumps(spans))
+PY
+'''
+	return json.loads(sshq(script))
+
+started = time.monotonic()
+deadline = started + 240
+nr = nh = nc = npc = np = 0
+while True:
+	spans = read_otel_traces()
+	rev12 = rev[:12]
+	matching = [s for s in spans if s.get('service.name',{}).get('stringValue')=='attackbox-public-443' and s.get('service.version',{}).get('stringValue')==rev and s.get('host.id',{}).get('stringValue')=='@HOSTNAME@' and s.get('campaign.id',{}).get('stringValue')==f'https443-{rev12}']
+	requests = [s for s in matching if s.get('name',{}).get('stringValue')=='public.request' and str(s.get('server.port',{}).get('intValue'))=='443']
+	health = [s for s in matching if s.get('name',{}).get('stringValue')=='public.health' and str(s.get('server.port',{}).get('intValue'))=='443']
+	unaddressed = [s for s in matching if s.get('name',{}).get('stringValue')=='public.request' and 'client.address' not in s]
+	creds = [s for s in matching if s.get('name',{}).get('stringValue')=='public.request' and s.get('attackbox.credential.source',{}).get('stringValue')=='authorization' and s.get('attackbox.credential.type',{}).get('stringValue')=='anthropic' and s.get('attackbox.credential.value',{}).get('stringValue')=='sk-ant-staging-synthetic-proof' and s.get('gen_ai.request.model',{}).get('stringValue')=='gpt-4o']
+	plain_ports = {int(str(s.get('server.port',{}).get('intValue',0))) for s in matching if s.get('name',{}).get('stringValue')=='public.request' and str(s.get('server.port',{}).get('intValue','')) in ['80','1234','3000','4000','8000','8080','8188','8888','11434']}
+	pcreds = [s for s in matching if s.get('name',{}).get('stringValue')=='public.request' and s.get('attackbox.credential.source',{}).get('stringValue')=='proxy-authorization' and s.get('attackbox.credential.value',{}).get('stringValue')=='c3RhZ2luZzpzeW50aGV0aWM=']
+	nr = len(requests)
+	nh = len(health)
+	nc = len(creds)
+	npc = len(pcreds)
+	np = len(plain_ports)
+	if unaddressed: sys.exit(f'Healthcheck gate failed: {len(unaddressed)} request span(s) without a peer address')
+	if nr and nh and nc and npc and np==9 and time.monotonic()-started>=150: break
+	if time.monotonic()>=deadline: sys.exit(f'No positive receipt before deadline: requests={nr}, health={nh}, credential_spans={nc}, proxy_credential_spans={npc}, plain_ports={np}')
+	time.sleep(10)
+
+signed = set('service.name service.version service.instance.id service.namespace host.id host.name campaign.id server.port attackbox.persona http.route http.request.method http.response.status_code attackbox.accepted_requests attackbox.rate_limited_requests attackbox.pre_http_connections attackbox.rejected_connections attackbox.captured_requests attackbox.capture_dropped attackbox.otel_dropped_spans_total attackbox.otel_export_failed_spans_total client.address attackbox.request.content_type http.request.body.size gen_ai.request.model attackbox.request.stream attackbox.request.query_params attackbox.probe.class attackbox.connection.outcome attackbox.tls.sni attackbox.credential.source attackbox.credential.type attackbox.credential.value attackbox.canary.key attackbox.canary.index gen_ai.response.model http.response.body.size name'.split())
+all_keys = set()
+for s in spans:
+	all_keys.update(s.keys())
+client_fields = len(all_keys - signed)
+if client_fields: sys.exit(f'Privacy gate failed: {client_fields} field name(s) outside the server-only inventory; values not queried')
+
+subprocess.run(['/bin/bash',str(p/'firewall.sh'),'preflight'],check=True)
+doc = dict(host,commit=rev,bundle_sha=sha,observed_requests=nr,observed_health=nh,unaddressed_requests=0,credential_spans=nc,proxy_credential_spans=npc,observed_plain_ports=np,client_fields=client_fields,epoch=int(time.time()))
+with tempfile.NamedTemporaryFile(dir=p,mode='w',prefix='.staging-',delete=False) as f:
+	tmp = Path(f.name); json.dump(doc,f,sort_keys=True); f.write('\n'); f.flush(); os.fsync(f.fileno())
+try: os.link(tmp,receipt)
+finally: tmp.unlink()
+print(f'Closed-ingress receipt: requests={nr}, health={nh}, unaddressed_requests=0, credential_spans={nc}, proxy_credential_spans={npc}, plain_ports={np}, client_fields={client_fields}.',flush=True)
