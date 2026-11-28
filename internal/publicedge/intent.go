@@ -5,9 +5,11 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-
-	"attackbox/internal/secret"
 )
+
+// redactionMarkerRE matches a whole redaction marker as written by internal/secret. The public
+// image builds only this package, so the pattern is kept here rather than imported.
+var redactionMarkerRE = regexp.MustCompile(`^\[redacted(?::hmac256:[0-9a-f]{16})?\]$`)
 
 var (
 	identityRE      = regexp.MustCompile(`(?i)\b(who|what) +(are +you|is +this|model|assistant|ai|your +name|you +are)\b`)
@@ -350,7 +352,7 @@ func sanitizeReflection(s string) string {
 	if credentialRE.MatchString(s) {
 		return "[user input]"
 	}
-	if secret.IsMarker(s) {
+	if redactionMarkerRE.MatchString(s) {
 		return "[user input]"
 	}
 	runes := []rune(s)
