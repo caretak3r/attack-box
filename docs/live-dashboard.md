@@ -76,7 +76,7 @@ The page shows internet data by default. Select **Test** or **Both** to see your
 | Listener ports | Shows traffic on each configured listener port with request count, pre-HTTP connection count, source count, and last seen time. Select a port to see only its traffic. |
 | Sources to endpoints | Shows which source addresses reached which port and endpoint. Line width shows the event count. Select a source or an endpoint to see only its traffic. |
 | Sources and Endpoints tables | Show the same data as text, with counts, the last time seen, and the most used user-agent. |
-| Requests and connections | Shows the newest 300 events of the selection. Each request shows its method, path with query string, and a preview extracted from the request body (a prompt or message text). Select a time to open the full event: query parameters, headers, and body. |
+| Requests and connections | Shows the newest 300 events in the selection. **Prompt in body** highlights timestamps with captured user input. Select a marked time for the user prompt preview and full request. A POST, a generic body preview, or a route label alone does not earn a marker. |
 
 Select **Pause** to stop the refresh while you read.
 

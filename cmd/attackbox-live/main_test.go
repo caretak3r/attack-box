@@ -487,20 +487,29 @@ func TestDirModeReadsLocalArchive(t *testing.T) {
 
 func TestPreviewExtraction(t *testing.T) {
 	tests := []struct {
-		body string
-		want string
+		path, body, want string
+		prompt           bool
 	}{
-		{`{"messages":[{"role":"user","content":"hello world"}]}`, "hello world"},
-		{`{"prompt":"test prompt"}`, "test prompt"},
-		{`{"text":"some text"}`, "some text"},
-		{`{"input":"input text"}`, "input text"},
-		{`plain text`, "plain text"},
-		{``, ""},
+		{"/api/chat", `{"messages":[{"role":"user","content":"hello world"},{"role":"assistant","content":"reply"}]}`, "hello world", true},
+		{"/api/generate", `{"prompt":"test prompt"}`, "test prompt", true},
+		{"/responses", `{"input":[{"role":"user","content":[{"type":"input_text","text":"a"},{"type":"text","text":"b"}]}]}`, "a b", true},
+		{"/v1/responses/?model=test", `{"input":"input text"}`, "input text", true},
+		{"/embeddings", `{"input":"input text"}`, "input text", false},
+		{"/", `{"text":"some text"}`, "some text", false},
+		{"/api/chat", `{"messages":[{"role":"system","content":"secret"}]}`, `{"messages":[{"role":"system","content":"secret"}]}`, false},
+		{"/api/chat", `{"prompt":"   "}`, `{"prompt":"   "}`, false},
+		{"/api/chat", `{"prompt":"partial`, `{"prompt":"partial`, false},
+		{"/", `plain text`, "plain text", false},
+		{"/api/tags", ``, "", false},
 	}
 	for _, tt := range tests {
-		got := extractPreview(tt.body)
-		if got != tt.want {
-			t.Errorf("extractPreview(%q) = %q, want %q", tt.body, got, tt.want)
+		line, err := json.Marshal(map[string]string{"time": "2026-11-28T05:31:28Z", "target": tt.path, "body": tt.body})
+		if err != nil {
+			t.Fatal(err)
+		}
+		e, ok := parseCapture(line, 443)
+		if !ok || e.Preview != tt.want || e.HasPrompt != tt.prompt {
+			t.Errorf("%s %s: got (%q, %t), want (%q, %t)", tt.path, tt.body, e.Preview, e.HasPrompt, tt.want, tt.prompt)
 		}
 	}
 }
@@ -519,14 +528,17 @@ func TestPreviewClipping(t *testing.T) {
 func TestStateFeedHasPreviewNotBody(t *testing.T) {
 	now := time.Now()
 	st := newStore(1000)
-	body := `{"messages":[{"role":"user","content":"hello world"}]}`
-	st.add(event{Time: now, IP: "203.0.113.1", Port: 443, Route: "/v1/chat/completions", Method: "POST", Status: 200, Kind: "request", Body: body})
+	e, ok := parseCapture([]byte(`{"time":"`+now.Format(time.RFC3339Nano)+`","peer":"203.0.113.1","target":"/v1/chat/completions","body":"{\"messages\":[{\"role\":\"user\",\"content\":\"hello world\"}]}"}`), 443)
+	if !ok {
+		t.Fatal("invalid fixture")
+	}
+	st.add(e)
 
 	v := st.state(now, time.Hour, "", "", "", "", 0, []int{443}, &sourceStatus{})
 	if len(v.Feed) != 1 {
 		t.Fatal("no feed")
 	}
-	if v.Feed[0].Preview != "hello world" {
+	if !v.Feed[0].HasPrompt || v.Feed[0].Preview != "hello world" {
 		t.Errorf("preview: %q, want 'hello world'", v.Feed[0].Preview)
 	}
 	if v.Feed[0].Body != "" {
@@ -914,7 +926,7 @@ func TestEventJSONFieldNames(t *testing.T) {
 		"method", "target", "host", "user_agent", "status", "probe", "proto",
 		"headers", "sni", "outcome", "content_type", "model", "stream", "tools",
 		"system_msg", "mcp_method", "canary_key", "credential", "body_bytes",
-		"body_sha256", "body_truncated", "rule_name", "priority", "block_type", "body",
+		"body_sha256", "body_truncated", "rule_name", "priority", "block_type", "body", "preview", "has_prompt",
 	}
 	for _, field := range required {
 		if _, ok := m[field]; !ok {
@@ -1057,7 +1069,7 @@ func TestAPIStateJSONFieldNames(t *testing.T) {
 	}
 	requireFields("feed request", request,
 		"time", "seq", "kind", "source", "origin", "ip", "port", "method", "target",
-		"status", "route", "user_agent", "body_bytes", "preview", "probe",
+		"status", "route", "user_agent", "body_bytes", "preview", "has_prompt", "probe",
 	)
 
 	source := asObject("source", asArray("sources", state["sources"])[0])

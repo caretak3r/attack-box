@@ -73,6 +73,8 @@ type event struct {
 	Priority      string      `json:"priority,omitempty"`
 	BlockType     string      `json:"block_type,omitempty"`
 	Body          string      `json:"body,omitempty"`
+	Preview       string      `json:"preview"`
+	HasPrompt     bool        `json:"has_prompt"`
 	spanMerged    bool
 }
 
@@ -132,7 +134,9 @@ func parseCapture(line []byte, port int) (event, bool) {
 	}
 	if raw.Body != "" {
 		var obj map[string]any
+		preview := raw.Body
 		if json.Unmarshal([]byte(raw.Body), &obj) == nil {
+			preview, e.HasPrompt = extractPreview(obj, raw.Target, raw.Body)
 			if model, ok := obj["model"].(string); ok {
 				e.Model = model
 			}
@@ -167,6 +171,7 @@ func parseCapture(line []byte, port int) (event, bool) {
 				}
 			}
 		}
+		e.Preview = cleanPreview(preview)
 	}
 	return e, true
 }
@@ -338,36 +343,65 @@ func parseShipperEnvelope(line []byte) ([]event, bool) {
 	return nil, false
 }
 
-func extractPreview(body string) string {
-	if body == "" {
-		return ""
+// Generic body previews remain visible, but only captured user input earns a prompt marker.
+func extractPreview(obj map[string]any, target, body string) (string, bool) {
+	if p, ok := obj["prompt"].(string); ok && strings.TrimSpace(p) != "" {
+		return p, true
 	}
-	var obj map[string]any
-	if json.Unmarshal([]byte(body), &obj) == nil {
-		if msgs, ok := obj["messages"].([]any); ok && len(msgs) > 0 {
-			if last, ok := msgs[len(msgs)-1].(map[string]any); ok {
-				if c, ok := last["content"].(string); ok {
-					return c
+	path, _, _ := strings.Cut(target, "?")
+	responses := strings.HasSuffix(strings.TrimSuffix(path, "/"), "/responses")
+	messages, _ := obj["messages"].([]any)
+	if responses && len(messages) == 0 {
+		messages, _ = obj["input"].([]any)
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		m, _ := messages[i].(map[string]any)
+		if m["role"] != "user" {
+			continue
+		}
+		switch content := m["content"].(type) {
+		case string:
+			if strings.TrimSpace(content) != "" {
+				return content, true
+			}
+		case []any:
+			var text strings.Builder
+			for _, part := range content {
+				p, _ := part.(map[string]any)
+				if s, ok := p["text"].(string); ok && (p["type"] == "text" || p["type"] == "input_text") && strings.TrimSpace(s) != "" {
+					if text.Len() > 0 {
+						text.WriteByte(' ')
+					}
+					text.WriteString(s)
 				}
 			}
-		}
-		if p, ok := obj["prompt"].(string); ok {
-			return p
-		}
-		if t, ok := obj["text"].(string); ok {
-			return t
-		}
-		if i, ok := obj["input"].(string); ok {
-			return i
+			if text.Len() > 0 {
+				return text.String(), true
+			}
 		}
 	}
-	return body
+	if s, ok := obj["input"].(string); ok {
+		return s, responses && strings.TrimSpace(s) != ""
+	}
+	if s, ok := obj["text"].(string); ok {
+		return s, false
+	}
+	if a, ok := obj["input"].([]any); ok && len(a) != 0 {
+		if s, ok := a[0].(string); ok {
+			return s, false
+		}
+	}
+	return body, false
 }
 
 func cleanPreview(s string) string {
-	r := []rune(s)
-	if len(r) > maxPreviewRuns {
-		return string(r[:maxPreviewRuns-1]) + "…"
+	n, last := 0, 0
+	for i := range s {
+		if n == maxPreviewRuns {
+			return s[:last] + "…"
+		}
+		last = i
+		n++
 	}
 	return s
 }
@@ -571,17 +605,12 @@ type viewState struct {
 	Ports           []map[string]any          `json:"ports"`
 	Timeline        [][2]int                  `json:"timeline"`
 	Flow            map[string]any            `json:"flow"`
-	Feed            []feedRow                 `json:"feed"`
+	Feed            []event                   `json:"feed"`
 	AIActivity      []map[string]any          `json:"ai_activity"`
 	Chains          []map[string]any          `json:"chains"`
 	HostSecurity    map[string]any            `json:"host_security"`
 	TestEnv         map[string]any            `json:"test_env"`
 	SourcesStatus   map[string]map[string]any `json:"sources_status"`
-}
-
-type feedRow struct {
-	event
-	Preview string `json:"preview"`
 }
 
 func (s *store) state(now time.Time, window time.Duration, who, ip, endpoint, q string, port int, ports []int, status *sourceStatus) viewState {
@@ -652,12 +681,11 @@ func (s *store) state(now time.Time, window time.Duration, who, ip, endpoint, q 
 			timeline[bucket][0]++
 		}
 	}
-	feed := make([]feedRow, 0, min(len(filtered), feedSize))
+	feed := make([]event, 0, min(len(filtered), feedSize))
 	for i := 0; i < len(filtered) && i < feedSize; i++ {
 		e := filtered[i]
 		e.Body = ""
-		p := cleanPreview(extractPreview(filtered[i].Body))
-		feed = append(feed, feedRow{event: e, Preview: p})
+		feed = append(feed, e)
 	}
 	srcAgg := make(map[string]map[string]any)
 	for _, e := range filtered {
