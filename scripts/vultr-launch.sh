@@ -367,8 +367,9 @@ cmd_bootstrap() (
     die "deployment test gate failed: local port $local_port did not become ready within 15 seconds"
   fi
   gate_rc=0
-  (cd "$ROOT" && go run ./cmd/attackbox-scenarios -target "https://127.0.0.1:$local_port" -self-signed \
-    -model "$model" -run-id "bootstrap-$commit" -output "$scenario_output") || gate_rc=$?
+  # Port 8443 is nginx: it rejects the traversal and oversized cases before the bait.
+  (cd "$ROOT" && go run ./cmd/attackbox-scenarios -target "https://127.0.0.1:$local_port" -self-signed -proxy \
+    -model "$model" -commit "${commit:0:12}" -run-id "bootstrap-$commit" -output "$scenario_output") || gate_rc=$?
   kill "$forward_pid" 2>/dev/null || true
   wait "$forward_pid" 2>/dev/null || true
   if [ "$gate_rc" != 0 ]; then
