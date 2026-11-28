@@ -672,7 +672,10 @@ remove_newrelic_migration() {
 
 	# The installed private Collector unit loads this key; it cannot start
 	# without it until install-monitoring.sh installs the file-export unit.
-	if [[ -e /etc/attackbox/otel-license.key && "$MODE" == "apply" ]]; then
+	# Stop it on every deploy until then: the shipper's Wants= restarts it,
+	# and a failing restart in set_release_version would end the deploy.
+	if [[ "$MODE" == "apply" ]] && { [[ -e /etc/attackbox/otel-license.key ]] ||
+		grep -qs newrelic_license_key /etc/systemd/system/attackbox-otel.service; }; then
 		systemctl stop attackbox-otel.service || true
 		removed+=("stopped attackbox-otel.service until install-monitoring.sh --apply")
 	fi
