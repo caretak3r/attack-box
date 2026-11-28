@@ -7,18 +7,14 @@ REMOTE_ROOT="${ATTACKBOX_REMOTE_ROOT:-}"
 REMOTE_HOST="attackbox"
 LOCK_DIR="$ARCHIVE_ROOT/.pull.lock"
 
-cleanup() {
-	rmdir "$LOCK_DIR" 2>/dev/null || true
-}
-trap cleanup EXIT
+umask 077
+mkdir -p "$ARCHIVE_ROOT"
 
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
 	echo "evidence-pull already running" >&2
 	exit 1
 fi
-
-umask 077
-mkdir -p "$ARCHIVE_ROOT"
+trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 
 files=0
 bytes=0

@@ -31,6 +31,7 @@ ReadWritePaths=/run/attackbox /var/lib/attackbox-shipper /var/lib/attackbox-evid
 
 # State directory: attackbox-shipper (queue) and attackbox-evidence/shipper (evidence files)
 StateDirectory=attackbox-shipper attackbox-evidence/shipper
+StateDirectoryMode=0700
 
 # Runtime directory: abx-ship:abx-bait, mode 0710. Primary group abx-bait means
 # the 0220 sockets are created abx-ship:abx-bait, so the bait (gid 65532) can
