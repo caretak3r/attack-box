@@ -7,6 +7,8 @@ import tempfile
 import time
 from pathlib import Path
 
+os.umask(0o077)
+p = Path(__file__).resolve().parent
 evidence_root = os.getenv('ATTACKBOX_EVIDENCE_ROOT', '/var/lib')
 launcher = os.getenv('ATTACKBOX_VULTR_LAUNCH', '@REPO_ROOT@/scripts/vultr-launch.sh')
 rev, sha = '@COMMIT@', '@BUNDLE_SHA@'
@@ -39,9 +41,11 @@ with open(f"{{evidence_root}}/attackbox-evidence/public-otel/traces.jsonl", "rb"
 		if not line.strip(): continue
 		req = json.loads(line)
 		for rs in req.get("resourceSpans", []):
+			res = {{a["key"]: a.get("value",{{}}) for a in rs.get("resource",{{}}).get("attributes",[])}}
 			for ss in rs.get("scopeSpans", []):
 				for sp in ss.get("spans", []):
-					attrs = {{a["key"]: a.get("value",{{}}) for a in sp.get("attributes",[])}}
+					attrs = dict(res, name={{"stringValue": sp.get("name","")}})
+					attrs.update({{a["key"]: a.get("value",{{}}) for a in sp.get("attributes",[])}})
 					spans.append(attrs)
 print(json.dumps(spans))
 PY

@@ -75,7 +75,8 @@ services:
       # Redaction secret from Docker secret
       ATTACKBOX_SECRET_FILE: "/run/secrets/attackbox_secret"
 
-      # Spool socket (host shipper owns the ingest key)
+      # Spool socket to the host shipper; the bait holds no telemetry key
+      ATTACKBOX_SPOOL_SOCKET: "/run/attackbox/spool.sock"
       ATTACKBOX_SPOOL_QUEUE: "10000"
       ATTACKBOX_SPOOL_TIMEOUT: "5s"
 

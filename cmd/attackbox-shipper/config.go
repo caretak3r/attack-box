@@ -60,14 +60,10 @@ func loadConfig(getenv func(string) string) (config, error) {
 		errs = append(errs, errors.New("ATTACKBOX_SHIP_SEGMENT_BYTES must be 1MB..256MB"))
 	}
 
-	// Evidence directory
+	// Evidence directory. Not STATE_DIRECTORY: the unit has two state directories, which systemd joins with ':'.
 	c.evidenceDir = getenv("ATTACKBOX_EVIDENCE_DIR")
 	if c.evidenceDir == "" {
-		if stateDir := getenv("STATE_DIRECTORY"); stateDir != "" {
-			c.evidenceDir = stateDir
-		} else {
-			c.evidenceDir = "/var/lib/attackbox-evidence/shipper"
-		}
+		c.evidenceDir = "/var/lib/attackbox-evidence/shipper"
 	}
 
 	c.hostname = getenv("HOSTNAME")

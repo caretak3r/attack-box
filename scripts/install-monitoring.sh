@@ -90,7 +90,8 @@ if [[ $mode == --check ]]; then
   echo "PASS: checksum, pinned Collector ${OTELCOL_VERSION}, and staged config; no services changed"
   exit 0
 fi
-# Validate trusted values without sourcing shell code. License is never printed.
+# Validate trusted values without sourcing shell code.
+python3 "$repo_root/deploy/otel/prepare-env.py" /etc/attackbox/monitoring.env "$stage/shipper-monitoring.env"
 getent group abx-otel >/dev/null || groupadd --system abx-otel
 getent passwd abx-otel >/dev/null || useradd --system --gid abx-otel --home-dir /nonexistent --shell /usr/sbin/nologin abx-otel
 # Existing root-owned helper refreshes the Ubuntu destination and UID sets.

@@ -1,34 +1,43 @@
-import hashlib, http.client, json, os, re, socket, ssl, subprocess, sys, time
+import hashlib
+import http.client
+import json
+import re
+import socket
+import ssl
+import subprocess
+import time
+import sys
 from pathlib import Path
 
 rev, bundle, image = sys.argv[1:]
 fqdn, ip, host = '@PUBLIC_NAME@', '@PUBLIC_IP@', '@HOSTNAME@'
 pin = 'D5ADDFC15CD87E9775871A98CD3579F897B16490B0314B24EC76811B38DC1EA1'
 model = 'local-instruct-8b'
-cred = 'sk-ant-staging-synthetic-proof'
-pcred = 'c3RhZ2luZzpzeW50aGV0aWM='
+cred = 'sk-ant-staging-synthetic-proof'  # synthetic; the capture keeps credential values as sent
+pcred = 'c3RhZ2luZzpzeW50aGV0aWM='  # base64 of a synthetic proxy user:password
 def check(condition, message):
-	if not condition:
-		raise SystemExit('stage proof: ' + message)
+    if not condition:
+        raise SystemExit('stage proof: ' + message)
 def run(*args):
-	return subprocess.check_output(args, text=True, timeout=15).strip()
+    return subprocess.check_output(args, text=True, timeout=15).strip()
 def ledger(name):
-	return (Path('/var/lib/attackbox-public/ledger') / name).read_text().strip()
+    return (Path('/var/lib/attackbox-public/ledger') / name).read_text().strip()
 def inspect(container, fmt):
-	return run('docker', 'container', 'inspect', '--format', fmt, container)
+    return run('docker', 'container', 'inspect', '--format', fmt, container)
 
 check(socket.gethostname().split('.')[0] == host, 'wrong host')
 for name, expected in {'status':'staged','commit':rev,'bundle_sha':bundle,'image':image,'host_id':host,'expected_hostname':host,'campaign_id':'https443-'+rev[:12],'bind_ip':ip,'public_fqdn':fqdn}.items():
-	check(ledger(name) == expected, 'wrong ledger ' + name)
+    check(ledger(name) == expected, 'wrong ledger ' + name)
 units = ['attackbox-public.service', 'attackbox-public-otel.service', 'attackbox.service', 'attackbox-shipper.service']
 check(run('systemctl','is-active',*units).splitlines() == ['active'] * len(units), 'inactive unit')
+# The ledger does not pin Docker IDs: a service restart recreates the container and the network.
 cid = run('docker','ps','-q','--no-trunc','--filter','label=com.docker.compose.project='+ledger('project'))
 network = run('docker','network','inspect','--format','{{.Id}}',ledger('project')+'_public')
 check(all(re.fullmatch('[0-9a-f]{64}', x) for x in (cid,network)), 'project does not own exactly one container and one network')
 check(inspect(cid, '{{.State.Status}} {{.State.Health.Status}} {{.Image}} {{.HostConfig.Runtime}} {{.Config.User}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.Privileged}} {{.HostConfig.LogConfig.Type}}') == f'running healthy {image} runsc 65532:65532 true false none', 'wrong runtime, identity or health')
 check(json.loads(inspect(cid, '{{json .HostConfig.CapDrop}}')) == ['ALL'] and 'no-new-privileges:true' in json.loads(inspect(cid,'{{json .HostConfig.SecurityOpt}}')), 'capability controls absent')
-plain = [80, 1234, 3000, 4000, 8000, 8080, 8188, 8888, 11434]
-local, keyed = {1234, 8000, 8080, 11434}, {3000, 4000}
+plain = [80, 1234, 3000, 4000, 8000, 8080, 8188, 8888, 11434]  # plain HTTP; container port = 20000 + public port
+local, keyed = {1234, 8000, 8080, 11434}, {3000, 4000}  # local model servers list 23 names; these two ports want a key
 fallback = "I'm here to help! Could you please provide more details about what you'd like to know or discuss?"
 check(sorted(run('docker','port',cid).splitlines()) == sorted([f'8443/tcp -> {ip}:443'] + [f'{20000+p}/tcp -> {ip}:{p}' for p in plain]), 'unexpected publication')
 mounts = [(m['Type'],m['Source'],m['Destination'],m['RW']) for m in json.loads(inspect(cid, '{{json .Mounts}}'))]
@@ -36,26 +45,24 @@ check(sorted(mounts) == sorted([('bind','/run/attackbox-public-otel','/run/attac
 networks = json.loads(inspect(cid, '{{json .NetworkSettings.Networks}}'))
 check(list(networks) == [ledger('project')+'_public'] and next(iter(networks.values()))['NetworkID'] == network, 'wrong public network')
 for private in ('attackbox-bait','attackbox-proxy'):
-	check(inspect(private, '{{.State.Status}} {{.State.Health.Status}}') == 'running healthy', 'private container unhealthy')
-	check(network not in {n['NetworkID'] for n in json.loads(inspect(private,'{{json .NetworkSettings.Networks}}')).values()}, 'shared private network')
+    check(inspect(private, '{{.State.Status}} {{.State.Health.Status}}') == 'running healthy', 'private container unhealthy')
+    check(network not in {n['NetworkID'] for n in json.loads(inspect(private,'{{json .NetworkSettings.Networks}}')).values()}, 'shared private network')
 for chain in ('input_early','forward_early'):
-	check(any('iifname "br-*"' in line and line.strip().endswith(' drop') for line in run('nft','list','chain','inet','attackbox',chain).splitlines()), 'bridge egress protection absent')
+    check(any('iifname "br-*"' in line and line.strip().endswith(' drop') for line in run('nft','list','chain','inet','attackbox',chain).splitlines()), 'bridge egress protection absent')
 check(not next(iter(networks.values()))['IPAddress'].startswith('172.30.0.'), 'private forwarding subnet reused')
 ctx = ssl.create_default_context()
 def request(address, port, path, body=None, raw=False, extra=None):
-	with socket.create_connection((address,port),timeout=8) as tcp, ctx.wrap_socket(tcp,server_hostname=fqdn) as tls:
-		conn = http.client.HTTPSConnection(fqdn, context=ctx, sock=tls)
-		headers = {'User-Agent': f'attackbox-deploy-test/{rev[:12]}', 'X-Staging-Proof': 'synthetic'}
-		if extra: headers.update(extra)
-		if body:
-			headers['Content-Type'] = 'application/json'
-			conn.request('POST', path, json.dumps(body), headers)
-		else:
-			conn.request('GET', path, headers=headers)
-		response = conn.getresponse()
-		data = response.read(65537)
-		conn.close()
-		return response.status, data if raw else json.loads(data)
+    with socket.create_connection((address,port),timeout=8) as tcp, ctx.wrap_socket(tcp,server_hostname=fqdn) as tls:
+        leaf = hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest().upper()
+        check((leaf == pin) == (port == 443), 'wrong TLS identity')
+        conn = http.client.HTTPSConnection(fqdn, port, timeout=8, context=ctx)
+        conn.sock = tls
+        conn.request('GET' if body is None else 'POST',path,body=None if body is None else json.dumps(body),headers={'Content-Type':'application/json','X-Staging-Proof':'synthetic',**(extra or {})})
+        response = conn.getresponse()
+        if port != 443:
+            return response.status, None
+        data = response.read(65537); check(len(data)<=65536, 'oversized synthetic response')
+        return response.status, data if raw else json.loads(data)
 check(request('127.0.0.1',8443,'/nginx-health')[0] == 200, 'private HTTPS failed')
 status, obj = request(ip,443,'/v1/models?proof=synthetic')
 check(status==401 and obj['error']['type']=='authentication_error', 'port 443 answered a route family without a credential')
@@ -63,63 +70,60 @@ status, obj = request(ip,443,'/v1/completions',{'model':model,'prompt':'syntheti
 check(status==200 and obj['model']==model and obj['choices'][0]['text']==fallback, 'completion was not synthetic')
 status, obj = request(ip,443,'/v1/completions',{'model':'not-a-deployed-model','prompt':'synthetic'},extra={'Authorization':'Bearer '+cred})
 check(status==404 and obj['error']['type']=='not_found_error', 'refusal mismatch')
-time.sleep(1.2)
+time.sleep(1.2)  # stay inside the 1/s visitor limit (burst 4)
 status, obj = request(ip,443,'/v1/api/completions?proof=synthetic',{'model':'gpt-4o','prompt':'synthetic'},extra={'Authorization':'Bearer '+cred})
 check(status==200 and obj['model']=='gpt-4o' and obj['choices'][0]['text']==fallback, 'route family variant or listed model was not served')
 time.sleep(1.2)
 status, data = request(ip,443,'/.env',raw=True,extra={'Proxy-Authorization':'Basic '+pcred})
 check(status==200 and re.fullmatch(rb'APP_ENV=production\nOPENAI_API_KEY=sk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}\nOPENAI_BASE_URL=https://'+re.escape(fqdn).encode()+rb'/v1\n', data), 'env-file answer mismatch')
 time.sleep(1.2)
-status, data = request(ip,443,'/',raw=True,extra={'Host':'ollama.'+fqdn})
+status, data = request(ip,443,'/',raw=True,extra={'Host':'ollama.'+fqdn})  # a product name in Host selects that product's answers; no key
 check(status==200 and data==b'Ollama is running', 'host name ollama on port 443 did not give the Ollama answer')
+# HTTP/2: the server must answer the client preface with a SETTINGS frame (no request, so no capture record).
 h2ctx = ssl.create_default_context(); h2ctx.set_alpn_protocols(['h2'])
 with socket.create_connection((ip,443),timeout=8) as tcp, h2ctx.wrap_socket(tcp,server_hostname=fqdn) as tls:
-	tls.sendall(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + bytes(3) + b'\x04' + bytes(5))
-	check(tls.selected_alpn_protocol() == 'h2' and tls.recv(9)[3:4] == b'\x04', 'HTTP/2 is offered but not served')
+    tls.sendall(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' + bytes(3) + b'\x04' + bytes(5))
+    check(tls.selected_alpn_protocol() == 'h2' and tls.recv(9)[3:4] == b'\x04', 'HTTP/2 is offered but not served')
 for p in plain:
-	time.sleep(1.2)
-	conn = http.client.HTTPConnection(ip, p, timeout=8)
-	conn.request('GET', '/v1/models', headers={'User-Agent': f'attackbox-deploy-test/{rev[:12]}', 'X-Staging-Proof': 'synthetic'})
-	response = conn.getresponse()
-	data = response.read(65537)
-	conn.close()
-	if p in keyed:
-		check(response.status == 401, f'plain port {p} did not reject a keyless request')
-	else:
-		check(response.status == 200 and len(data) <= 65536 and len(json.loads(data)['data']) == (9 if p in local else 21), f'plain port {p} did not serve its model list')
+    time.sleep(1.2)
+    conn = http.client.HTTPConnection(ip, p, timeout=8)
+    conn.request('GET', '/v1/models?proof=synthetic', headers={'X-Staging-Proof': 'synthetic'})
+    response = conn.getresponse(); data = response.read(65537); conn.close()
+    if p in keyed:
+        check(response.status == 401 and len(data) <= 65536, f'plain port {p} answered a route family without a credential')
+    else:
+        check(response.status == 200 and len(data) <= 65536 and len(json.loads(data)['data']) == (23 if p in local else 59), f'plain port {p} did not serve its model list')
+# Port answers: each of these ports must look like its usual server (status, Server header, body).
 personas = [(11434,'/',200,None,b'Ollama is running'), (1234,'/',200,None,b'{"error":"Unexpected endpoint or method. (GET /)"}'), (8000,'/health',200,'uvicorn',b''), (8080,'/health',200,'llama.cpp',b'{"status":"ok"}'),
-			(3000,'/health',200,'uvicorn',b'{"status":true}'), (4000,'/health/liveliness',200,'uvicorn',b'"I\'m alive!"'), (8188,'/queue',200,'Python/3.12 aiohttp/3.12.15',b'{"queue_running": [], "queue_pending": []}'), (8888,'/api',200,'TornadoServer/6.5.2',b'{"version": "2.17.0"}')]
+            (3000,'/health',200,'uvicorn',b'{"status":true}'), (4000,'/health/liveliness',200,'uvicorn',b'"I\'m alive!"'), (8188,'/queue',200,'Python/3.12 aiohttp/3.12.15',b'{"queue_running": [], "queue_pending": []}'), (8888,'/api',200,'TornadoServer/6.5.2',b'{"version": "2.17.0"}')]
 for p, target, want, server, body in personas:
-	time.sleep(1.2)
-	conn = http.client.HTTPConnection(ip, p, timeout=8)
-	conn.request('GET', target, headers={'User-Agent': f'attackbox-deploy-test/{rev[:12]}', 'X-Staging-Proof': 'synthetic'})
-	response = conn.getresponse()
-	data = response.read(65537)
-	conn.close()
-	check((response.status, response.getheader('Server'), data) == (want, server, body), f'port {p} did not give its port answer')
+    time.sleep(1.2)
+    conn = http.client.HTTPConnection(ip, p, timeout=8)
+    conn.request('GET', target, headers={'X-Staging-Proof': 'synthetic'})
+    response = conn.getresponse(); data = response.read(65537); conn.close()
+    check((response.status, response.getheader('Server'), data) == (want, server, body), f'port {p} did not give its port answer')
+# Ollama management route, loaded model, a prompt with a token limit, and the MCP tool list on port 11434.
 for method, target, body, marker in [('POST','/api/show',b'{"model":"llama3.3:70b"}',b'"parameter_size":"70.6B"'), ('GET','/api/ps',None,b'"size_vram":'),
-									 ('POST','/api/generate',b'{"model":"llama3.3:70b","prompt":"hi","stream":false,"options":{"num_predict":1}}',b'"response":"Hello","done":true,"done_reason":"length"'),
-									 ('POST','/mcp',b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}',b'"name":"run_command"')]:
-	time.sleep(1.2)
-	conn = http.client.HTTPConnection(ip, 11434, timeout=8)
-	conn.request(method, target, body, {'User-Agent': f'attackbox-deploy-test/{rev[:12]}', 'X-Staging-Proof': 'synthetic', 'Content-Type': 'application/json'})
-	response = conn.getresponse()
-	data = response.read(65537)
-	conn.close()
-	check(response.status == 200 and marker in data, f'port 11434 {target} did not give its Ollama answer')
+                                     ('POST','/api/generate',b'{"model":"llama3.3:70b","prompt":"hi","stream":false,"options":{"num_predict":1}}',b'"response":"Hello","done":true,"done_reason":"length"'),
+                                     ('POST','/mcp',b'{"jsonrpc":"2.0","id":1,"method":"tools/list"}',b'"name":"run_command"')]:
+    time.sleep(1.2)
+    conn = http.client.HTTPConnection(ip, 11434, timeout=8)
+    conn.request(method, target, body=body, headers={'X-Staging-Proof': 'synthetic'})
+    response = conn.getresponse(); data = response.read(65537); conn.close()
+    check(response.status == 200 and marker in data, f'port 11434 {target} did not give its Ollama answer')
 root, cap = Path('/var/lib/attackbox-public-capture'), Path('/var/lib/attackbox-public-capture/requests')
 check(run('stat','-c','%u:%g:%a',str(root))=='0:0:700' and run('stat','-c','%u:%g:%a',str(cap))=='65532:65532:700', 'unsafe capture directories')
 today = cap / time.strftime('capture-%Y%m%d.jsonl', time.gmtime())
 time.sleep(0.5)
 check(run('stat','-c','%u:%a',str(today))=='65532:600', 'capture file missing or unsafe')
 with today.open('rb') as f:
-	rows = [json.loads(line) for line in f]
-lines, new, plain_rows, persona_rows, lure_rows = len(rows), rows[-27:-21], rows[-21:-12], rows[-12:-4], rows[-4:]
+    rows = [json.loads(line) for line in f]
+lines, new, plain_rows, persona_rows, lure_rows = len(rows), rows[-27:-21], rows[-21:-12], rows[-12:-4], rows[-4:]  # ingress is closed, so the last twenty-seven records are the requests above
 check(lines >= 27 and all(r.get('port') == 443 and any(h[0].lower() == 'x-staging-proof' for h in r.get('headers', [])) for r in new), 'capture missed staging requests or their headers')
 check([(r.get('route'), r.get('status')) for r in new] == [('/v1/models',401), ('/v1/completions',200), ('/v1/completions',404), ('/v1/api/completions',200), ('/.env',200), ('/',200)], 'capture has other routes or statuses for the port 443 requests')
 check([(r.get('port'), r.get('route')) for r in lure_rows] == [(11434,'/api/show'), (11434,'/api/ps'), (11434,'/api/generate'), (11434,'/mcp')], 'capture missed the Ollama and MCP requests or their routes')
 check([r.get('port') for r in plain_rows] == plain and all(any(h[0].lower() == 'x-staging-proof' for h in r.get('headers', [])) for r in plain_rows), 'capture missed the plain-port requests or their ports')
-check([(r.get('port'), r.get('route')) for r in persona_rows] == [(11434,'/'), (1234,'/'), (8000,'/health'), (8080,'/health'), (3000,'/health'), (4000,'/health/liveliness'), (8188,'/queue'), (8888,'/api')], 'capture missed the port answer requests or their routes')
+check([(r.get('port'), r.get('route')) for r in persona_rows] == [(11434,'/'), (1234,'/unmatched'), (8000,'/health'), (8080,'/health'), (3000,'/health'), (4000,'/health/liveliness'), (8188,'/queue'), (8888,'/api')], 'capture missed the port answer requests or their routes')
 check(sum(1 for r in new if r.get('body_bytes') and len(r.get('body_sha256', '')) == 64 and 'synthetic' in r.get('body', '')) == 3, 'capture missed staging request bodies')
 check(any(['Authorization','Bearer '+cred] in r.get('headers', []) for r in new), 'capture redacted or missed the synthetic credential')
 check(any(['Proxy-Authorization','Basic '+pcred] in r.get('headers', []) for r in new), 'capture redacted or missed the synthetic proxy credential')

@@ -28,7 +28,7 @@ usage:
   public-host-stage.sh check|stage --bundle PATH --bundle-sha SHA256 --commit COMMIT \
     --verifier PATH --verifier-sha SHA256 --release-repo PATH \
     --expected-hostname NAME --public-fqdn NAME --public-ip IPV4 --host-id ID --campaign-id ID \
-    --tls-cert PATH --tls-key PATH --license-file PATH [--approve SHA256]
+    --tls-cert PATH --tls-key PATH [--approve SHA256]
   public-host-stage.sh renew --approve SHA256 --tls-cert PATH
   public-host-stage.sh rollback --approve SHA256
 USAGE
@@ -319,8 +319,6 @@ verify_common_inputs() {
   safe_root_source_file "$tls_cert" 'TLS certificate'
   safe_root_source_file "$tls_key" 'TLS private key'
   [[ $(stat -c '%a:%h' "$tls_key") =~ ^(400|600):1$ ]] || fail 'dedicated TLS key must be 0400/0600 with no hard links'
-  safe_root_source_file "$license_file" 'license file'
-  [[ -s $license_file ]] || fail 'license file is empty'
   safe_root_source_dir "$release_repo" 'approved release repository'
   [[ $(hash_file "$verifier") == "$verifier_sha" ]] || fail 'trusted verifier checksum mismatch'
   verify_tls_pair "$tls_cert" "$tls_key"
@@ -402,7 +400,6 @@ prepare_verified_work() {
     verify_tls_pair "$WORK/tls-cert" /dev/fd/8
     openssl pkey -in /dev/fd/8 -passin pass: -out "$WORK/tls-key"
   )
-  copy_input "$license_file" "$WORK/license" 0600
   verify_tls_pair "$WORK/tls-cert" "$WORK/tls-key"
   verify_release_source
   [[ $(hash_file "$WORK/bundle.snapshot") == "$bundle_sha" ]] || fail 'bundle snapshot checksum mismatch'
@@ -472,7 +469,7 @@ replace_marker() {
   mv -f -- "$tmp" "$path"
 }
 
-file_keys=(compose runtime_env project_id tls_cert tls_key collector_config collector_env collector_license collector_binary socket_helper compose_helper public_unit otel_unit)
+file_keys=(compose runtime_env project_id tls_cert tls_key collector_config collector_env collector_binary socket_helper compose_helper public_unit otel_unit)
 file_paths=(
   /opt/attackbox-public/compose.yaml
   /etc/attackbox-public/runtime.env
@@ -481,16 +478,15 @@ file_paths=(
   /etc/attackbox-public/tls/privkey.pem
   /etc/attackbox-public-otel/config.yaml
   /etc/attackbox-public-otel/environment
-  /etc/attackbox-public-otel/license.key
   /usr/local/libexec/attackbox-public-otel
   /usr/local/libexec/attackbox-public-otel-socket
   /usr/local/libexec/attackbox-public-compose
   /etc/systemd/system/attackbox-public.service
   /etc/systemd/system/attackbox-public-otel.service
 )
-file_uids=(0 0 0 0 0 0 0 0 0 0 0 0 0)
-file_gids=(0 0 0 65532 65532 0 0 0 0 0 0 0 0)
-file_modes=(644 600 600 440 440 644 600 600 755 755 755 644 644)
+file_uids=(0 0 0 0 0 0 0 0 0 0 0 0)
+file_gids=(0 0 0 65532 65532 0 0 0 0 0 0 0)
+file_modes=(644 600 600 440 440 644 600 755 755 755 644 644)
 
 dir_keys=(opt_dir etc_dir tls_dir otel_etc_dir)
 dir_paths=(/opt/attackbox-public /etc/attackbox-public /etc/attackbox-public/tls /etc/attackbox-public-otel)
@@ -611,7 +607,7 @@ project_container() {
 cleanup_work() {
   local member
   [[ -d $WORK && ! -L $WORK ]] || return 0
-  rm -f -- "$WORK/bundle.snapshot" "$WORK/tls-cert" "$WORK/tls-key" "$WORK/license" "$WORK/committed-verifier" \
+  rm -f -- "$WORK/bundle.snapshot" "$WORK/tls-cert" "$WORK/tls-key" "$WORK/committed-verifier" \
     "$WORK/project-id" "$WORK/runtime.env" "$WORK/collector.env" "$WORK/cert.pub" "$WORK/key.pub" "$WORK/expected-ports" "$WORK/actual-ports"
   for member in "${required_payload[@]}"; do rm -f -- "$WORK/extract/$member"; done
   for member in "${signed_runtime_files[@]}"; do rm -f -- "$WORK/signed/$member"; done
@@ -1130,7 +1126,6 @@ run_stage() {
   record_file tls_key "$WORK/tls-key" 0 65532 440
   record_file collector_config "$WORK/extract/deploy/public-otel/config.yaml" 0 0 644
   record_file collector_env "$WORK/collector.env" 0 0 600
-  record_file collector_license "$WORK/license" 0 0 600
   record_file collector_binary "$WORK/extract/otelcol-contrib" 0 0 755
   record_file socket_helper "$WORK/extract/deploy/public-otel/prepare-socket.sh" 0 0 755
   record_file compose_helper "$WORK/extract/deploy/public-compose.sh" 0 0 755
@@ -1148,7 +1143,6 @@ run_stage() {
   install_owned_file tls_key "$WORK/tls-key" /etc/attackbox-public/tls/privkey.pem
   install_owned_file collector_config "$WORK/extract/deploy/public-otel/config.yaml" /etc/attackbox-public-otel/config.yaml
   install_owned_file collector_env "$WORK/collector.env" /etc/attackbox-public-otel/environment
-  install_owned_file collector_license "$WORK/license" /etc/attackbox-public-otel/license.key
   install_owned_file collector_binary "$WORK/extract/otelcol-contrib" /usr/local/libexec/attackbox-public-otel
   install_owned_file socket_helper "$WORK/extract/deploy/public-otel/prepare-socket.sh" /usr/local/libexec/attackbox-public-otel-socket
   install_owned_file compose_helper "$WORK/extract/deploy/public-compose.sh" /usr/local/libexec/attackbox-public-compose
@@ -1296,10 +1290,10 @@ run_rollback() {
 action=${1:-}
 [[ $action == check || $action == stage || $action == renew || $action == rollback ]] || { usage; exit 2; }
 shift
-bundle= bundle_sha= commit= verifier= verifier_sha= release_repo= expected_hostname= public_fqdn= public_ip= host_id= campaign_id= tls_cert= tls_key= license_file= approve=
+bundle= bundle_sha= commit= verifier= verifier_sha= release_repo= expected_hostname= public_fqdn= public_ip= host_id= campaign_id= tls_cert= tls_key= approve=
 while (($#)); do
   case $1 in
-    --bundle|--bundle-sha|--commit|--verifier|--verifier-sha|--release-repo|--expected-hostname|--public-fqdn|--public-ip|--host-id|--campaign-id|--tls-cert|--tls-key|--license-file|--approve)
+    --bundle|--bundle-sha|--commit|--verifier|--verifier-sha|--release-repo|--expected-hostname|--public-fqdn|--public-ip|--host-id|--campaign-id|--tls-cert|--tls-key|--approve)
       [[ $# -ge 2 ]] || { usage; exit 2; }
       case $1 in
         --bundle) bundle=$2 ;; --bundle-sha) bundle_sha=$2 ;; --commit) commit=$2 ;;
@@ -1307,7 +1301,7 @@ while (($#)); do
         --expected-hostname) expected_hostname=$2 ;; --public-ip) public_ip=$2 ;; --host-id) host_id=$2 ;;
         --public-fqdn) public_fqdn=$2 ;;
         --campaign-id) campaign_id=$2 ;; --tls-cert) tls_cert=$2 ;; --tls-key) tls_key=$2 ;;
-        --license-file) license_file=$2 ;; --approve) approve=$2 ;;
+        --approve) approve=$2 ;;
       esac
       shift 2 ;;
     *) usage; exit 2 ;;
@@ -1322,12 +1316,12 @@ systemctl() {
   if [[ $action == renew ]]; then timeout -k 1 12 systemctl "$@" 9<&-; else command systemctl "$@" 9<&-; fi
 }
 if [[ $action == rollback || $action == renew ]]; then
-  [[ -z $bundle$bundle_sha$commit$verifier$verifier_sha$release_repo$expected_hostname$public_fqdn$public_ip$host_id$campaign_id$tls_key$license_file && $approve =~ ^[a-f0-9]{64}$ ]] || { usage; exit 2; }
+  [[ -z $bundle$bundle_sha$commit$verifier$verifier_sha$release_repo$expected_hostname$public_fqdn$public_ip$host_id$campaign_id$tls_key && $approve =~ ^[a-f0-9]{64}$ ]] || { usage; exit 2; }
   if [[ $action == renew && -n $tls_cert ]]; then run_renew
   elif [[ $action == rollback && -z $tls_cert ]]; then run_rollback
   else usage; exit 2; fi
 else
-  [[ -n $bundle && -n $bundle_sha && -n $commit && -n $verifier && -n $verifier_sha && -n $release_repo && -n $expected_hostname && -n $public_fqdn && -n $public_ip && -n $host_id && -n $campaign_id && -n $tls_cert && -n $tls_key && -n $license_file ]] || { usage; exit 2; }
+  [[ -n $bundle && -n $bundle_sha && -n $commit && -n $verifier && -n $verifier_sha && -n $release_repo && -n $expected_hostname && -n $public_fqdn && -n $public_ip && -n $host_id && -n $campaign_id && -n $tls_cert && -n $tls_key ]] || { usage; exit 2; }
   [[ $action == stage || -z $approve ]] || { usage; exit 2; }
   if [[ $action == check ]]; then run_check; else run_stage; fi
 fi

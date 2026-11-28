@@ -75,8 +75,7 @@ cert_fixture bmV3 >/root/input/renew.pem
 cert_fixture cHJpdmF0ZQ== >/root/input/proxy.pem
 printf 'not a public key source\n' >/root/input/proxy.key
 printf 'synthetic private key\n' >/root/input/key.pem
-printf 'synthetic-license-only\n' >/root/input/license.key
-chmod 0600 /root/input/{cert.pem,key.pem,license.key}
+chmod 0600 /root/input/{cert.pem,key.pem}
 
 cat >/usr/local/bin/hostname <<'MOCK'
 #!/bin/bash
@@ -481,7 +480,7 @@ script=/candidate
 common=(--bundle /root/input/public-bundle.tar --bundle-sha "$bundle_sha" --commit "$commit" \
   --verifier /root/release/scripts/verify-public-bundle.sh --verifier-sha "$verifier_sha" --release-repo /root/release \
   --expected-hostname "$host" --public-fqdn api.example.test --public-ip "$public_ip" --host-id synthetic-host --campaign-id synthetic-campaign \
-  --tls-cert /root/input/cert.pem --tls-key /root/input/key.pem --license-file /root/input/license.key)
+  --tls-cert /root/input/cert.pem --tls-key /root/input/key.pem)
 
 bash "$script" check "${common[@]}" >/tmp/check.out
 grep -Fq 'check passed' /tmp/check.out
@@ -505,7 +504,7 @@ mv /tmp/docker.saved /usr/local/bin/docker
 expect_failure 'bundle SHA-256' bash "$script" check --bundle /root/input/public-bundle.tar --bundle-sha bad --commit "$commit" \
   --verifier /root/release/scripts/verify-public-bundle.sh --verifier-sha "$verifier_sha" --release-repo /root/release \
   --expected-hostname "$host" --public-fqdn api.example.test --public-ip "$public_ip" --host-id synthetic-host --campaign-id synthetic-campaign \
-  --tls-cert /root/input/cert.pem --tls-key /root/input/key.pem --license-file /root/input/license.key
+  --tls-cert /root/input/cert.pem --tls-key /root/input/key.pem
 truncate -s 1073741825 /root/input/oversized.tar
 oversized=("${common[@]}")
 for ((index=0; index<${#oversized[@]}; index++)); do
@@ -514,11 +513,11 @@ done
 expect_failure 'bundle exceeds 1 GiB' bash "$script" check "${oversized[@]}"
 [[ ! -e /var/lib/attackbox-public ]] || fail 'oversized bundle changed public state'
 rm /root/input/oversized.tar
-cp /root/input/license.key /tmp/untrusted-license.key
-chmod 0600 /tmp/untrusted-license.key
+cp /root/input/cert.pem /tmp/untrusted-cert.pem
+chmod 0600 /tmp/untrusted-cert.pem
 unsafe=("${common[@]}")
 for ((index=0; index<${#unsafe[@]}; index++)); do
-  [[ ${unsafe[$index]} != --license-file ]] || unsafe[$((index+1))]=/tmp/untrusted-license.key
+  [[ ${unsafe[$index]} != --tls-cert ]] || unsafe[$((index+1))]=/tmp/untrusted-cert.pem
 done
 expect_failure 'group/world-writable parent' bash "$script" check "${unsafe[@]}"
 printf 'wrong-host.test\n' >/tmp/mock/hostname
@@ -664,7 +663,7 @@ fi
 otel_user=(setpriv --reuid=998 --regid=998 --clear-groups --)
 config=/etc/attackbox-public-otel/config.yaml
 [[ $(stat -c '%u:%g:%a' "${config%/*}") == 0:0:700 && $(stat -c '%u:%g:%a' "$config") == 0:0:644 &&
-   $(stat -c '%u:%g:%a' "${config%/*}/license.key") == 0:0:600 ]] || fail 'Collector credential source permissions changed'
+   ! -e ${config%/*}/license.key ]] || fail 'Collector config source permissions changed'
 if "${otel_user[@]}" head -c 1 "$config" >/dev/null 2>&1; then fail 'Collector can read its config through the host path'; fi
 # Model PID 1 delivering the synthetic config; use the actual unit argv under the service UID.
 cred_dir=$(mktemp -d /run/test-otel-creds.XXXXXXXX)

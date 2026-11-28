@@ -23,6 +23,8 @@ git -C "$root" -c gpg.minTrustLevel=fully verify-commit "$rev" >/dev/null 2>&1
 [[ $(git -C "$root" log -1 --format=%GF "$rev") == 7026F1FDA2A21BC035F17D3B4D9E5BA7BBE1EB29 ]]
 lib=${ATTACKBOX_FIREWALL_LEDGER:-$folder/public-firewall-ledger.sh}
 [[ -f $lib && ! -L $lib ]]
+# shellcheck source=/dev/null
+source "$lib"
 launcher=${ATTACKBOX_VULTR_LAUNCH:-$root/scripts/vultr-launch.sh}
 key=${VULTR_API_KEY:-}
 if [[ -z $key ]]; then key=$(sed -nE 's/^(export[[:space:]]+)?VULTR_API_KEY=//p' "$root/.env" | tail -n 1 | tr -d "\"' \r"); fi

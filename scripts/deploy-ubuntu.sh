@@ -658,6 +658,7 @@ remove_newrelic_migration() {
 		fi
 	fi
 
+	# The public gateway's collector key belongs to its release ledger; the public cutover removes it.
 	local nr_paths=(
 		/etc/newrelic-infra.yml
 		/etc/newrelic-infra
@@ -665,9 +666,16 @@ remove_newrelic_migration() {
 		/etc/apt/sources.list.d/newrelic-infra.list
 		/etc/apt/trusted.gpg.d/newrelic-infra.gpg
 		/usr/share/keyrings/newrelic-infra.gpg
+		/usr/local/bin/newrelic
 		/etc/attackbox/otel-license.key
-		/etc/attackbox-public-otel/license.key
 	)
+
+	# The installed private Collector unit loads this key; it cannot start
+	# without it until install-monitoring.sh installs the file-export unit.
+	if [[ -e /etc/attackbox/otel-license.key && "$MODE" == "apply" ]]; then
+		systemctl stop attackbox-otel.service || true
+		removed+=("stopped attackbox-otel.service until install-monitoring.sh --apply")
+	fi
 
 	for path in "${nr_paths[@]}"; do
 		if [[ -e "$path" || -L "$path" ]]; then
@@ -720,7 +728,7 @@ setup_firewall() {
         { echo "flush ruleset"; nft list ruleset; } > "$backup"
 
         # ERR trap for rollback
-        trap 'nft -f "'"$backup"'" 2>/dev/null; rm -f "'"$backup"'" "'"$tmpdir"'"/*.txt; rmdir "'"$tmpdir"'" 2>/dev/null; err "Firewall setup failed, rolled back"' ERR
+        trap 'nft -f "'"$backup"'" 2>/dev/null; rm -f "'"$backup"'"; err "Firewall setup failed, rolled back"' ERR
 
         # Load attackbox table (idempotent)
         if ! nft -c -f "$nft_rules"; then
@@ -1148,7 +1156,7 @@ set_release_version() {
 }
 
 # The deployment label is the campaign ID, never a commit. The shipper reads
-# it at start, and bootstrap-infrastructure.sh copies it into the edge log labels.
+# it at start.
 set_deployment_id() {
     local env_file="${1:-/etc/attackbox/shipper-monitoring.env}" campaign
     [[ -f "$env_file" ]] || return 0
@@ -1333,8 +1341,6 @@ run_verification_enhanced() {
         err "Verification requires Docker"
         return 1
     fi
-
-    bash "${SCRIPT_DIR}/bootstrap-infrastructure.sh" --verify
 
     # Use verified multi-arch busybox digest for tests
     # Verification: docker pull busybox:1.36.1

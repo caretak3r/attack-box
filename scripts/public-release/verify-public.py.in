@@ -30,7 +30,7 @@ def https_check():
 		res = conn.getresponse()
 		body = json.loads(res.read(65537))
 	ids = [m.get('id') for m in body.get('data', [])]
-	if leaf != pin or res.status != 200 or len(ids) != 21 or ids[0] != 'local-instruct-8b' or 'gpt-4o' not in ids:
+	if leaf != pin or res.status != 200 or len(ids) != 59 or ids[0] != 'local-instruct-8b' or 'gpt-4o' not in ids:
 		raise RuntimeError(f'unexpected HTTPS result: status={res.status}, pinned={leaf == pin}')
 	time.sleep(1.2)
 	h2 = subprocess.run(['curl', '-sS', '--http2', '--max-time', '10', '-o', '/dev/null', '-w', '%{http_code} %{http_version}',
@@ -58,7 +58,7 @@ def https_check():
 		body = json.loads(res.read(65537))
 		conn.close()
 		ids = [m.get('id') for m in body.get('data', [])]
-		expect_len = 9 if port in local else 21
+		expect_len = 23 if port in local else 59
 		expect_status = 401 if port in keyed else 200
 		if res.status != expect_status or len(ids) != (0 if expect_status==401 else expect_len):
 			raise RuntimeError(f'unexpected plain HTTP result on port {port}: status={res.status}')
@@ -69,17 +69,17 @@ def evidence_count(pattern):
 	script = f'''
 set -euo pipefail
 python3 -I - <<'PY'
-import json, re, os
+import json, re, os, time
 evidence_root = os.getenv("ATTACKBOX_EVIDENCE_ROOT", "/var/lib")
 egress, rev12 = "{egress}", "{rev[:12]}"
 pat = re.compile(r"""{pattern}""")
-capture = f"{{evidence_root}}/attackbox-public-capture/requests/capture-$(date -u +%Y%m%d).jsonl"
+capture = f"{{evidence_root}}/attackbox-public-capture/requests/" + time.strftime("capture-%Y%m%d.jsonl", time.gmtime())
 n = 0
 if __import__("pathlib").Path(capture).exists():
 	with open(capture, "rb") as f:
 		for line in f:
 			r = json.loads(line)
-			if r.get("src_ip") == egress:
+			if r.get("peer") == egress:
 				n += 1
 traces = f"{{evidence_root}}/attackbox-evidence/public-otel/traces.jsonl"
 spans = []
@@ -89,9 +89,11 @@ if __import__("pathlib").Path(traces).exists():
 			if not line.strip(): continue
 			req = json.loads(line)
 			for rs in req.get("resourceSpans", []):
+				res = {{a["key"]: a.get("value",{{}}) for a in rs.get("resource",{{}}).get("attributes",[])}}
 				for ss in rs.get("scopeSpans", []):
 					for sp in ss.get("spans", []):
-						attrs = {{a["key"]: a.get("value",{{}}) for a in sp.get("attributes",[])}}
+						attrs = dict(res, name={{"stringValue": sp.get("name","")}})
+						attrs.update({{a["key"]: a.get("value",{{}}) for a in sp.get("attributes",[])}})
 						if attrs.get("service.version",{{}}).get("stringValue") == "{rev}" and attrs.get("campaign.id",{{}}).get("stringValue") == f"https443-{{rev12}}" and attrs.get("client.address",{{}}).get("stringValue") == egress:
 							if pat.search(json.dumps(attrs)):
 								spans.append(1)
@@ -106,8 +108,8 @@ if __name__ == '__main__':
 	proto = https_check()
 	print(f'Public HTTPS: {proto["http"]}, HTTP/2: {proto["http2"]}, TLS: {proto["tls"]}, trusted chain: {proto["trusted"]}, leaf pin: {proto["leaf"]==pin}, model: {proto["model"]}, plain ports: {len(proto["plain_ports"])}, firewall rules: {len(proto["rules"])}')
 	time.sleep(2)
-	captured, n = evidence_count(r'"name".*"public\\.request".*"/v1/(api/)?models"')
-	c, _ = evidence_count(r'"name".*"public\\.connection".*"no_data".*"sni".*"unknown"')
+	captured, n = evidence_count(r'(?=.*"name": \{"stringValue": "public\.request"\})(?=.*"http\.route": \{"stringValue": "/v1/(api/)?models"\})')
+	_, c = evidence_count(r'(?=.*"name": \{"stringValue": "public\.connection"\})(?=.*"attackbox\.connection\.outcome": \{"stringValue": "no_data"\})(?=.*"attackbox\.tls\.sni": \{"stringValue": "unknown"\})')
 	print(f'Local capture: {captured} line(s) from {egress}. OTLP traces: {n} public.request on /v1/models and {c} public.connection (no_data, sni=unknown) span(s).')
 	with tempfile.NamedTemporaryFile(dir=folder,mode='w',prefix='.public-',delete=False) as f:
 		tmp = pathlib.Path(f.name)

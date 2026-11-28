@@ -213,11 +213,11 @@ test_newrelic_migration() (
     # Create fixture NR files
     mkdir -p "$tmp/etc/newrelic-infra" "$tmp/etc/systemd/system/newrelic-infra.service.d" \
         "$tmp/etc/apt/sources.list.d" "$tmp/etc/apt/trusted.gpg.d" \
-        "$tmp/etc/attackbox" "$tmp/etc/attackbox-public-otel"
+        "$tmp/etc/attackbox" "$tmp/etc/attackbox-public-otel" "$tmp/usr/local/bin"
     touch "$tmp/etc/newrelic-infra.yml" "$tmp/etc/newrelic-infra/agent.yml" \
         "$tmp/etc/systemd/system/newrelic-infra.service.d/override.conf" \
         "$tmp/etc/apt/sources.list.d/newrelic-infra.list" \
-        "$tmp/etc/apt/trusted.gpg.d/newrelic-infra.gpg" \
+        "$tmp/etc/apt/trusted.gpg.d/newrelic-infra.gpg" "$tmp/usr/local/bin/newrelic" \
         "$tmp/etc/attackbox/otel-license.key" "$tmp/etc/attackbox-public-otel/license.key"
 
     # Create shipper.env with NR line and kept line
@@ -243,7 +243,9 @@ ENV
     [[ ! -e "$tmp/etc/apt/sources.list.d/newrelic-infra.list" ]] || return 1
     [[ ! -e "$tmp/etc/apt/trusted.gpg.d/newrelic-infra.gpg" ]] || return 1
     [[ ! -e "$tmp/etc/attackbox/otel-license.key" ]] || return 1
-    [[ ! -e "$tmp/etc/attackbox-public-otel/license.key" ]] || return 1
+    [[ ! -e "$tmp/usr/local/bin/newrelic" ]] || return 1
+    # The public release ledger owns its collector key; only its rollback removes it.
+    [[ -e "$tmp/etc/attackbox-public-otel/license.key" ]] || return 1
 
     # Verify NR line removed from shipper.env but kept lines remain
     [[ -f "$tmp/etc/attackbox/shipper.env" ]] || return 1

@@ -7,16 +7,15 @@ bin_dir=${2:-}
 [[ $# == 2 && ( $mode == --check || $mode == --apply ) ]] || { echo 'usage: install-log-budget.sh --check|--apply VERIFIED_BINARY_DIRECTORY' >&2; exit 2; }
 python3 - "$bin_dir" <<'PY'
 import hashlib,json,pathlib,struct,sys
-root=pathlib.Path(sys.argv[1])
-inventory=json.loads(root.joinpath('CHECKSUMS.json').read_text())
+root=pathlib.Path(sys.argv[1]); manifest=json.loads((root/'SHA256SUMS.json').read_text())
 for name in ['attackbox-auditfilter','attackbox-hostcollector','attackbox-hostreader']:
- got=hashlib.file_digest(open(root/name,'rb'),'sha256').hexdigest()
- want=inventory[name]['sha256']
- if got!=want: raise SystemExit(f'{name} SHA-256 {got[:16]}... does not match inventory {want[:16]}...')
-for name in ['attackbox-auditfilter','attackbox-hostcollector','attackbox-hostreader']:
- b=root.joinpath(name).read_bytes()
- if b[:4]!=b'\x7fELF' or b[4]!=2 or b[5]!=1 or b[18:20]!=b'\xb7\x00': raise SystemExit('bad Linux amd64 ELF header: '+name)
- off,=struct.unpack_from('<Q',b,32);size,count=struct.unpack_from('<HH',b,off+56)
+ p=root/name
+ if p.is_symlink() or not p.is_file(): raise SystemExit('binary must be regular: '+name)
+ b=p.read_bytes()
+ if hashlib.sha256(b).hexdigest()!=manifest.get(name): raise SystemExit('checksum mismatch: '+name)
+ if len(b)<64 or b[:6]!=b'\x7fELF\x02\x01' or struct.unpack_from('<H',b,18)[0]!=62: raise SystemExit('Linux amd64 ELF required')
+ off=struct.unpack_from('<Q',b,32)[0];size,count=struct.unpack_from('<HH',b,54)
+ if size<56 or count==0 or off+size*count>len(b): raise SystemExit('invalid ELF headers')
  if any(struct.unpack_from('<I',b,off+i*size)[0]==3 for i in range(count)): raise SystemExit('static binary required')
 print('Three binary checksums and static Linux amd64 ELF headers verified')
 PY

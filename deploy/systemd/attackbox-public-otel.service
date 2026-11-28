@@ -46,6 +46,7 @@ AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
 IPAddressDeny=any
 IPAddressAllow=localhost
+SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 StandardOutput=null
 StandardError=null
