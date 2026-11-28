@@ -176,6 +176,25 @@ test_release_version_label() (
     grep -q 'ATTACKBOX_RELEASE_VERSION=\$commit ./scripts/deploy-ubuntu.sh' "${SCRIPT_DIR}/vultr-launch.sh" || return 1
     rm -rf "$tmp"
 )
+test_deployment_id_label() (
+    local tmp
+    tmp=$(mktemp -d)
+    ok() { :; }; err() { :; }
+    awk '/^set_deployment_id\(\) \{/ {copy=1} copy {print} copy && /^}/ {exit}' "$DEPLOY_SCRIPT" > "$tmp/function"
+    source "$tmp/function"
+    printf 'ATTACKBOX_CAMPAIGN_ID=c1\nATTACKBOX_SENSOR_ID=h1\nATTACKBOX_DEPLOYMENT_ID=0123abc\n' > "$tmp/env"; chmod 600 "$tmp/env"
+    set_deployment_id "$tmp/env" || return 1
+    [[ "$(cat "$tmp/env")" == $'ATTACKBOX_CAMPAIGN_ID=c1\nATTACKBOX_SENSOR_ID=h1\nATTACKBOX_DEPLOYMENT_ID=c1' && ! -e "$tmp/env.bak" ]] || return 1
+    [[ "$(stat -f %Lp "$tmp/env" 2>/dev/null || stat -c %a "$tmp/env")" == 600 ]] || return 1
+    set_deployment_id "$tmp/env" || return 1
+    printf 'ATTACKBOX_CAMPAIGN_ID=Bad/Id\nATTACKBOX_DEPLOYMENT_ID=0123abc\n' > "$tmp/bad"
+    ! set_deployment_id "$tmp/bad" || return 1
+    grep -qx 'ATTACKBOX_DEPLOYMENT_ID=0123abc' "$tmp/bad" || return 1
+    printf 'ATTACKBOX_SENSOR_ID=h1\n' > "$tmp/none"
+    set_deployment_id "$tmp/none" && set_deployment_id "$tmp/absent" || return 1
+    [[ "$(grep -n '^        set_deployment_id$' "$DEPLOY_SCRIPT" | cut -d: -f1)" -lt "$(grep -n '^        start_services$' "$DEPLOY_SCRIPT" | cut -d: -f1)" ]] || return 1
+    rm -rf "$tmp"
+)
 test_bootstrap_before_docker() { local boot_line=$(grep -n "bootstrap_firewall" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:bootstrap_firewall()" | head -1 | cut -d: -f1); local dock_line=$(grep -n "start_docker" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:start_docker()" | head -1 | cut -d: -f1); [[ -n "$boot_line" && -n "$dock_line" && "$boot_line" -lt "$dock_line" ]]; }
 test_docker_before_prepare() { local dock_line=$(grep -n "start_docker" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:start_docker()" | head -1 | cut -d: -f1); local prep_line=$(grep -n "prepare_bait" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:prepare_bait()" | head -1 | cut -d: -f1); [[ -n "$dock_line" && -n "$prep_line" && "$dock_line" -lt "$prep_line" ]]; }
 test_prepare_before_final_firewall() { local prep_line=$(grep -n "^[[:space:]]*prepare_bait$" "$DEPLOY_SCRIPT" | head -1 | cut -d: -f1); local fw_line=$(grep -n "^[[:space:]]*setup_firewall$" "$DEPLOY_SCRIPT" | head -1 | cut -d: -f1); [[ -n "$prep_line" && -n "$fw_line" && "$prep_line" -lt "$fw_line" ]]; }
@@ -255,6 +274,7 @@ main() {
     run_test "Docs socket paths" test_docs_socket_paths
     run_test "Public gateway restored after Docker stop" test_public_gateway_restore
     run_test "Release label follows the deploy" test_release_version_label
+    run_test "Deployment label is the campaign ID" test_deployment_id_label
     echo ""; echo "=========================================================="; echo "Test Results"; echo "=========================================================="
     echo "Tests run:    $TESTS_RUN"; echo -e "Tests passed: ${GREEN}$TESTS_PASSED${NC}"
     if [[ $TESTS_FAILED -gt 0 ]]; then echo -e "Tests failed: ${RED}$TESTS_FAILED${NC}"; exit 1; else echo -e "Tests failed: 0"; echo ""; echo -e "${GREEN}✓${NC} All tests passed"; exit 0; fi

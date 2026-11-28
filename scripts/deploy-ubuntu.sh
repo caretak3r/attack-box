@@ -1226,6 +1226,20 @@ set_release_version() {
     ok "Release label set to $version"
 }
 
+# The deployment label is the campaign ID, never a commit. The shipper reads
+# it at start, and bootstrap-infrastructure.sh copies it into the edge log labels.
+set_deployment_id() {
+    local env_file="${1:-/etc/attackbox/shipper-monitoring.env}" campaign
+    [[ -f "$env_file" ]] || return 0
+    grep -q '^ATTACKBOX_DEPLOYMENT_ID=' "$env_file" || return 0
+    campaign=$(sed -n 's/^ATTACKBOX_CAMPAIGN_ID=//p' "$env_file")
+    [[ "$campaign" =~ ^[a-z0-9][a-z0-9_.-]{0,62}$ ]] || { err "Invalid ATTACKBOX_CAMPAIGN_ID in $env_file"; return 1; }
+    ! grep -qx "ATTACKBOX_DEPLOYMENT_ID=$campaign" "$env_file" || return 0
+    sed -i.bak "s/^ATTACKBOX_DEPLOYMENT_ID=.*/ATTACKBOX_DEPLOYMENT_ID=$campaign/" "$env_file"
+    rm -f "$env_file.bak"
+    ok "Deployment label set to the campaign ID $campaign"
+}
+
 
 # Resolve Ubuntu mirrors
 resolve_ubuntu_mirrors() {
@@ -1541,6 +1555,7 @@ main() {
 
     if [[ "$MODE" == "apply" ]]; then
         set_release_version
+        set_deployment_id
         start_services
         start_bait
         # Report a failure after the private checks; do not stop them.
