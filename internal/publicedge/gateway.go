@@ -27,9 +27,31 @@ const gatewayModel = "local-instruct-8b"
 
 // gatewayModelList is the fixed set of names the gateway claims to serve; it must match the
 // gen_ai.request.model allowlist in deploy/public-otel/config.yaml. Ollama-style names also list in /api/tags.
-var gatewayModelList = []string{gatewayModel, "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "o3-mini", "gpt-3.5-turbo",
+var gatewayModelList = []string{gatewayModel,
+	// OpenAI
+	"gpt-5.6-sol", "gpt-5.5-pro", "gpt-5.5", "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini", "o3-mini", "gpt-3.5-turbo",
+	// Anthropic
+	"claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
 	"claude-3-5-sonnet-20241022", "claude-3-7-sonnet-20250219", "claude-sonnet-4-20250514", "claude-3-5-haiku-20241022",
-	"llama3.1:8b", "qwen2.5:7b", "deepseek-r1:8b", "mistral:7b", "llama3.3:70b", "deepseek-r1:70b", "qwen2.5-coder:32b",
+	// Google Gemini
+	"gemini-4-argon", "gemini-3.8-flash", "gemini-3.1-flash-lite",
+	// xAI
+	"grok-4.7",
+	// DeepSeek hosted
+	"deepseek-chat", "deepseek-reasoner", "deepseek-flash", "deepseek-v4-pro",
+	// Moonshot Kimi
+	"kimi-k3.1-pro", "kimi-k3",
+	// Mistral
+	"mistral-large-4", "mistral-small-4",
+	// opencode
+	"big-pickle", "mimo-v2.6-flash-free", "deepseek-v4.1-flash-free", "claude-fable-5",
+	// Qwen hosted
+	"qwen3-max",
+	// Ollama tags
+	"llama3.1:8b", "qwen2.5:7b", "deepseek-r1:8b", "deepseek-r1:70b", "mistral:7b", "llama3.3:70b", "qwen2.5-coder:32b",
+	"llama4:16x17b", "llama4:128x17b", "gemma3:1b", "gemma3:4b", "gemma3:12b", "gemma3:27b", "phi4:14b", "qwen3:8b", "qwen3:32b",
+	"qwen3-coder:30b", "qwen3-coder:480b", "deepseek-v3:671b", "gpt-oss:20b", "gpt-oss:120b",
+	// Embedding models
 	"text-embedding-3-small", "text-embedding-3-large", "nomic-embed-text"}
 
 // gatewayModelName returns the listed model for a requested name; Ollama clients may add ":latest".
@@ -713,7 +735,13 @@ func gatewayMessages(w http.ResponseWriter, r *http.Request) {
 
 // gatewayHostedModel reports a hosted API name, which a local model server does not list.
 func gatewayHostedModel(m string) bool {
-	return strings.HasPrefix(m, "gpt-") || strings.HasPrefix(m, "o3-") || strings.HasPrefix(m, "claude-") || strings.HasPrefix(m, "text-embedding-")
+	if strings.Contains(m, ":") {
+		return false
+	}
+	return strings.HasPrefix(m, "gpt-") || strings.HasPrefix(m, "o3-") || strings.HasPrefix(m, "claude-") ||
+		strings.HasPrefix(m, "text-embedding-") || strings.HasPrefix(m, "gemini-") || strings.HasPrefix(m, "grok-") ||
+		strings.HasPrefix(m, "deepseek-") || strings.HasPrefix(m, "kimi-") || strings.HasPrefix(m, "mistral-") ||
+		strings.HasPrefix(m, "big-pickle") || strings.HasPrefix(m, "mimo-") || strings.HasPrefix(m, "qwen3-max")
 }
 
 // gatewayLMStudioModels answers LM Studio's native model list with the local-style models.

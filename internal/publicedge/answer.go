@@ -108,6 +108,14 @@ func gatewayIdentity(model string) string {
 		return "I'm ChatGPT, a large language model trained by OpenAI. How can I help you today?"
 	case strings.HasPrefix(model, "claude-"):
 		return "I'm Claude, an AI assistant made by Anthropic. How can I help you today?"
+	case strings.HasPrefix(model, "gemini-"):
+		return "I'm Gemini, a multimodal AI model created by Google. I can help with questions, writing, coding, and visual understanding."
+	case strings.HasPrefix(model, "big-pickle"), strings.HasPrefix(model, "mimo-"):
+		return "I'm an AI assistant. How can I help you today?"
+	case strings.HasPrefix(model, "grok-"):
+		return "I'm Grok, an AI assistant developed by xAI. I can help you with a wide range of tasks."
+	case strings.HasPrefix(model, "kimi-"):
+		return "I'm Kimi, a large language model developed by Moonshot AI. How can I assist you today?"
 	case strings.HasPrefix(model, "qwen"):
 		return "I am Qwen, a large language model created by Alibaba Cloud. I can answer questions, write text and help with code."
 	case strings.HasPrefix(model, "deepseek"):
@@ -116,6 +124,10 @@ func gatewayIdentity(model string) string {
 		return "I'm a large language model trained by Mistral AI. How can I help you today?"
 	case strings.HasPrefix(model, "llama"):
 		return `I'm an artificial intelligence model known as Llama. Llama stands for "Large Language Model Meta AI."`
+	case strings.HasPrefix(model, "gemma"):
+		return "I'm Gemma, an open model developed by Google. How can I help you today?"
+	case strings.HasPrefix(model, "phi"):
+		return "I'm Phi, a small language model by Microsoft. How can I assist you?"
 	}
 	return "I'm an AI assistant. How can I help you today?"
 }

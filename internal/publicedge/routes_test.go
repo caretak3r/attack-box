@@ -120,6 +120,29 @@ func TestGatewayPatternRoutes(t *testing.T) {
 	}
 }
 
+func TestGatewayModelAllowlist(t *testing.T) {
+	modelPattern := collectorPattern(t, "gen_ai.request.model")
+	for _, m := range gatewayModelList {
+		if !modelPattern.MatchString(m) {
+			t.Errorf("model %q not in collector allowlist", m)
+		}
+	}
+}
+
+func TestGatewayHostedVsLocal(t *testing.T) {
+	for _, m := range gatewayModelList {
+		isHosted := gatewayHostedModel(m)
+		hasColon := strings.Contains(m, ":")
+		isLocalStyle := m == "local-instruct-8b" || m == "nomic-embed-text" || hasColon
+		if isLocalStyle && isHosted {
+			t.Errorf("model %q is local-style but gatewayHostedModel returned true", m)
+		}
+		if !isLocalStyle && !isHosted {
+			t.Errorf("model %q is hosted but gatewayHostedModel returned false", m)
+		}
+	}
+}
+
 // json200 reports whether a 200 answer with a JSON content type holds valid JSON.
 func json200(w *httptest.ResponseRecorder) bool {
 	return w.Code != 200 || w.Header().Get("Content-Type") != gatewayJSON || json.Valid(w.Body.Bytes())
