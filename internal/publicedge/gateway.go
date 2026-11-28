@@ -292,7 +292,7 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 			r.Body = counted
 		}
 		if g.Capture != nil {
-			bodyRec = newCaptureBodyRecorder(r.Body)
+			bodyRec = g.Capture.bodyRecorder(r.Body)
 			r.Body = bodyRec
 		}
 	}
@@ -533,11 +533,13 @@ func gatewayCompletion(chat bool) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		prompt := gatewayContentText(obj["prompt"])
+		limit := gatewayLimit(obj, "max_completion_tokens", "max_tokens")
+		var a gatewayAnswerText
 		if chat {
-			prompt = gatewayLastUser(obj["messages"])
+			a = gatewayChatAnswer(r, model, obj["messages"], limit, false)
+		} else {
+			a = gatewayCompose(model, gatewayContentText(obj["prompt"]), limit, false)
 		}
-		a := gatewayCompose(model, prompt, gatewayLimit(obj, "max_completion_tokens", "max_tokens"), false)
 		text := gatewayQ(strings.Join(a.text, ""))
 		gatewaySleep(r.Context(), time.Duration(a.count)*12*time.Millisecond)
 		now := time.Now().Unix()
@@ -687,7 +689,7 @@ func gatewayMessages(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	a := gatewayCompose(model, gatewayLastUser(obj["messages"]), maxTokens, false)
+	a := gatewayChatAnswer(r, model, obj["messages"], maxTokens, false)
 	text, reason := gatewayQ(strings.Join(a.text, "")), "end_turn"
 	if a.reason == "length" {
 		reason = "max_tokens"

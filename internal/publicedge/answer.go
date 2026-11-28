@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -155,19 +156,24 @@ func gatewayLimit(obj map[string]json.RawMessage, names ...string) int {
 	return 0
 }
 
-// gatewayLastUser returns the text of the last user message of a chat request.
-func gatewayLastUser(raw json.RawMessage) string {
+func gatewayChatAnswer(r *http.Request, model string, raw json.RawMessage, limit int, think bool) gatewayAnswerText {
 	var messages []struct {
 		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
 	}
-	_ = json.Unmarshal(raw, &messages)
+	valid := json.Unmarshal(raw, &messages) == nil
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "user" {
-			return gatewayContentText(messages[i].Content)
+			content := messages[i].Content
+			prompt := gatewayContentText(content)
+			a := gatewayCompose(model, prompt, limit, think)
+			if rec, ok := r.Body.(*captureBodyRecorder); ok && valid && i == len(messages)-1 && prompt != "" {
+				rec.chatACK(r, content, prompt, limit, &a)
+			}
+			return a
 		}
 	}
-	return ""
+	return gatewayCompose(model, "", limit, think)
 }
 
 // gatewayContentText reads a string, or the text parts of a content list.

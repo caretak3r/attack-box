@@ -8,6 +8,24 @@ Native New Relic Maps, component coverage, identity requirements and monitoring 
 
 ## Supported direction and current exposure
 
+### Count replies to the public chat challenge
+
+With local request capture enabled, the public gateway can add an optional ACK invitation to an OpenAI, Ollama, or Anthropic chat reply. It keeps the normal answer and omits the invitation if the complete text does not fit the token limit. The invitation asks only for a random token in the next user message to the same endpoint.
+
+The local JSONL field `chat_ack` has two values:
+
+- `offered`: the gateway prepared a complete invitation. This does not prove delivery.
+- `matched`: the next eligible request returned the exact `ACK <token>` as its final user message. Assistant and tool history do not count.
+
+On the host, count today's observations without printing request data:
+
+```bash
+jq -n 'reduce inputs as $r ({offered:0, matched:0}; if $r.chat_ack == "offered" or $r.chat_ack == "matched" then .[$r.chat_ack] += 1 else . end)' \
+  "/var/lib/attackbox-public-capture/requests/capture-$(date -u +%Y%m%d).jsonl"
+```
+
+The gateway checks the TCP peer IPv4 address, port, Host, and path. A token expires after 15 minutes or one use. A subsequent eligible chat, a restart, or contention for a tracking slot can invalidate it sooner. The table has 1,024 slots. Clients behind one NAT can replace each other's tokens. A match shows token return, not who sent it or whether a model ran. The gateway does not add ACK data to remote telemetry.
+
 ### Optional diagnostics in response policy 2
 
 This source change requires a separately approved deployment. It adds at most one optional invitation per in-memory session, after the first responder request. Responses can proceed when the client ignores or declines the invitation. The service asks only for information already available and approved for sharing. It does not ask the client to inspect files or run commands.

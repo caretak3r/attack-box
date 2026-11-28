@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"hash"
+	"hash/maphash"
 	"io"
 	"net/http"
 	"net/netip"
@@ -37,6 +38,7 @@ type Capture struct {
 	recorded uint64
 	dropped  uint64
 	now      func() time.Time
+	acks     chatACKTable
 }
 
 type captureRecord struct {
@@ -49,6 +51,7 @@ type captureRecord struct {
 	Route         string      `json:"route"`
 	Status        int         `json:"status"`
 	Probe         string      `json:"probe,omitempty"`
+	ChatACK       string      `json:"chat_ack,omitempty"`
 	Port          int         `json:"port,omitempty"`
 	Proto         string      `json:"proto,omitempty"`
 	Headers       [][2]string `json:"headers,omitempty"`
@@ -66,6 +69,7 @@ func OpenCapture(dir string) (*Capture, error) {
 func openCapture(dir string, now func() time.Time) (*Capture, error) {
 	c := &Capture{dir: dir, now: now}
 	c.mu.Lock()
+	c.acks.seed = maphash.MakeSeed()
 	defer c.mu.Unlock()
 	if err := c.rotate(now().UTC()); err != nil {
 		return nil, err
@@ -116,6 +120,7 @@ func (c *Capture) Record(r *http.Request, route string, status int, probe string
 	}
 
 	if bodyRec != nil && bodyRec.bytes > 0 {
+		rec.ChatACK = bodyRec.ack
 		rec.BodyBytes = bodyRec.bytes
 		rec.BodySHA256 = hex.EncodeToString(bodyRec.hash.Sum(nil))
 		if bodyRec.buf.Len() > 0 {
@@ -234,14 +239,16 @@ func clip(s string, n int) string {
 // captureBodyRecorder keeps the first bytes of a request body and hashes and counts all bytes that pass through it.
 type captureBodyRecorder struct {
 	io.ReadCloser
-	buf   bytes.Buffer
-	hash  hash.Hash
-	bytes int
-	eof   bool
+	capture *Capture
+	ack     string
+	buf     bytes.Buffer
+	hash    hash.Hash
+	bytes   int
+	eof     bool
 }
 
-func newCaptureBodyRecorder(r io.ReadCloser) *captureBodyRecorder {
-	return &captureBodyRecorder{ReadCloser: r, hash: sha256.New()}
+func (c *Capture) bodyRecorder(r io.ReadCloser) *captureBodyRecorder {
+	return &captureBodyRecorder{ReadCloser: r, capture: c, hash: sha256.New()}
 }
 
 func (r *captureBodyRecorder) Read(p []byte) (int, error) {

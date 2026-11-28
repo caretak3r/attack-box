@@ -354,11 +354,11 @@ func gatewayOllama(chat bool) http.HandlerFunc {
 		if stream {
 			contentType = "application/x-ndjson"
 		}
-		prompt, asked := gatewayContentText(obj["prompt"]), obj["prompt"] != nil
-		if chat {
-			prompt, asked = gatewayLastUser(obj["messages"]), gatewayArray(obj["messages"])
+		var prompt string
+		if !chat {
+			prompt = gatewayContentText(obj["prompt"])
 		}
-		if !asked || !chat && prompt == "" {
+		if chat && !gatewayArray(obj["messages"]) || !chat && prompt == "" {
 			// A request without a prompt only loads the model.
 			gatewayOllamaSteps(w, stream, 200, "", line("", "", `,"done":true,"done_reason":"load"}`))
 			return
@@ -366,7 +366,13 @@ func gatewayOllama(chat bool) http.HandlerFunc {
 		var options map[string]json.RawMessage
 		_ = json.Unmarshal(obj["options"], &options)
 		think := strings.Contains(m.caps, "thinking") && string(bytes.TrimSpace(obj["think"])) != "false"
-		a := gatewayCompose(m.listed(), prompt, gatewayLimit(options, "num_predict"), think)
+		limit := gatewayLimit(options, "num_predict")
+		var a gatewayAnswerText
+		if chat {
+			a = gatewayChatAnswer(r, m.listed(), obj["messages"], limit, think)
+		} else {
+			a = gatewayCompose(m.listed(), prompt, limit, think)
+		}
 
 		// A larger model is slower: about 9 ms for each token at 8B and 32 ms at 70B.
 		tokenTime := 6*time.Millisecond + time.Duration(m.size/1600)
