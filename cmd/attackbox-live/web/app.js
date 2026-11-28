@@ -301,9 +301,11 @@ function renderFeed(v) {
         what.append(line2);
       }
     }
-    const open = el('button', 'link', clock(e.time));
+    const open = el('button', 'link');
+    const time = clock(e.time);
+    open.append(e.has_prompt ? el('mark', '', `${time} · Prompt in body`) : time);
     open.type = 'button';
-    open.title = 'Open the full event';
+    open.title = `${e.time} · Open the full event`;
     const tr = row([[open], [ipButton(e.ip, e.own)], [what, 'wide'],
       [e.status ? String(e.status) : '', e.status ? `num s${Math.floor(e.status / 100)}` : 'num'],
       [e.kind === 'connection' ? 'pre-HTTP' : (e.probe || e.route || '')],
@@ -360,6 +362,7 @@ async function openDetail(seq, opener) {
   fact('Model', e.model);
   fact('Data source', e.source === 'capture' ? 'Host capture file' : 'New Relic span');
   const parts = [head, facts];
+  if (e.has_prompt) parts.push(el('h3', '', 'User prompt preview'), el('pre', '', e.preview));
 
   const pairs = (heading, list) => {
     if (!list.length) return;

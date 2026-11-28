@@ -64,6 +64,7 @@ type event struct {
 	BodyTruncated bool        `json:"body_truncated,omitempty"`
 	BodySHA256    string      `json:"body_sha256,omitempty"`
 	Preview       string      `json:"preview,omitempty"`
+	HasPrompt     bool        `json:"has_prompt,omitempty"`
 	Headers       [][2]string `json:"headers,omitempty"`
 	Body          string      `json:"body,omitempty"`
 
@@ -78,46 +79,55 @@ func clip(s string, n int) string {
 	return s
 }
 
-// extractPreview derives a plain-text preview from the request body for the feed.
-func extractPreview(body string) string {
+// extractPreview distinguishes user text from the generic body preview used for other requests.
+func extractPreview(body, requestPath string) (string, bool) {
 	if body == "" {
-		return ""
+		return "", false
 	}
 	var obj map[string]any
-	if err := json.Unmarshal([]byte(body), &obj); err == nil {
-		if s, ok := obj["prompt"].(string); ok && s != "" {
-			return s
+	if json.Unmarshal([]byte(body), &obj) != nil {
+		return body, false
+	}
+	if s, ok := obj["prompt"].(string); ok && strings.TrimSpace(s) != "" {
+		return s, true
+	}
+	responses := strings.HasSuffix(strings.TrimSuffix(requestPath, "/"), "/responses")
+	messages, _ := obj["messages"].([]any)
+	if responses && len(messages) == 0 {
+		messages, _ = obj["input"].([]any)
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		m, _ := messages[i].(map[string]any)
+		if m["role"] != "user" {
+			continue
 		}
-		if msgs, ok := obj["messages"].([]any); ok && len(msgs) > 0 {
-			if last, ok := msgs[len(msgs)-1].(map[string]any); ok {
-				if content, ok := last["content"].(string); ok && content != "" {
-					return content
-				}
-				if parts, ok := last["content"].([]any); ok {
-					var texts []string
-					for _, p := range parts {
-						if pm, ok := p.(map[string]any); ok {
-							if text, ok := pm["text"].(string); ok && text != "" {
-								texts = append(texts, text)
-							}
-						}
-					}
-					if len(texts) > 0 {
-						return strings.Join(texts, " ")
-					}
+		switch content := m["content"].(type) {
+		case string:
+			if strings.TrimSpace(content) != "" {
+				return content, true
+			}
+		case []any:
+			var text []string
+			for _, part := range content {
+				p, _ := part.(map[string]any)
+				if s, ok := p["text"].(string); ok && (p["type"] == "text" || p["type"] == "input_text") && strings.TrimSpace(s) != "" {
+					text = append(text, s)
 				}
 			}
-		}
-		if s, ok := obj["input"].(string); ok && s != "" {
-			return s
-		}
-		if arr, ok := obj["input"].([]any); ok && len(arr) > 0 {
-			if s, ok := arr[0].(string); ok && s != "" {
-				return s
+			if len(text) != 0 {
+				return strings.Join(text, " "), true
 			}
 		}
 	}
-	return body
+	if s, ok := obj["input"].(string); ok && strings.TrimSpace(s) != "" {
+		return s, responses
+	}
+	if arr, ok := obj["input"].([]any); ok && len(arr) > 0 {
+		if s, ok := arr[0].(string); ok && s != "" {
+			return s, false
+		}
+	}
+	return body, false
 }
 
 // cleanPreview makes one line of at most 160 runes; only the start of the text is read.
@@ -151,7 +161,9 @@ func (e *event) finish() {
 	default:
 		e.Endpoint = p + "/unmatched"
 	}
-	e.Preview = cleanPreview(extractPreview(e.Body))
+	preview, prompt := extractPreview(e.Body, target)
+	e.Preview = cleanPreview(preview)
+	e.HasPrompt = e.Kind == "request" && prompt
 	e.hay = strings.ToLower(strings.Join([]string{e.IP, e.Method, e.Target, e.Host, e.UserAgent, e.Route,
 		e.Probe, e.Outcome, e.Model, strconv.Itoa(e.Status), e.Body}, "\n"))
 }

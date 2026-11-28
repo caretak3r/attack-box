@@ -267,11 +267,36 @@ func TestPreviewExtraction(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := cleanPreview(extractPreview(tc.body))
+			preview, _ := extractPreview(tc.body, "")
+			got := cleanPreview(preview)
 			if got != tc.want {
 				t.Errorf("extractPreview(%q) = %q, want %q", tc.body, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestFeedPromptEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		path, body string
+		want       bool
+	}{
+		{"/api/generate", `{"prompt":"hello"}`, true},
+		{"/v1/chat/completions", `{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"reply"}]}`, true},
+		{"/v1/responses", `{"input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}]}`, true},
+		{"/v1/responses?stream=1", `{"input":"hello"}`, true},
+		{"/v1/embeddings", `{"input":"hello"}`, false},
+		{"/api/chat", `{"messages":[{"role":"system","content":"instructions"},{"role":"tool","content":"result"}]}`, false},
+		{"/api/chat", `{"messages":[{"role":"user","content":[{"type":"image","text":"metadata"}]}]}`, false},
+		{"/api/generate", `{"prompt":"   "}`, false},
+		{"/api/generate", `{"prompt":"truncated`, false},
+		{"/api/tags", "", false},
+	} {
+		e := event{Kind: "request", Body: tc.body, Target: tc.path}
+		e.finish()
+		if e.HasPrompt != tc.want {
+			t.Errorf("%s %s: has_prompt = %t, want %t", tc.path, tc.body, e.HasPrompt, tc.want)
+		}
 	}
 }
 
