@@ -29,6 +29,7 @@ type gatewayPersona struct {
 	noKey      http.HandlerFunc            // that 401 answer; nil keeps the gateway's
 	local      bool                        // a local model server: it lists and serves no hosted API names
 	owner      string                      // owned_by of its /v1/models entries; "" keeps the gateway's owners
+	pipes      bool                        // Open WebUI: a chat names a stored pipe function by its id
 }
 
 const gatewayJSONUTF8 = "application/json; charset=utf-8"
@@ -55,7 +56,7 @@ var gatewayPersonas = map[int]gatewayPersona{
 		"/":       gatewayFixed(200, gatewayHTML, `<!DOCTYPE html><html><head><meta charset="utf-8"><title>llama.cpp - chat</title></head><body><div id="app"></div></body></html>`),
 		"/health": gatewayFixed(200, gatewayJSONUTF8, `{"status":"ok"}`),
 	}},
-	3000: {server: "uvicorn", needKey: true, noKey: gatewayFixed(401, gatewayJSON, `{"detail":"Not authenticated"}`), // Open WebUI
+	3000: {server: "uvicorn", needKey: true, pipes: true, noKey: gatewayFixed(401, gatewayJSON, `{"detail":"Not authenticated"}`), // Open WebUI
 		notFound: gatewayFixed(404, gatewayJSON, `{"detail":"Not Found"}`),
 		paths: map[string]http.HandlerFunc{
 			"/":            gatewayFixed(200, gatewayHTML, gatewayOpenWebUIPage),
@@ -186,6 +187,14 @@ func (p gatewayPersona) route(r *http.Request) (http.HandlerFunc, string) {
 }
 
 var gatewayIdentifierRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
+
+// gatewayPipe returns the model id of a chat on a port that serves stored pipe functions as models.
+// The gateway stores nothing, so any id that a function could have answers as one.
+func gatewayPipe(r *http.Request, obj map[string]json.RawMessage) (string, bool) {
+	var id string
+	ok := requestPersona(r).pipes && r.PathValue("deployment") == "" && json.Unmarshal(obj["model"], &id) == nil && gatewayIdentifierRE.MatchString(id)
+	return id, ok
+}
 
 // gatewayOpenWebUICreate answers a new tool or function with its record. Open WebUI runs such code when it stores it;
 // the gateway keeps the request in the local capture and runs nothing.

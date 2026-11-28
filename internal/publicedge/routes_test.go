@@ -30,7 +30,7 @@ func collectorPattern(t *testing.T, attr string) *regexp.Regexp {
 
 // The collector drops a span whose route label or fake key is not in its allowlist.
 func TestGatewayPatternRoutes(t *testing.T) {
-	routes, keys := collectorPattern(t, "http.route"), collectorPattern(t, "attackbox.canary.key")
+	routes, keys, models := collectorPattern(t, "http.route"), collectorPattern(t, "attackbox.canary.key"), collectorPattern(t, "gen_ai.request.model")
 	for port, p := range gatewayPersonas {
 		for _, paths := range []map[string]http.HandlerFunc{p.paths, p.posts} {
 			for path := range paths {
@@ -62,6 +62,9 @@ func TestGatewayPatternRoutes(t *testing.T) {
 		{3000, "POST", "/api/v1/tools/create", `{`, "/api/v1/tools/create", 422, `json_invalid`},
 		{3000, "DELETE", "/api/v1/tools/id/sys_diag_709/delete", "", "/api/v1/tools/id/{id}/delete", 200, `true`},
 		{3000, "DELETE", "/api/v1/functions/id/f1/delete", "", "/api/v1/functions/id/{id}/delete", 200, `true`},
+		// Open WebUI serves a stored pipe function as a model named by its id; the span does not name it.
+		{3000, "POST", "/api/chat/completions", `{"model":"sys_pipe_1","messages":[{"role":"user","content":"x"}]}`, "/api/chat/completions", 200, `"model":"sys_pipe_1"`},
+		{3000, "POST", "/api/chat/completions", `{"model":"no-such-model","messages":[{"role":"user","content":"x"}]}`, "/api/chat/completions", 404, `model not found`},
 		{3000, "GET", "/api/v1/tools/create", "", "/unmatched", 404, `{"detail":"Not Found"}`},
 		{4000, "GET", "/model/info", "", "/model/info", 200, `{"model_name":"claude-sonnet-4-20250514","litellm_params":{"model":"anthropic/claude-sonnet-4-20250514"}`},
 		{4000, "GET", "/v1/model/info", "", "/v1/model/info", 200, `"model":"ollama/llama3.3:70b"`},
@@ -102,6 +105,10 @@ func TestGatewayPatternRoutes(t *testing.T) {
 					route = a.Value.AsString()
 				case "attackbox.canary.key":
 					key = a.Value.AsString()
+				case "gen_ai.request.model":
+					if !models.MatchString(a.Value.AsString()) {
+						t.Errorf("model %q not in the collector allowlist", a.Value.AsString())
+					}
 				}
 			}
 			if route != tc.route || !routes.MatchString(route) {

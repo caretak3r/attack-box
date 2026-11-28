@@ -542,8 +542,11 @@ func gatewayCompletion(chat bool) http.HandlerFunc {
 		}
 		model, ok := gatewayRequestModel(r, obj)
 		if !ok {
-			gatewayReply(w, 404, gatewayJSON, gatewayNoModel)
-			return
+			if model, ok = gatewayPipe(r, obj); !ok {
+				gatewayReply(w, 404, gatewayJSON, gatewayNoModel)
+				return
+			}
+			delete(obj, "model") // the span names only listed models; the local capture keeps the id
 		}
 		stream, ok := gatewayStream(obj["stream"])
 		if !ok || chat && !gatewayArray(obj["messages"]) || !chat && !gatewayText(obj["prompt"]) && !gatewayArray(obj["prompt"]) {
