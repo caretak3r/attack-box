@@ -2,19 +2,19 @@
 
 ## Architecture
 
-The Go audit forwarder reads the original audit file and joins records by audit event time and serial. It sends retained groups to a private JSONL file. The native New Relic agent forwards this file under the existing `linux_audit` log type. The bait, shipper, proxy, Falco, and egress evidence paths do not change.
+The Go audit forwarder reads the original audit file and joins records by audit event time and serial. It sends retained groups to a private JSONL file. The bait, shipper, proxy, Falco, and egress evidence paths do not change.
 
 Source: `/Users/rohit/attack-box/cmd/attackbox-auditfilter/main.go` and `/Users/rohit/attack-box/internal/auditfilter/filter.go`.
 
 A retained group includes all observed SYSCALL, EXECVE, PATH, CWD, PROCTITLE, and SOCKADDR records. Each group has a hash and chunks of at most 3,500 Unicode characters. Join by `audit_reader_boot_id`, `audit_event_id`, and `body_sha256`; order by `chunk_index`. Require every chunk. The boot ID identifies the reader boot, not proof of the original event boot. Original audit timestamps remain in the message. Deduplicate replayed chunks by this identity. Invalid UTF-8 is hex-encoded and marked; the hash still covers the original bytes.
 
-Only one group can be suppressed: successful x86-64 routing-netlink socket creation by the root New Relic Infrastructure process. The rule requires the expected executable, audit login identity, syscall arguments, and complete group. It checks the executable reported by the kernel audit record and the live PID, parent, start time, UID, and systemd cgroup. It does not require ptrace capability. PID reuse, unknown context, failed operations, other network operations, and incomplete records stay in the output. An attacker with host-root control can tamper with collection; remote receipt does not prove source integrity.
+Only one group can be suppressed: successful x86-64 routing-netlink socket creation by the root Infrastructure process. The rule requires the expected executable, audit login identity, syscall arguments, and complete group. It checks the executable reported by the kernel audit record and the live PID, parent, start time, UID, and systemd cgroup. It does not require ptrace capability. PID reuse, unknown context, failed operations, other network operations, and incomplete records stay in the output. An attacker with host-root control can tamper with collection; local file writes do not prove source integrity.
 
 Each batch reports input, retained, and suppressed row counts, the first and last audit event IDs, a stable batch ID, and the policy version. The cursor advances on disk only after output fsync. A crash can replay records. Rotation drains retained numeric files in order. A missing inode, changed bytes, truncated file, or oversized line stops the reader with an error. The inventory reports the reader service state. No silent cursor reset is permitted. On restart, an incomplete output line is removed before the uncommitted source batch is replayed.
 
-Memory input is bounded to 256 KiB per batch. A normal batch flushes within about five seconds; remote arrival also depends on the native agent and network. Output retains four 64 MiB files. Each rotation reports the bytes retired from the oldest local file. Retired bytes are not proof of a remote collection loss. Original audit data retains up to 64 files of 8 MiB. These are size limits, not time guarantees. The native forwarder has no receipt protocol with this buffer; a long export outage can outlast local retention. Monitor export faults, rotation, source gaps, disk use, and silence. Do not treat local persistence as confirmed New Relic delivery.
+Memory input is bounded to 256 KiB per batch. A normal batch flushes within about five seconds; local file arrival depends on the shipper and filesystem. Output retains four 64 MiB files. Each rotation reports the bytes retired from the oldest local file. Retired bytes are not proof of a collection loss. Original audit data retains up to 64 files of 8 MiB. These are size limits, not time guarantees. Monitor rotation, source gaps, and disk use.
 
-The inventory worker keeps its existing systemd sandbox running and refreshes every 60 seconds. It reads all fixed service states with one systemctl call. The 90-second snapshot validity limit remains. Native New Relic systemd inventory runs every five minutes. Native process samples run every 60 seconds. HTTP readiness probes and metrics collection remain frequent. This removes repeated sandbox creation and inspection commands without disabling audit rules or sandbox controls.
+The inventory worker keeps its existing systemd sandbox running and refreshes every 60 seconds. It reads all fixed service states with one systemctl call. The 90-second snapshot validity limit remains. HTTP readiness probes and metrics collection remain frequent. This removes repeated sandbox creation and inspection commands without disabling audit rules or sandbox controls.
 
 ## Setup
 
@@ -32,23 +32,20 @@ For monitoring bootstrap, pass `--log-budget-binaries` and the staging-directory
 
 Keep full supported attack request and response capture, follow-up attribution, proxy rejection records, authentication, Falco, blocked egress, loss counters, and service-map traces. Health-check requests also remain captured: shared routes and proxy addresses do not provide a safe discard identity. Do not add a route-only or User-Agent-only exclusion. Syslog and egress remain separate until duplicate equivalence is proved.
 
-Target at most 2 GB/day of quiet-host ingestion across all telemetry, with at least 20 GB of monthly burst reserve. This implementation does not enforce a billing cap. Measure `NrConsumption` after its reporting delay and use byte estimates only for source comparisons. Validate a full 24-hour interval before claiming the daily target. Lower traffic in a short interval is not proof of a monthly limit.
+Host-local bounds: audit forwarder output retains four 64 MiB files (256 MiB total). Original audit data retains up to 64 files of 8 MiB (512 MiB total). Shipper events retain 30 days and 8 GiB. OTel traces and metrics retain 64 MiB each with 30-day and 60-backup rotation. Public requests retain 7 UTC days. Monitor filesystem usage separately.
 
-Query batch accounting in New Relic:
+Query batch accounting from local files:
 
-```sql
-FROM Log_Security SELECT sum(input_rows), sum(kept_rows), sum(suppressed_rows)
-WHERE action = 'audit_budget_batch' SINCE 30 minutes ago
+```bash
+# Using jq on audit-filter output
+jq -c 'select(.action == "audit_budget_batch")' \
+  /var/log/attackbox-audit/*.jsonl | \
+  jq -s 'map({input_rows, kept_rows, suppressed_rows}) | add'
 ```
 
-Batch replay can duplicate these sums. For exact reconciliation, deduplicate by `audit_batch_id`. Inspect retained events with `audit_event_id`, `chunk_index`, `chunk_count`, `body_sha256`, and `audit_decision`. A grouped message may contain several record types; older queries that count one audit line per log event must change.
+Batch replay can duplicate these sums. For exact reconciliation, deduplicate by `audit_batch_id`. Inspect retained events with `audit_event_id`, `chunk_index`, `chunk_count`, `body_sha256`, and `audit_decision`. A grouped message may contain several record types.
 
-Local verification: `go test -race ./...`, `go vet ./...`, and `bash /Users/rohit/attack-box/scripts/smoke.sh`. Before rollout, also test source rotation, crash replay, malformed groups, filter bypass attempts, exact reconstruction, and the installer checksum checks. After rollout, verify remote audit chunks, accounting, an HTTP request/response/follow-up sequence, traces, and a proxy rejection. Keep all live evidence and deployment state in private reports.
-
-Native sampling settings use a systemd drop-in at `/etc/systemd/system/newrelic-infra.service.d/attackbox-log-budget.conf`. The source is `/Users/rohit/attack-box/deploy/newrelic/log-budget.conf`. The [native agent configuration reference](https://docs.newrelic.com/docs/infrastructure/infrastructure-agent/configuration/infrastructure-agent-configuration-settings/) defines these intervals.
+Local verification: `go test -race ./...`, `go vet ./...`, and `bash /Users/rohit/attack-box/scripts/smoke.sh`. Before rollout, also test source rotation, crash replay, malformed groups, filter bypass attempts, and exact reconstruction. After rollout, verify audit chunks, accounting, an HTTP request/response/follow-up sequence, traces, and a proxy rejection in local evidence files. Keep all live evidence and deployment state in private reports.
 
 The installer masks `falcoctl-artifact-follow.service` after it confirms that the installed Falco rules exist. The Falco engine remains active. The rule file hash must remain unchanged during this operation. In the campaign network, the online follower cannot reach its index and otherwise restarts repeatedly. Update rules in an approved maintenance window, validate them, and record the new hash before the next campaign. Do not open an extra outbound route for this updater during a campaign.
 
-## Account budget alert
-
-The condition template is `/Users/rohit/attack-box/newrelic/alerts/ingestion-budget.json`. Create it in the approved New Relic account and UI-only alert policy through NerdGraph `alertsNrqlConditionStaticCreate`. The deployed condition is recorded in `/Users/rohit/attack-box/NEWRELIC.md`; the template has no API key. It warns above 75 GB and becomes critical above 80 GB of account-visible month-to-date ingestion. It uses a one-hour event window and a 600-second event timer. Usage data can arrive about three hours late. Account alerts do not replace an organization-wide allowance check. The installer does not create the account condition or change notification destinations.

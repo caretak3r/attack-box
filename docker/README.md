@@ -125,7 +125,7 @@ Internet
 │ Bait (attackbox)             │
 │ - OpenAI API on :8080        │
 │ - Internal network only      │
-│ - No egress, no New Relic key│
+│ - No egress                  │
 │ - Writes to spool socket     │
 └──────────────────────────────┘
    ↓ Unix socket
@@ -133,7 +133,7 @@ Internet
 ┌──────────────────────────────┐
 │ Host Shipper                 │
 │ /run/attackbox/spool.sock    │
-│ Owns New Relic key           │
+│ Writes evidence to disk      │
 └──────────────────────────────┘
 ```
 
@@ -182,7 +182,7 @@ Configured via `compose.yaml` environment section or `.env` file:
 - `ATTACKBOX_SPOOL_QUEUE`: Spool queue depth (default: 10000)
 - `ATTACKBOX_SPOOL_TIMEOUT`: Spool write timeout (default: 5s)
 
-**Critical**: Bait must use `ATTACKBOX_SPOOL_SOCKET` and must NOT have `ATTACKBOX_NR_LICENSE_KEY`.
+**Critical**: Bait must use `ATTACKBOX_SPOOL_SOCKET`.
 
 ### Proxy Configuration
 

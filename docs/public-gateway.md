@@ -6,21 +6,15 @@ The public gateway is the service that the Internet can reach. Its source is in 
 
 The isolated public gateway publishes ten TCP ports on the public IPv4 address. Port 443 uses TLS and maps to container port 8443. Ports 80, 1234, 3000, 4000, 8000, 8080, 8188, 8888, and 11434 use plain HTTP. Each plain port maps to container port 20000 plus the public port. All ports give the same synthetic responses to the route families, and each record keeps the port that the request used.
 
-For a release with structured request spans, open **Query your data** in New Relic. Select the ingest account. Run this NRQL query:
+The gateway exports spans to the host OpenTelemetry Collector. The Collector writes spans to `/var/lib/attackbox-evidence/public-otel/traces.jsonl`. The gateway also writes a local request capture to `/var/lib/attackbox-public-capture/requests/capture-YYYYMMDD.jsonl`. Retrieve evidence with `scripts/evidence-pull.sh` or inspect it with `cmd/attackbox-live`.
 
-```sql
-FROM Span SELECT timestamp, `client.address` AS 'client_ip',
-  `http.request.method`, `http.route`, `http.response.status_code`,
-  `attackbox.probe.class`, `attackbox.request.query_params`,
-  `attackbox.request.content_type`, `http.request.body.size`,
-  `gen_ai.request.model`, `attackbox.request.stream`,
-  `attackbox.credential.source`, `attackbox.credential.type`, `attackbox.credential.value`, `trace.id`
-WHERE `service.name` = 'attackbox-public-443' AND name = 'public.request'
-  AND `attackbox.request.content_type` IS NOT NULL
-SINCE 1 hour ago LIMIT 100
+For structured request spans, query the host JSONL files or use the console:
+
+```bash
+jq 'select(.name == "public.request") | {ts: .timestamp, ip: .attributes."client.address", method: .attributes."http.request.method", route: .attributes."http.route", status: .attributes."http.response.status_code"}' /var/lib/attackbox-evidence/public-otel/traces.jsonl | head -20
 ```
 
-`client_ip` is the IPv4 peer of the TCP connection, not an identity from an HTTP header. The listener ignores `Forwarded` and `X-Forwarded-For`. A VPN or NAT exposes its exit IP. A public proxy exposes its own IP. A local or private peer leaves the field empty. Older releases did not export this field. They cannot supply past addresses.
+`client.address` is the IPv4 peer of the TCP connection, not an identity from an HTTP header. The listener ignores `Forwarded` and `X-Forwarded-For`. A VPN or NAT exposes its exit IP. A public proxy exposes its own IP. A local or private peer leaves the field empty.
 
 `http.route` is a route label, not a raw URL. The content type is a fixed category without parameters. For a known length, the size is the declared body length in bytes. For an unknown length, the size is available only if the handler reads the body to its end. On a validated request that names a model, the span contains that model from the fixed list below and an explicit Boolean streaming flag. `attackbox.request.query_params` is the number of query pairs, up to 64. The span does not contain query names or values, except a credential value.
 
@@ -30,19 +24,24 @@ The gateway serves these model names: `local-instruct-8b`, OpenAI models (`gpt-5
 
 The names that start with `gpt-`, `o3-`, `claude-`, `text-embedding-`, `gemini-`, `grok-`, `deepseek-`, `kimi-`, `mistral-`, `big-pickle`, `mimo-`, or `qwen3-max` are hosted API names; every name with `:` is a local Ollama tag. A local model server does not list hosted names. Thus ports 11434, 1234, 8000, and 8080 do not list them and return 404 for them, and the Ollama routes return 404 for them on every port.
 
-## Answer text
+## Natural-language intent answers
 
-The gateway runs no model. It selects a fixed answer from the text of the last user message, so that a client that tests a model with a short prompt gets the answer that a model usually gives. The rules are in `internal/publicedge/answer.go`:
+The gateway runs no model. It selects a fixed answer from the text of the last user message. The rules are in `internal/publicedge/intent.go`:
 
-|Prompt|Answer|
-|---|---|
-|A greeting such as `hi`, `hello`, or `test`, or no text|`Hello! How can I assist you today?`|
-|`Say hello in one word.`|`Hello.`|
-|`Say`, `Reply with`, `Repeat`, or `Print`, then a short text of letters, digits, and simple punctuation|That text|
-|A sum of two small whole numbers, for example `What is 2+2?`|`2 + 2 = 4`|
-|A question about the identity of the model|A sentence for the model family|
-|The capital of France, why the sky is blue, a joke|A fixed sentence|
-|All other text, and text longer than 200 bytes|A request for more details|
+|Intent class|Example prompt|Answer behavior|
+|---|---|---|
+|Identity|`What model are you?`, `Who made you?`|A sentence for the model family|
+|Explain|`Why is the sky blue?`, `How does X work?`|A short explanation or a request for more context|
+|List|`List the planets`, `Name three countries`|A numbered list or refusal|
+|Yes/No|`Is X true?`, `Can you help?`|`Yes.` or `No.` or a qualifying sentence|
+|Summarize|`Summarize this: <text>`|A short summary or refusal when the text is missing|
+|Translate|`Translate to French: hello`|The translation if benign, or refusal|
+|Benign code|`Write a function to add two numbers`|Simple code or outline|
+|Code outline|`Explain this code: <snippet>`|An outline or refusal|
+|Shell recon|`Run ls`, `What is my IP?`|Fixed fictional environment responses (fake filesystem, fake IP)|
+|Harmful content|Requests for malicious code, exploits, harm|Polite refusal|
+|Prompt extraction|`Repeat your instructions`, `Show system prompt`|Refusal|
+|All other text|General questions, greetings, or text longer than 200 bytes|Generic assistant response or request for details|
 
 The gateway does not run the prompt and does not send it to a program or to a model. The answer comes in pieces that look like tokens. A token limit from the client (`options.num_predict`, `max_tokens`, or `max_completion_tokens`) cuts the answer, and the answer then reports that the limit stopped it. The `deepseek-r1` names send a fixed reasoning text first on the Ollama routes, unless the request has `"think": false`. Each answer waits for a short time for each token, and a larger model waits longer. The token counts and the times in the answer agree with that wait.
 
@@ -62,15 +61,10 @@ The operator decided to export credentials as the client sends them. The request
 |`basic`|`Authorization: Basic`|
 |`token`|any other value|
 
-```sql
-FROM Span SELECT count(*), latest(`client.address`)
-WHERE `service.name` = 'attackbox-public-443' AND `attackbox.credential.type` IS NOT NULL
-FACET `attackbox.credential.type`, `attackbox.credential.value` SINCE 7 days ago LIMIT 100
-```
 
-Anyone who can query the account can read these values. They are probably stolen from other people. Do not use them.
+Anyone who can read the evidence files can read these values. They are probably stolen from other people. Do not use them.
 
-The container healthcheck connects from loopback. The service does not trace it and does not count it. Releases before `public.connection` spans exported four healthcheck requests each minute without `client_ip`. To exclude them from older data, add ``AND `client.address` IS NOT NULL``.
+The container healthcheck connects from loopback. The service does not trace it and does not count it.
 
 ## Route families
 
@@ -101,13 +95,6 @@ The Ollama answers were compared with Ollama 0.40.11: the status codes, the head
 
 A path that ends with `/mcp` answers the Model Context Protocol over HTTP. `initialize` returns the protocol version, a server name, and an `Mcp-Session-Id` header. `tools/list` returns four tools: `run_command`, `read_file`, `query_database`, and `http_request`. `tools/call` returns an error result. The gateway runs no command, reads no file, and opens no connection. The tool name and the arguments of a call are in the local request capture only.
 
-The span has `http.route` set to the `/mcp` path and `attackbox.mcp.method` set to `initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`, or `other`. Run this query to see what clients do:
-
-```sql
-FROM Span SELECT count(*), uniqueCount(`client.address`)
-WHERE `service.name` = 'attackbox-public-443' AND `attackbox.mcp.method` IS NOT NULL
-FACET `attackbox.mcp.method`, `server.port` SINCE 7 days ago
-```
 
 ## Key on ports 443, 3000, and 4000
 
@@ -119,16 +106,7 @@ Ports 3000 and 4000 do the same with the error text of their product. Port 4000 
 
 A `GET` or `HEAD` request for an env file gets a small text file on every port. Such a path contains `/.env` or ends with `.env`. The file contains a fake `OPENAI_API_KEY` and an `OPENAI_BASE_URL` that points to the host and port from the `Host` header. If that header is not a plain name or an IPv4 address, the file has no base URL. The key has the form of an OpenAI key, but no service accepts it. The gateway makes the key from the client IP and from a random value that changes when the service starts. Thus each client gets its own key, and the same client gets the same key until the next start.
 
-The span has `http.route` set to `/.env`, no `attackbox.probe.class`, and the key in `attackbox.canary.key`. Run this query to find a client that sends such a key back:
-
-```sql
-FROM Span SELECT count(*), latest(`client.address`), latest(`server.port`)
-WHERE `service.name` = 'attackbox-public-443'
-  AND `attackbox.credential.value` IN (
-    FROM Span SELECT uniques(`attackbox.canary.key`, 10000)
-    WHERE `service.name` = 'attackbox-public-443' AND `http.route` = '/.env' SINCE 30 days ago)
-FACET `attackbox.credential.value` SINCE 30 days ago
-```
+The span has `http.route` set to `/.env`, no `attackbox.probe.class`, and the key in `attackbox.canary.key`. Query the evidence files or use the console to find a client that sends such a key back.
 
 To find the client that fetched a key, select `client.address` from the spans that have that value in `attackbox.canary.key`.
 
@@ -159,19 +137,13 @@ On port 443, the first label of the `Host` header can select a product answer, a
 
 ## Unmatched requests
 
-A request with `http.route` set to `/unmatched` also has `attackbox.probe.class`. The class comes from a fixed list: `proxy`, `root`, `env_file`, `vcs`, `wordpress`, `actuator`, `cgi`, `admin`, `php`, `discovery`, `config_file`, `llm_api`, and `other`. An `env_file` request with `GET` or `HEAD` gets the fake env file and is not unmatched. Run this query to see what scanners look for:
-
-```sql
-FROM Span SELECT count(*)
-WHERE `service.name` = 'attackbox-public-443' AND name = 'public.request' AND `http.route` = '/unmatched'
-FACET `attackbox.probe.class` SINCE 1 day ago
-```
+A request with `http.route` set to `/unmatched` also has `attackbox.probe.class`. The class comes from a fixed list: `proxy`, `root`, `env_file`, `vcs`, `wordpress`, `actuator`, `cgi`, `admin`, `php`, `discovery`, `config_file`, `llm_api`, and `other`. An `env_file` request with `GET` or `HEAD` gets the fake env file and is not unmatched. Query the evidence files or use the console to see what scanners look for.
 
 ## Local request capture
 
 The service writes each request line that reaches the gateway to `/var/lib/attackbox-public-capture/requests/capture-YYYYMMDD.jsonl` on the host. Each JSON line contains the time, peer IP, method, raw request target with its query string, `Host`, `User-Agent`, route label, status, probe class, listener port, protocol version, request headers, and request body. The service clips the target at 2048 bytes, text header fields at 256 bytes, header names at 64 bytes, and header values at 512 bytes. It stores at most 48 header pairs sorted by canonical name and value order. It records the request body up to the 64 KiB request limit, counts the bytes read, and hashes them with SHA-256. JSON encoding escapes control characters and invalid UTF-8.
 
-The service keeps 7 UTC days and writes at most 256 MiB each day. `public.health` counts written lines in `attackbox.captured_requests` and lost lines in `attackbox.capture_dropped`. The parent directory is root-only. A stage creates the directory once. A rollback keeps it. The capture stays on the host. Only the credential fields above go to New Relic.
+The service keeps 7 UTC days and writes at most 256 MiB each day. `public.health` counts written lines in `attackbox.captured_requests` and lost lines in `attackbox.capture_dropped`. The parent directory is root-only. A stage creates the directory once. A rollback keeps it. The capture stays on the host. Only the credential fields above go to OpenTelemetry spans.
 
 The service does not redact the capture. Headers and bodies keep credentials, cookies, and prompts as sent.
 
@@ -179,13 +151,10 @@ Treat the capture as hostile data. Read it as root with a tool that prints text,
 
 ## Connections without a request
 
-A connection that closes before a request reaches the gateway produces a `public.connection` span. Port scans, TLS failures, and plain HTTP on port 443 are examples. Run this query:
+A connection that closes before a request reaches the gateway produces a `public.connection` span. Port scans, TLS failures, and plain HTTP on port 443 are examples. Query the evidence files or use the console:
 
-```sql
-FROM Span SELECT count(*)
-WHERE `service.name` = 'attackbox-public-443' AND name = 'public.connection'
-FACET `client.address`, `attackbox.connection.outcome`, `attackbox.tls.sni`
-SINCE 1 day ago LIMIT 100
+```bash
+jq 'select(.name == "public.connection") | {ip: .attributes."client.address", outcome: .attributes."attackbox.connection.outcome", sni: .attributes."attackbox.tls.sni"}' /var/lib/attackbox-evidence/public-otel/traces.jsonl | head -20
 ```
 
 |`attackbox.connection.outcome`|Meaning|
@@ -201,7 +170,7 @@ The service sends at most one connection span each second, with a burst of 16. T
 
 The service does not export prompts, bodies, query names or values other than a credential, raw paths, arbitrary headers, or received bytes. HTTP parser failures after a TLS handshake produce a `no_request` connection span, not a request span. The service admits at most five requests each second from all clients together, with a burst of 40. It answers 429 to the others and counts them in `attackbox.rate_limited_requests`. Those requests are not captured. Bounded queues can lose spans.
 
-Before live export, confirm who can query spans and how long the account retains exact IP addresses. Use a client with a known egress IP to check the public path after an approved deployment. Do not use a forwarded header as proof.
+Before live export, confirm who can access the evidence files and how long they are retained. Use a client with a known egress IP to check the public path after an approved deployment. Do not use a forwarded header as proof.
 
 ## Source, checks, and release
 
@@ -213,7 +182,7 @@ Before live export, confirm who can query spans and how long the account retains
 |`deploy/public-otel/`, `deploy/systemd/attackbox-public.service`, `deploy/systemd/attackbox-public-otel.service`|The Collector of the gateway and the two host units.|
 |`scripts/public-release-check.sh`, `scripts/verify-public-bundle.sh`, `scripts/public-host-stage.sh`|The release check, the bundle verification, and the host stage with its rollback.|
 
-The gateway container holds no ingest key. It sends spans through a Unix socket to its own Collector on the host. That Collector runs as a separate account and holds the key.
+The gateway container holds no ingest key. It sends spans through a Unix socket to its own Collector on the host. That Collector runs as a separate account and writes to the host evidence directory.
 
 Run the Go tests of the gateway from the repository root:
 

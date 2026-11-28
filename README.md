@@ -6,7 +6,7 @@ AttackBox is a defensive honeypot for AI APIs. It simulates OpenAI, vLLM, and Ol
 
 - Returns synthetic API responses, including simulated streaming.
 - Records bounded, redacted service observations. Host adapters add runtime and egress observations.
-- Uses a Go shipper to validate records, queue them on disk, and deliver logs and metrics to New Relic.
+- Uses a Go shipper to validate records, queue them on disk, and write evidence files to the host.
 - Runs a separate public gateway that answers like common AI servers on ten TCP ports. The gateway records request metadata and the credentials that clients send. It runs no model.
 
 ## Architecture
@@ -18,18 +18,18 @@ flowchart LR
     Client[Loopback client] --> Proxy[nginx proxy] --> Bait[Go bait]
     Bait -->|Unix socket| Shipper[Go host shipper]
     Adapters[Runtime and egress adapters] -->|Role sockets| Shipper
-    Shipper --> Queue[Disk queue] --> NR[New Relic]
+    Shipper --> Queue[Disk queue] --> Evidence[Evidence files]
 ```
 
 The Ubuntu 24.04 Compose profile publishes the proxy on loopback and enables only the OpenAI persona. Docker Compose defines the containers. The gVisor override selects `runsc`. On the host, systemd manages the shipper and adapters. nftables applies network policy. Falco and the kernel journal supply host observations.
 
-Telemetry can be incomplete. A heartbeat does not prove that the system captured every request or that containment held. Treat all captured text as untrusted data.
+The operator retrieves evidence with `scripts/evidence-pull.sh` over SSH. The console (`cmd/attackbox-live`) monitors live over SSH or reads archived evidence. The findings command (`cmd/attackbox-findings`) processes the evidence archive.
 
-The public gateway is a separate service (`cmd/attackbox-public`). It does not use the bait, the shipper, or the disk queue. It runs in its own gVisor container, exports spans through its own OpenTelemetry Collector, and writes a request capture on the host. Read the [public gateway guide](docs/public-gateway.md).
+Telemetry can be incomplete. A heartbeat does not prove that the system captured every request or that containment held. Treat all captured text as untrusted data.
 
 ## Local setup
 
-Install Go 1.26 or later and `curl`. Run these commands from the repository root. Docker and a New Relic key are not required.
+Install Go 1.26 or later and `curl`. Run these commands from the repository root. Docker is not required for local testing.
 
 ```bash
 go test ./...
@@ -86,4 +86,4 @@ pnpm dev --hostname 127.0.0.1
 
 Open `http://127.0.0.1:3000/`. The build writes the static site to `site/out/`. The development server is for local preview only.
 
-For more detail, read the [architecture guide](docs/architecture.md), [operator guide](docs/operator.md), [public gateway guide](docs/public-gateway.md), or [New Relic runbook](docs/newrelic-runbook.md).
+For more detail, read the [architecture guide](docs/architecture.md), [operator guide](docs/operator.md), or [public gateway guide](docs/public-gateway.md).

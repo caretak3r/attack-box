@@ -38,7 +38,7 @@ Host adapters run continuously and forward observations to the shipper.
 |---|---|
 | Falco adapter | Reads Falco JSON lines from a file. Keeps a durable cursor. Sends bounded `runtime` records to its role socket. |
 | Egress adapter | Reads the kernel journal. Keeps a durable cursor. Sends bounded records to its role socket. |
-| Audit forwarder | Reads the kernel audit file and joins records into event groups. Writes retained groups to a private file that the native New Relic agent forwards. |
+| Audit forwarder | Reads the kernel audit file and joins records into event groups. Writes retained groups to a private file. |
 | Readiness collector | A root helper writes fixed snapshots of systemd and container states. An unprivileged collector reads them and serves metrics on loopback. |
 
 Cursors persist across restarts. Adapters skip events older than their last-read cursor.
@@ -55,13 +55,13 @@ The bait healthcheck calls a loopback URL with the `-healthcheck` flag. It refus
 
 The readiness collector HTTP endpoint serves the latest privileged snapshot. Operators query it to check container status, Falco cursor age, and shipper checkpoint age.
 
-New Relic dashboards and alerts in the repository show:
+Operators query the evidence files and console tools to verify component health and traffic patterns:
 
-| Artifact | Purpose |
+| Tool | Purpose |
 |---|---|
-| `newrelic/dashboards/attackbox-overview.json` | Edge request rates, response status codes, session counts, component health, and queue depth. |
-| `newrelic/alerts/critical-alerts.yaml` | Component failures, missing heartbeats, queue growth, and container restarts. |
-| `newrelic/alerts/informational-alerts.yaml` | Unusual request patterns and declaration counts. |
+| `attackbox-watch` | Bounded snapshots over SSH or from a local archive. Reports systemd status, container health, disk usage, journal entries, and checkpoint ages. |
+| `attackbox-findings` | Numeric summaries from evidence files. Aggregates HTTP status codes, Falco events, and kernel audit drops. |
+| `attackbox-live` | Loopback dashboard over SSH or against a local archive. Shows public gateway traffic with source addresses, endpoint flows, and exploit chains. |
 
 Alerts do not prove complete capture. Use the observed match rate formula in [Architecture](/architecture/) for controlled tests.
 

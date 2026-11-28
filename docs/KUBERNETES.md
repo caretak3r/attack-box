@@ -23,10 +23,9 @@ The [Ubuntu profile](../compose.yaml) runs two containers. nginx publishes TLS o
 
 **Private deployment parity is a separate gate.** Compose sets `ATTACKBOX_FULL_EVIDENCE=true`. Disabling it does not produce the six-field passive contract. Private sessions also do not transfer between replicas. If private observations are required, a passive rollout cannot replace Compose.
 
-- Keep the systemd shipper, disk queue, Falco and journal readers, and New Relic key on the host. Passive stdout is not the shipper’s wire protocol.
+- Keep the systemd shipper, disk queue, Falco and journal readers, and evidence collection on the host. Passive stdout is not the shipper's wire protocol.
 - For private bait only, review an exception for a read-only directory mount containing `/run/attackbox/spool.sock`. Do not expose Docker, containerd, the queue, or host credentials. Prove that `runsc` permits the intended socket and that `SO_PEERCRED` reports UID `65532`. Test rejection on the other role sockets and reconnection after shipper restart.
 - The bait endpoint shares four connections and a 1 MiB/s budget across producers. Replicas do not multiply that budget. Measure queue growth, drops, disk space, and recovery with a local test sink. A socket write proves neither disk commit nor remote delivery. See the [trust boundaries](architecture.md) and [operator gates](operator.md).
-
 ## Conversion work
 
 1. **Inventory the node before selecting a release.** Record CPU architecture and steal time, allocatable memory, SSD space and latency, NIC limits, and console recovery. For existing K3s, also record the version, datastore, CNI, runtime handlers, listeners, and workloads. Rehearse on an isolated equivalent node first. Do not disable another workload’s ingress or change its datastore.

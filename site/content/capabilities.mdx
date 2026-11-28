@@ -66,27 +66,24 @@ Adapters forward evidence to role-specific shipper sockets.
 
 ## Delivery
 
-The shipper admits records by role, validates structure, and delivers logs and metrics to New Relic.
+The shipper admits records by role, validates structure, and writes them to append-only evidence files on the host.
 
 | Mechanism | Behavior |
 |---|---|
 | Role admission | The bait sends `edge`, `transcript`, `probe`, and its own lifecycle `runtime` records. Host adapters send `egress` and `runtime` records. A socket client cannot send the heartbeat of the shipper. |
 | Disk queue | Records are appended to a durable disk queue. The queue survives restarts. Maximum payload is 8 MiB per record. |
-| Quarantine | Records rejected by the remote API are retained in a local quarantine directory (maximum 64 MiB, 4096 records). The drain stops when storage is full. |
-| New Relic logs | Records are batched and sent to the Logs API. Chunks fit the 1 MiB POST minimum. |
-| New Relic metrics | Shipper counters, container health, and service readiness are sent as dimensional metrics. |
-| OpenTelemetry traces | The bait and shipper export OTLP traces over a Unix socket to a local Collector. The Collector forwards traces to New Relic. |
-
-The bait holds no ingest key in the deployed profile. The shipper owns the key.
+| Quarantine | Records rejected during validation are retained in a local quarantine directory (maximum 64 MiB, 4096 records). The drain stops when storage is full. |
+| Evidence files | Records are appended to JSONL evidence files on the host. Files rotate by date and size. Retention is configured per evidence type. |
+| OpenTelemetry export | The bait and shipper export OTLP traces and metrics over Unix sockets to local Collectors. The Collectors write to append-only JSONL files on the host. |
 
 ## Operator tools
 
 | Tool | Purpose |
 |---|---|
 | `attackbox-scenarios` | Runs a fixed synthetic workload against a loopback listener. Returns pass/fail results. |
-| `attackbox-evidence` | Reconstructs complete request or response bodies from a local New Relic NDJSON export. Verifies chunk hashes. |
-| `attackbox-watch` | Takes bounded read-only snapshots over SSH. Parses systemd status, container health, disk usage, and journal entries. |
-| `attackbox-findings` | Publishes numeric summaries from watch JSON. Aggregates HTTP status codes, Falco events, and kernel audit drops. |
+| `attackbox-evidence` | Reconstructs complete request or response bodies from local evidence JSONL. Verifies chunk hashes. |
+| `attackbox-watch` | Takes bounded read-only snapshots over SSH or from a local archive. Parses systemd status, container health, disk usage, and journal entries. |
+| `attackbox-findings` | Publishes numeric summaries from watch JSON and evidence files. Aggregates HTTP status codes, Falco events, and kernel audit drops. |
 | `attackbox-live` | Serves a loopback dashboard of public gateway traffic. Shows each request with its source address, a source-to-endpoint flow, and connections that sent no HTTP request. |
 
 Evidence tools parse captured text as data and never execute it.

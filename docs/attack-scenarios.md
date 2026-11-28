@@ -1,4 +1,4 @@
-# Synthetic attack checks
+# Deployment test scenarios
 
 Use this check before public ingress opens. It sends ten fixed requests to one loopback listener. It does not execute commands, scan ports, use real credentials, follow redirects, or contact a public target.
 
@@ -29,9 +29,7 @@ The check targets the OpenAI persona. Use `-model` to select an advertised model
 | `oversized` | 413; JSON error | Exactly 1 MiB captured request prefix; incomplete manifest with `body_limit` reason |
 
 The oversized case intentionally cannot produce a complete request-body reconstruction. The client submits 1 MiB plus one byte; the service captures only the allowed 1 MiB prefix. The manifest must state this limit. A complete manifest for that request is a failure.
-
-Each case uses a distinct user agent, `attackbox-synthetic-RUN_ID-SCENARIO`, plus `X-Attackbox-Research-Run` and `X-Attackbox-Research-Scenario` headers. These labels are untrusted input. They do not authenticate traffic, exclude it from alerts, or prove its origin. Each case uses a separate responder session to avoid repeated-run probe state changing the expected response.
-
+Each case uses a distinct user agent, `attackbox-deploy-test-COMMIT-SCENARIO`, plus `X-Attackbox-Research-Run` and `X-Attackbox-Research-Scenario` headers. The commit is the 12-hex prefix. These labels are untrusted input. They do not authenticate traffic, exclude it from alerts, or prove its origin. Each case uses a separate responder session to avoid repeated-run probe state changing the expected response.
 ## Local candidate gate
 
 Run from `/Users/rohit/attack-box`:
@@ -51,58 +49,30 @@ cd /Users/rohit/attack-box
 ATTACKBOX_SCENARIO_TEST_REPORT_DIR=/tmp/attackbox-scenario-local-001 go test -race -count=1 -v ./cmd/attackbox-scenarios
 ```
 
-The test writes `/tmp/attackbox-scenario-local-001/results.json` and `/tmp/attackbox-scenario-local-001/local-events.json`. These files prove local handler capture only. They are not New Relic delivery receipts. `/tmp/attackbox-scenario-local-001/local-events.json` uses the internal event schema; do not pass it to the New Relic export reconstruction command.
+The test writes `/tmp/attackbox-scenario-local-001/results.json` and `/tmp/attackbox-scenario-local-001/local-events.json`. These files prove local handler capture only. They are not evidence delivery receipts. `/tmp/attackbox-scenario-local-001/local-events.json` uses the internal event schema; do not pass it to the evidence export reconstruction command.
 
 ## Closed-ingress host check
 
-First confirm that the reviewed raw-evidence service and shipper are installed and healthy. The earlier `c44e2cb` host build does not provide the new raw-evidence capture. A 200 response from that build does not establish raw logging readiness.
+First confirm that the reviewed evidence collection and shipper are installed and healthy. The earlier `c44e2cb` host build does not provide the new evidence store. A 200 response from that build does not establish evidence readiness.
 
 Build a Linux binary from the reviewed candidate, then copy it to a temporary path on the host through the existing SSH access. Keep public ingress closed. Run it on that host:
 
 ```sh
-/tmp/attackbox-scenarios -target https://127.0.0.1:8443 -self-signed -proxy -model gpt-4o -run-id preflight-001 -output /tmp/attackbox-preflight-001.jsonl
+/tmp/attackbox-scenarios -target https://127.0.0.1:8443 -self-signed -proxy -model gpt-4o -commit a1b2c3d4e5f6 -output /tmp/attackbox-preflight-001.jsonl
 ```
 
-The default endpoint passes through the local proxy. nginx rejects the encoded traversal with 400 and the oversized body with 413 before Go receives them. Use `-proxy` to check the expected nginx HTML rejections with no application request ID. These are edge-path results; verify their Docker journal records separately. Omit `-proxy` for a direct handler check. Run the full ten-case handler check through an SSH loopback forward to the existing internal bait address, with no public listener. Do not expose a new port for this check. Keep `/tmp/attackbox-preflight-001.jsonl` as the response manifest. A second run needs a new file and run ID. Remove the temporary binary after the check.
+The default endpoint passes through the local proxy. nginx rejects the encoded traversal with 400 and the oversized body with 413 before Go receives them. Use `-proxy` to check the expected nginx HTML rejections with no application request ID. These are edge-path results; verify their Docker journal records separately. Omit `-proxy` for a direct handler check. Run the full ten-case handler check through an SSH loopback forward to the existing internal bait address, with no public listener. Do not expose a new port for this check. Keep `/tmp/attackbox-preflight-001.jsonl` as the response manifest. A second run needs a new file and commit. Remove the temporary binary after the check.
 
 Exit 0 means all response checks passed. A timeout, wrong status, missing server ID, invalid response envelope, incomplete SSE terminator, or response size limit returns exit 1. Configuration errors return exit 2. The command always writes `logging_verified: false`: only independent evidence checks can establish logging and delivery.
 
 `response_id` is the complete `X-Request-Id` header. `log_request_id` is the first 16 hexadecimal characters after `req_`, matching the server log schema. Compare the response manifest with logs by this server-assigned ID. Do not use the research label as a trusted correlation key.
 
-## New Relic evidence gate
+## Evidence gate
 
-Select the correct New Relic account and sensor. Find ordinary events for the run:
+Find the evidence files on the host. Query the shipper events or use `cmd/attackbox-live` with SSH for ordinary events for the run. For a direct handler run, expect ten distinct request IDs. With `-proxy`, expect eight application request IDs; inspect the two nginx rejections in the Docker journal view by edge ID and event time. Transcripts and probe records apply only to inference cases. Use `/tmp/attackbox-preflight-001.jsonl` to reconcile each case.
 
-```sql
-FROM Log, Log_AttackEvidence SELECT count(*), uniqueCount(request_id)
-WHERE `service.name` = 'attackbox'
-  AND sensor_id = 'REPLACE_SENSOR_ID'
-  AND user_agent LIKE 'attackbox-synthetic-preflight-001-%'
-FACET stream SINCE 15 minutes ago LIMIT MAX
-```
+The evidence files hold complete request and response data. Reconstruct the complete request and response with the existing verifier using the host evidence files or the archive pulled to the Mac. Match both byte counts and SHA-256 values to the response manifest. For `oversized`, request reconstruction must reject the incomplete capture; inspect its `body_limit` manifest and verify the complete response instead. For `fake-credential`, also reconstruct `request_metadata` and confirm the deliberately invalid Authorization value. The raw header representation uses base64-encoded byte strings.
 
-For a direct handler run, expect ten distinct request IDs. With `-proxy`, expect eight application request IDs; inspect the two nginx rejections in the Docker journal view by edge ID and event time. Transcripts and probe records apply only to inference cases. Use `/tmp/attackbox-preflight-001.jsonl` to reconcile each case. Substitute an application request ID below:
+Record the first time each request is visible in the evidence files and the manifest `started_at` time. Their difference gives an observed end-to-end visibility bound, including request duration. It is not a precise collection latency metric. Missing events, missing segments, hash errors, and unbounded delay must block public rollout.
 
-```sql
-FROM Log, Log_AttackEvidence SELECT *
-WHERE `service.name` = 'attackbox'
-  AND sensor_id = 'REPLACE_SENSOR_ID'
-  AND request_id = 'REPLACE_LOG_REQUEST_ID'
-SINCE 15 minutes ago LIMIT MAX
-```
-
-Export all matching rows for that request. Check export row limits and pagination. A partial export cannot prove complete delivery. Store the result as `/tmp/attackbox-nr-request.json`. Reconstruct the complete request and response with the existing verifier:
-
-```sh
-cd /Users/rohit/attack-box
-go run ./cmd/attackbox-evidence -input /tmp/attackbox-nr-request.json -request-id REPLACE_LOG_REQUEST_ID -kind request_body -output /tmp/attackbox-rebuilt-request.bin
-go run ./cmd/attackbox-evidence -input /tmp/attackbox-nr-request.json -request-id REPLACE_LOG_REQUEST_ID -kind response_body -output /tmp/attackbox-rebuilt-response.bin
-shasum -a 256 /tmp/attackbox-rebuilt-request.bin /tmp/attackbox-rebuilt-response.bin
-wc -c /tmp/attackbox-rebuilt-request.bin /tmp/attackbox-rebuilt-response.bin
-```
-
-Use new paths for each request. Match both byte counts and SHA-256 values to the response manifest. For `oversized`, request reconstruction must reject the incomplete capture; inspect its `body_limit` manifest and verify the complete response instead. For `fake-credential`, also reconstruct `request_metadata` and confirm the deliberately invalid Authorization value. The raw header representation uses base64-encoded byte strings.
-
-Record the first time each request is visible in New Relic and the manifest `started_at` time. Their difference gives an observed end-to-end visibility bound, including request duration and query delay. It is not a precise ingest latency metric. Missing events, missing segments, hash errors, and unbounded delay must block public rollout.
-
-If tracing is enabled, check that the same request has a `trace.id` and that its corresponding span is present. Check Infrastructure host metrics and collector freshness separately. These text-only scenarios should not execute a shell or produce real outbound attack traffic; absence of a Falco execution alert or egress block is expected. They do not validate host compromise detection, packet capture, collector outage recovery, or all attack classes.
+If OpenTelemetry tracing is enabled, check that the same request has a `trace.id` and that its corresponding span is present in the evidence files. Check collector freshness separately. These text-only scenarios should not execute a shell or produce real outbound attack traffic; absence of a Falco execution alert or egress block is expected. They do not validate host compromise detection, packet capture, collector outage recovery, or all attack classes.

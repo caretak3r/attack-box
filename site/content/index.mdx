@@ -18,9 +18,9 @@ A separate public gateway answers on public ports like common AI servers. Its an
 | Observe | Record bounded, redacted observations of client behavior: requests, parsed declarations, probe compliance, and sessions. |
 | Collect | Add host runtime evidence from Falco, kernel audit, and privileged snapshots outside the bait container. |
 | Validate | Admit records by role and structure. Reject malformed or oversized payloads before queueing. |
-| Deliver | Append admitted records to a durable disk queue. Batch and ship logs and metrics to New Relic. Export traces to an OpenTelemetry Collector. |
+| Deliver | Append admitted records to append-only JSONL evidence files on the host. Rotate by date and size. |
 
-The supplied Ubuntu deployment uses an nginx proxy on host loopback and enables only the OpenAI persona. Local development does not need Docker, a VPS, or a New Relic key.
+Local development does not need Docker or a VPS.
 
 - [Capabilities](/capabilities/) lists API routes, log streams, host evidence, delivery mechanisms, operator tools, and limits.
 - [Public gateway](/public-gateway/) lists the public ports, the answers, the records, and the limits of the gateway.

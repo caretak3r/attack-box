@@ -19,13 +19,15 @@ flowchart LR
     B --> S[Go host shipper: bait Unix socket]
     F[Host Falco] --> R[Go durable reader: runtime socket]
     J[Kernel journal] --> E[Go durable reader: egress socket]
+    A[Audit filter] --> AF[Audit JSONL]
     R --> S
     E --> S
     S --> Q[Durable local queue]
-    Q --> N[New Relic log and metric APIs]
-    P --> DJ[Persistent Docker journal]
-    DJ --> NI[Native Infrastructure log forwarder]
-    NI --> N
+    Q --> L[Local JSONL evidence files]
+    P --> OC[OTel Collector]
+    B --> OC
+    S --> OC
+    OC --> OL[Local OTLP/JSON traces and metrics]
 ```
 
 The supplied Compose configuration publishes only `127.0.0.1:8443` and `127.0.0.1:8080`. vLLM and Ollama listeners are disabled. Port 8080 redirects to HTTPS port 8443. This configuration does not expose public AI discovery ports. Public 443, 8000, and 11434 are proposed in I01 of `/Users/rohit/attack-box/IMPROVE.md`.
@@ -40,8 +42,8 @@ The gVisor override assigns `172.30.0.2` to bait and maps `bait` to that address
 
 | Component | Entry point | Input and output | Identity and authority |
 |---|---|---|---|
-| Bait | `/Users/rohit/attack-box/cmd/attackbox/main.go` | HTTP personas to synthetic responses; redacted events to local output and configured sink | Container UID 65532; redaction secret; no ingest key in deployed spool mode |
-| Shipper | `/Users/rohit/attack-box/cmd/attackbox-shipper/main.go` | Role-specific Unix sockets to disk queue and New Relic | Host user `abx-ship`, primary group `abx-bait`, supplemental group `abx-ship`; owns ingest key in process environment |
+| Bait | `/Users/rohit/attack-box/cmd/attackbox/main.go` | HTTP personas to synthetic responses; redacted events to local output and configured sink | Container UID 65532; redaction secret |
+| Shipper | `/Users/rohit/attack-box/cmd/attackbox-shipper/main.go` | Role-specific Unix sockets to disk queue and local JSONL files | Host user `abx-ship`, primary group `abx-bait`, supplemental group `abx-ship`; file exporter writes to evidence directory |
 | Runtime adapter | Go `attackbox-hostreader -source falco` | Falco JSON lines to runtime socket | Host root, separate systemd unit; no ingest key required by adapter mode |
 | Egress adapter | Go `attackbox-hostreader -source journal` | Filtered kernel journal JSON to egress socket | Host root, separate systemd unit; no ingest key required by adapter mode |
 | Analysis job | Proposed; no binary exists | Approved redacted exports to bounded families, candidate links, and reports | Separate analysis environment, outside decoy and operator Mac; no authority over the live response policy |
@@ -52,7 +54,7 @@ Captured text is untrusted data at every boundary. Do not render it as active HT
 
 ## Current response path
 
-An optional operator-side Go watcher takes bounded read-only SSH snapshots and writes a local overnight report. It is separate from the production telemetry path and does not run on the VPS or verify New Relic receipt. Procedure and limits: `/Users/rohit/attack-box/docs/overnight-watch.md`.
+An optional operator-side Go watcher takes bounded read-only SSH snapshots and writes a local overnight report. It is separate from the evidence collection path and does not run on the VPS. Procedure and limits: `/Users/rohit/attack-box/docs/overnight-watch.md`.
 
 The HTTP layer parses bounded requests, selects the persona, derives session context, and invokes the responder. The server takes an admission tick when a request arrives, before it reads the body. The responder attributes a reply only to a probe response that the server fully sent before that admission. It scores only new material. In all other cases it records an `attribution` observation and does not guess. The responder also records declarations and classifies intent. After three issued questions it can release one fake payout. Other branches select an intent probe or the registration sequence: model question, harness question, assigned behavioral probe, then a neutral completion. Intent probes can continue after payout.
 
@@ -199,7 +201,7 @@ Producers write wire version `v=1`. The shipper rejects unsupported versions and
 
 Wire record IDs use `<16-lowercase-hex-boot>-<positive-sequence>`. Forwarded IDs use `<role>-<boot>-<sequence>`. Deduplicate chunks by record ID and chunk index. Reassemble only within that identity and validate expected count and content hash. Hash alone is not a transcript identity.
 
-The bootstrap uses the Go host reader for Falco files and kernel journal events. Set `ATTACKBOX_HOST_RECEIPTS=true` on the shipper. Only root-only runtime and egress sockets can return receipts. The bait socket remains one-way. A receipt confirms an fsynced local queue append; it does not confirm New Relic delivery.
+The bootstrap uses the Go host reader for Falco files and kernel journal events. Set `ATTACKBOX_HOST_RECEIPTS=true` on the shipper. Only root-only runtime and egress sockets can return receipts. The bait socket remains one-way. A receipt confirms an fsynced local queue append; it does not confirm remote delivery.
 
 The reader preserves each source record as base64 segments of at most 128 KiB. It retains source records up to 8 MiB. It commits its source position only after all segments have receipts. The private cursor file uses fsync, rename and directory fsync. One process holds the state-directory lock. A lost receipt can produce duplicates with stable record IDs. Use `source_event_id`, `source_segment`, `source_segments`, `source_bytes` and `source_sha256` to reconstruct and check source bytes after reconstructing each exported body chunk.
 
@@ -219,31 +221,29 @@ The `checkpoint` file records generation, segment, offset, and acknowledged sequ
 
 The default unacknowledged queue limit is 256 MiB. Role reservations are bait 60%, runtime 20%, and egress 20%. Full queues reject new records; they do not evict unacknowledged data. Physical disk use can exceed the logical unacknowledged limit due to retained segments and quarantine files. Monitor filesystem usage separately.
 
-The drain reads up to 200 records or 512 KiB, delivers in order, and checkpoints confirmed deliveries after 200 records or one second. Authentication, endpoint, transport and outage failures block later records. HTTP 413 first splits encoded batches. Record-level HTTP 400, 413 or 422 failures isolate the source record. The drain can advance past that record only after it stores the exact queue bytes and SHA-256 in `/var/lib/attackbox-shipper/queue/quarantine`. The quarantine is bounded to 64 MiB and 4096 files. It never evicts records. A full or damaged quarantine stops the drain. Replayed entries use deterministic filenames. A server-wide 400 response can fill this store; it is not treated as successful remote delivery. Monitor `quarantine_records` and `quarantine_bytes`. Empty polls wait 100 ms; blocked delivery retries after 250 ms. Remote API acceptance is not proof of query availability.
+The drain reads up to 200 records or 512 KiB, writes them to local JSONL files, and checkpoints confirmed writes after 200 records or one second. File I/O failures block later records. Malformed records isolate to quarantine. The drain can advance past a quarantined record only after it stores the exact queue bytes and SHA-256 in `/var/lib/attackbox-shipper/queue/quarantine`. The quarantine is bounded to 64 MiB and 4096 files. It never evicts records. A full or damaged quarantine stops the drain. Replayed entries use deterministic filenames. Monitor `quarantine_records` and `quarantine_bytes`. Empty polls wait 100 ms; blocked writes retry after 250 ms.
 
 The shipper sends bounded `ingest_stats` and `producer_boot` reports outside the durable queue. `loss_scope=committed` covers only stages through durable admission. `none_known` does not establish delivery or query availability. A forced stop, missing prefix, or unexplained gap can leave loss `unknown`.
 
 Recovery truncates a torn final frame in the newest segment. Other corruption preserves the valid prefix and quarantines the segment. Missing or inconsistent checkpoint state causes uncertain replay. Logs can repeat. Metrics in the uncertain range are suppressed and `attackbox.metric_replay_gap` records the gap. An I/O error can leave the queue broken until restart and recovery; do not delete queue files to clear it.
 
-On shutdown, the shipper cancels ingest and drain, checkpoints confirmed delivery, and closes its remote client within the configured timeout. It leaves unacknowledged disk records for restart. It does not promise to empty the disk queue before exit.
+On shutdown, the shipper cancels ingest and drain, checkpoints confirmed writes, and closes file handles within the configured timeout. It leaves unacknowledged disk records for restart. It does not promise to empty the disk queue before exit.
 
 Source: `/Users/rohit/attack-box/internal/shipper/queue.go` and `/Users/rohit/attack-box/cmd/attackbox-shipper/drain.go`.
 
 ## Network, secrets, and host limits
 
-The intended bait boundary permits inbound proxy traffic and local spool writes. Container-originated internet and metadata access must be denied. The host shipper uses allowlisted New Relic HTTPS destinations. Host policy also permits specific DNS, time, and update traffic. Provider firewall policy is a separate control.
+The intended bait boundary permits inbound proxy traffic and local spool writes. Container-originated internet and metadata access must be denied. The host shipper writes only to local filesystems. Host policy permits specific DNS, time, and update traffic for system maintenance. Provider firewall policy is a separate control.
 
-The current deployment uses US New Relic endpoints. Changing endpoint URLs alone does not change the deployment script's firewall sets or verification hosts. DNS refresh adds addresses; stale addresses remain until a ruleset reload or reboot. IP allowlisting does not make a permitted remote endpoint a trusted data source.
-
-The bait secret is mounted at `/run/secrets/attackbox_secret`. The host ingest key is loaded from `/etc/attackbox/shipper.env`. The key permits telemetry ingestion; it must belong to a dedicated decoy account with bounded cost exposure. Root or shipper compromise can expose it. Socket isolation does not protect it after host-root compromise.
+The bait secret is mounted at `/run/secrets/attackbox_secret`. Evidence files are written to `/var/lib/attackbox-evidence` and subdirectories. Root or shipper compromise can expose these files. Socket isolation does not protect evidence after host-root compromise.
 
 Source: `/Users/rohit/attack-box/compose.yaml`, `/Users/rohit/attack-box/deploy/nftables/attackbox.nft`, and `/Users/rohit/attack-box/scripts/deploy-ubuntu.sh`.
 
 ## Health and interpretation
 
-The shipper sends a heartbeat every 30 seconds directly through its New Relic client, outside the disk queue. `bait_connected` means at least one bait socket connection exists. `last_bait_record_age_ms` is -1 before a valid bait record. Both `queue_bytes` and `queue_backlog_bytes` currently report unacknowledged queue bytes. `ship_dropped_total` reports queue drops, not every possible collection loss.
+The shipper writes a heartbeat every 30 seconds to the evidence stream. `bait_connected` means at least one bait socket connection exists. `last_bait_record_age_ms` is -1 before a valid bait record. Both `queue_bytes` and `queue_backlog_bytes` currently report unacknowledged queue bytes. `ship_dropped_total` reports queue drops, not every possible collection loss.
 
-A heartbeat proves one reporting path worked at that time. It does not prove complete capture, correct responses, working Falco, or containment. An ingest spike is an investigation signal. It does not alone prove compromise.
+A heartbeat proves local collection continued at that time. It does not prove complete capture, correct responses, working Falco, or containment. An evidence spike is an investigation signal. It does not alone prove compromise.
 
 ## Proposed Go extension contracts
 
@@ -267,28 +267,28 @@ Source review and local tests establish only their tested behavior. Public port 
 
 ## Live evidence and delivery
 
-The [service ecosystem](service-ecosystem.md) documents service identities, collection routes, and coverage checks. New Relic Infrastructure supplies host, process, and Docker metrics. An optional OpenTelemetry Collector supplies application spans and readiness metrics. See the [monitoring guide](monitoring-setup.md) for setup and rollback.
+The [service ecosystem](service-ecosystem.md) documents service identities, collection routes, and coverage checks. OTel Collector supplies application spans and metrics. See the [monitoring guide](monitoring-setup.md) for operator-side collection and analysis.
 
-The implemented application capture, batch export, evidence recovery CLI, shutdown ordering, dashboard setup and validation gates are documented in `/Users/rohit/attack-box/docs/live-evidence.md`. The process defaults to `ATTACKBOX_FULL_EVIDENCE=true`; Compose sets it explicitly. Raw capture preserves submitted bytes and credentials; readable summaries remain redacted. This does not extend capture to proxy-rejected traffic or remove bounded-queue loss. The fixed readiness collector is implemented locally. The durable forensic host reader is implemented and tested locally; its paired shipper/reader release is not deployed.
+The implemented application capture, evidence recovery CLI, shutdown ordering and validation gates are documented in `/Users/rohit/attack-box/docs/live-evidence.md`. The process defaults to `ATTACKBOX_FULL_EVIDENCE=true`; Compose sets it explicitly. Raw capture preserves submitted bytes and credentials; readable summaries remain redacted. This does not extend capture to proxy-rejected traffic or remove bounded-queue loss. The durable forensic host reader is implemented and tested locally.
 
 
 ## Prepared edge collection and containment changes
 
-The proxy writes JSON access records to stdout and TLS/parser diagnostics to stderr. Its Docker log driver is `journald`; native Infrastructure reads the `docker.service` journal with `logtype=docker_journal`. This keeps the route valid when a container ID changes. Bait still uses the Go evidence route and the bounded local Docker driver. The native systemd input is documented at https://docs.newrelic.com/docs/logs/forward-logs/forward-your-logs-using-infrastructure-agent/ .
+The proxy writes JSON access records to stdout and TLS/parser diagnostics to stderr. Its Docker log driver is `journald`. Bait uses the Go evidence route and the bounded local Docker driver.
 
 Each access record includes a proxy request ID, client address, raw request line, response status, byte counts, timing and TLS fields. `bait_request_id` comes from the upstream response header, not a client-supplied header. It is empty for requests that nginx rejects before forwarding. Error records remain text. These records contain metadata; they do not contain a full rejected request body or raw TLS packets. Request lines can contain submitted credentials. Treat all fields as inert evidence.
 
 The host firewall pins the gVisor proxy and bait to configured addresses. It permits new proxy connections to the bait on TCP 8080 and denies other container-originated forwarding. Docker and provider firewalls remain separate controls.
 
 
-### Native edge route identity
+### Evidence file paths
 
-The proxy writes access JSON and parser diagnostics to Docker journald. The Infrastructure agent reads the `docker` systemd journal route. Each project-managed route includes the trusted sensor and deployment IDs, so partition rules and saved views select it. JSON access fields use the New Relic `MESSAGE.*` prefix. This path captures rejection metadata, not raw bodies rejected by nginx. The Go evidence stream captures bounded application-level bytes separately.
+The proxy journal and shipper output use trusted sensor and deployment IDs. The Go evidence stream captures bounded application-level bytes separately.
 
 ### Overnight findings publication
 
-The local Go watcher reads bounded SSH snapshots from the host. A second local Go process reads the private sample file and atomic report. It renders fixed labels and numeric aggregates into a separate findings-only Git repository. Only that repository is committed and pushed. Raw evidence remains on the existing private collection paths. The publisher checks staged paths and commit history, drops inherited Git overrides, retries failed pushes and stops after the final report or at the watch deadline. This path requires the operator Mac and GitHub access. It does not verify New Relic receipt or change public ingress. Setup, limits and verification are in `/Users/rohit/attack-box/docs/overnight-watch.md`.
+The local Go watcher reads bounded SSH snapshots from the host. A second local Go process reads the private sample file and atomic report. It renders fixed labels and numeric aggregates into a separate findings-only Git repository. Only that repository is committed and pushed. Raw evidence remains on the existing private collection paths. The publisher checks staged paths and commit history, drops inherited Git overrides, retries failed pushes and stops after the final report or at the watch deadline. This path requires the operator Mac and GitHub access. It does not change public ingress. Setup, limits and verification are in `/Users/rohit/attack-box/docs/overnight-watch.md`.
 
 ## Audit collection budget
 
-The optional Go audit forwarder compacts related host audit records before native New Relic forwarding. The persistent inventory worker reduces audit activity from monitoring itself. The bait evidence path stays unchanged. Architecture, retention bounds, filtering conditions, and bootstrap steps: `/Users/rohit/attack-box/docs/log-budget.md`.
+The optional Go audit forwarder compacts related host audit records. The persistent inventory worker reduces audit activity from monitoring itself. The bait evidence path stays unchanged. Architecture, retention bounds, filtering conditions, and bootstrap steps: `/Users/rohit/attack-box/docs/log-budget.md`.

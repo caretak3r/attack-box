@@ -4,7 +4,7 @@ The local Go command `/Users/rohit/attack-box/cmd/attackbox-watch/main.go` obser
 
 Default duration: eight hours. Default interval: five minutes plus collection time. Maximum duration: twelve hours. Minimum interval: one minute. Each SSH command has a 45-second deadline and two bounded 8 MiB output buffers. The remote shell program is fixed. Only integer observation timestamps are inserted.
 
-Each snapshot collects host load, available memory, disk use, component inventory, OTel export counters, failed units, cursor modification times, bounded proxy/kernel journal rows and a bounded Falco file tail. It records known route categories, response status, public/private source counts and firewall prefixes. It does not save raw request paths, query values, headers, payloads or IP addresses. New Relic receipt is not verified by this command. Existing New Relic UI alerts remain a separate monitoring path.
+Each snapshot collects host load, available memory, disk use, component inventory, OTel export counters, failed units, cursor modification times, bounded proxy/kernel journal rows and a bounded Falco file tail. It records known route categories, response status, public/private source counts and firewall prefixes. It does not save raw request paths, query values, headers, payloads or IP addresses. The existing evidence files remain the monitoring path.
 
 `samples.jsonl` and `REPORT.md` are private files in a new output directory. The report is replaced atomically after each snapshot. It reports `running`, `complete` or `interrupted`. Read the latest snapshot time as well as the state: an abruptly terminated process cannot update its final status. The first snapshot covers the preceding five minutes. Subsequent successful windows do not overlap. Collection failures are explicit gaps; they do not trigger automatic replay or remediation. Falco tail parse-error counts can repeat old records. A bounded source can omit evidence during a flood or rotation.
 
@@ -21,7 +21,7 @@ Use a new absolute output directory for each run. The directory has mode 0700; r
 
 Stop the current watch with SIGTERM to the numeric PID in `/Users/rohit/attack-box/reports/overnight-20261124/watch.pid`. The collector finishes or times out its current read, then writes an interrupted report. The idle-sleep assertion ends when the watch process exits.
 
-Readiness values of -1 mean unknown. A stale Falco cursor can indicate an idle source. Egress blocks, private-source requests, synthetic labels and parse errors do not establish an attack. Before attributing activity, inspect the original evidence in New Relic and account for collection limits. Do not execute or follow captured content.
+Readiness values of -1 mean unknown. A stale Falco cursor can indicate an idle source. Egress blocks, private-source requests, synthetic labels and parse errors do not establish an attack. Before attributing activity, inspect the evidence files and account for collection limits. Do not execute or follow captured content.
 
 Verification: `GOTOOLCHAIN=go1.25.11 go test -race ./cmd/attackbox-watch`, matching `go vet`, independent source review, and a live read-only `-once` baseline. On 2026-11-24 the provider firewall allowed only administrator SSH; public honeypot ingress was closed. The overnight command does not change that state.
 

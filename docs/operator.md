@@ -1,10 +1,10 @@
 # Attack Box setup and operations
 
-Source baseline: `584a658`. Documentation review: 2026-11-22. No live VPS, gVisor, or New Relic verification was performed for this documentation update.
+Source baseline: `584a658`. Documentation review: 2026-11-22. No live VPS or gVisor verification was performed for this documentation update.
 
 Architecture: `/Users/rohit/attack-box/docs/architecture.md`. Proposed improvements and deployment gates: `/Users/rohit/attack-box/IMPROVE.md`.
 
-Native New Relic Maps, component coverage, identity requirements and monitoring acceptance tests: `/Users/rohit/attack-box/docs/service-ecosystem.md`. That document includes a later host snapshot and a proposed instrumentation setup; it does not certify complete monitoring.
+Service ecosystem and monitoring: `/Users/rohit/attack-box/docs/service-ecosystem.md`. That document includes a later host snapshot and a proposed instrumentation setup; it does not certify complete monitoring.
 
 ## Supported direction and current exposure
 
@@ -94,7 +94,7 @@ Source: `/Users/rohit/attack-box/cmd/attackbox/main.go` and `/Users/rohit/attack
 | `-check-config` | Validate configuration and exit; does not establish network reachability |
 | `-healthcheck URL` | Check an HTTP loopback URL; rejects non-loopback hosts, credentials, and redirects |
 
-Exactly one telemetry mode must be selected: host spool socket, direct New Relic key, or `ATTACKBOX_NR_DISABLED=true`. Use host spool mode on the VPS. Direct-key mode puts the ingest key in the bait and is outside the deployed separation.
+Exactly one telemetry mode must be selected: host spool socket or local-only. Use host spool mode on the VPS.
 
 Unset or blank settings use defaults. All bait integer limits are positive. All bait durations must be greater than zero and at most one hour. Boolean values accept `true/false`, `yes/no`, or `1/0`, without case sensitivity.
 
@@ -108,9 +108,6 @@ Unset or blank settings use defaults. All bait integer limits are positive. All 
 | `ATTACKBOX_TRUSTED_PROXIES` | Empty | Comma-separated IPs or CIDRs; forwarding headers are trusted only from those peers |
 | `ATTACKBOX_SECRET_FILE` | Empty: random process key | Regular file, 32–4096 bytes, no group/other permission bits; stable file needed for stable derived keys |
 | `ATTACKBOX_NR_DISABLED` | `false` | Explicit local-only telemetry mode |
-| `ATTACKBOX_NR_LICENSE_KEY` | Empty | Required only for direct remote mode; conflicts with spool/local mode |
-| `ATTACKBOX_NR_LOG_URL` | Client default: US Log API | Direct-mode URL override; does not alter firewall policy |
-| `ATTACKBOX_NR_METRIC_URL` | Client default: US Metric API | Direct-mode URL override; does not alter firewall policy |
 | `ATTACKBOX_SPOOL_SOCKET` | Empty | Enables host spool mode; absolute Unix path, at most 107 bytes, no NUL |
 | `ATTACKBOX_SPOOL_QUEUE` | `10000` | 1–100000 queued records; separate fixed byte ceiling also applies |
 | `ATTACKBOX_SPOOL_TIMEOUT` | `5s` | Per-record socket write timeout |
@@ -133,16 +130,12 @@ Follow-up and canary attribution (I03) adds no flag and no environment variable.
 Compose overrides include OpenAI `0.0.0.0:8080`, instance `attackbox-bait`, 5,000 sessions, a commercial-model catalog, trusted proxy subnet `172.30.0.0/24`, and secret path `/run/secrets/attackbox_secret`. vLLM and Ollama remain off. The proposed public profile must narrow trusted forwarding identity to the actual proxy peer and assign a coherent catalog to each persona.
 
 ## Shipper command and configuration
-
 Source: `/Users/rohit/attack-box/cmd/attackbox-shipper/main.go` and `/Users/rohit/attack-box/cmd/attackbox-shipper/config.go`.
 
-The binary supports `-version` and `-stdin-stream runtime|egress`. It does not have a configuration-check or dry-run flag. Without stdin mode it runs socket ingest, disk queue, and remote delivery. Stdin mode reads JSON lines and writes to `ATTACKBOX_SPOOL_SOCKET`; the supplied adapter units set this to the appropriate role socket. Adapter mode does not load the host ingest key.
+The binary supports `-version` and `-stdin-stream runtime|egress`. It does not have a configuration-check or dry-run flag. Without stdin mode it runs socket ingest, disk queue, and evidence writing. Stdin mode reads JSON lines and writes to `ATTACKBOX_SPOOL_SOCKET`; the supplied adapter units set this to the appropriate role socket. Adapter mode does not load keys.
 
 | Environment variable | Default | Validation or meaning |
 |---|---|---|
-| `ATTACKBOX_NR_LICENSE_KEY` | None | Required for the shipper; local key-shape validation also applies |
-| `ATTACKBOX_NR_LOG_URL` | `https://log-api.newrelic.com/log/v1` | HTTPS ingest endpoint; no automatic regional selection |
-| `ATTACKBOX_NR_METRIC_URL` | `https://metric-api.newrelic.com/metric/v1` | HTTPS ingest endpoint; no automatic regional selection |
 | `ATTACKBOX_SENSOR_ID` | Lowercase hostname, or `attackbox` if invalid | Stable sensor label on shipper logs and metrics |
 | `ATTACKBOX_DEPLOYMENT_ID` | `unset` | Deployment label on shipper logs and metrics. On a monitored host it is the campaign ID, not a commit |
 | `ATTACKBOX_SPOOL_SOCKET` | `/run/attackbox/spool.sock` | Bait UID 65532; 4 connections, 1 MiB/s, 4 MiB burst |
@@ -158,24 +151,21 @@ Both ID values must match `^[a-z0-9][a-z0-9._-]{0,62}$`. Use a new deployment ID
 
 Socket paths must be absolute, at most 107 bytes, and contain no NUL. Use distinct paths. Current byte-setting parsing silently falls back to defaults for non-integer input; it rejects parsed out-of-range integers. Check the effective configuration carefully. Strict deployment-manifest validation is proposed in `/Users/rohit/attack-box/IMPROVE.md`.
 
-The script resolves and permits the US New Relic hosts above. For another region, endpoint configuration, firewall resolution, and deployment verification must change together. Do not assume a key selects the region.
-
 ## VPS preparation and install
 
 Use an operator-approved source revision. Stage the full checkout at `/opt/attackbox-src` on the VPS. The script installs runtime artifacts at `/opt/attackbox`; keep these paths distinct because the installer copies files from its source directory.
 
-Create a dedicated decoy New Relic account or subaccount and an ingest license key. Do not give the host a query/admin key. Configure retention, ingest limits, and cost alerts outside the decoy. Do not enable automatic AI processing of hostile payloads.
+The host stores evidence on disk. The operator retrieves it over SSH. No third-party ingest key is required on the host.
 
-Create `/etc/attackbox/shipper.env` with owner `root:root` and mode `0600`. Enter the real ingest key through a protected editor or secret-delivery channel. Do not put it in shell history, repository files, or command output. The required settings are:
+The installer requires `/etc/attackbox/shipper.env` with owner `root:root` and mode `0600`. The required settings are:
 
 ```dotenv
-ATTACKBOX_NR_LICENSE_KEY=<replace with the dedicated ingest license key>
 ATTACKBOX_SPOOL_SOCKET=/run/attackbox/spool.sock
 ATTACKBOX_RUNTIME_SOCKET=/run/attackbox/runtime.sock
 ATTACKBOX_EGRESS_SOCKET=/run/attackbox/egress.sock
 ```
 
-The placeholder is not a valid key. The installer requires this file before service startup and appends missing role-socket settings in apply mode.
+The installer appends missing role-socket settings in apply mode.
 
 Run these commands on the VPS only after deployment authorization:
 
@@ -185,11 +175,7 @@ sudo bash /opt/attackbox-src/scripts/deploy-ubuntu.sh --apply
 sudo bash /opt/attackbox-src/scripts/deploy-ubuntu.sh --verify
 ```
 
-With no mode flag the script performs preflight. `--dry-run` reports proposed setup actions; it is not a runtime rehearsal. `--apply` installs dependencies, users, firewall policy, gVisor, service units, container artifacts, and binaries. It builds before applying the final restrictive egress policy. `--refresh-sets` refreshes allowed endpoint addresses; stale entries remain until a reboot or a restart of `nftables.service`. A reload of `nftables.service` keeps the set elements (verified on nftables 1.0.9). Do not restart `nftables.service`: a restart flushes the full ruleset, which includes the Docker rules. The script installs its refresh entry point at `/usr/local/sbin/attackbox-deploy`.
-
-When `/etc/attackbox/monitoring.env` exists and the launcher passes `ATTACKBOX_RELEASE_VERSION`, `--apply` sets that one field to the deployed commit and restarts `attackbox-otel.service`. When `/etc/attackbox/shipper-monitoring.env` exists, `--apply` also sets `ATTACKBOX_DEPLOYMENT_ID` in that file to the `ATTACKBOX_CAMPAIGN_ID` of the same file, before the shipper starts. The deployment label is the campaign ID. Do not set it to a commit. The commit is in `ATTACKBOX_RELEASE_VERSION`.
-
-`--apply` stops Docker, and this stops the public gateway. When `attackbox-public.service` is enabled, the installer starts the public gateway again after the bait starts. The public ports do not answer during the build. If the public gateway does not start, the installer completes the private checks and then exits with an error.
+With no mode flag the script performs preflight. `--dry-run` reports proposed setup actions; it is not a runtime rehearsal. `--apply` installs dependencies, users, firewall policy, gVisor, service units, container artifacts, and binaries. It builds before applying the final restrictive egress policy. A reload of `nftables.service` keeps the set elements (verified on nftables 1.0.9). Do not restart `nftables.service`: a restart flushes the full ruleset, which includes the Docker rules. The script installs its refresh entry point at `/usr/local/sbin/attackbox-deploy`.
 
 `--apply` also disables cloud-init for later boots with `/etc/cloud/cloud-init.disabled`. The egress policy blocks the provider metadata address. Without that address, cloud-init treats a reboot as a new instance: it makes new SSH host keys and puts the SSH defaults of the image back, which permit password login.
 
@@ -231,18 +217,15 @@ The helper installs only the public chain. It restarts only nginx when the serve
 Renewal needs the operator's login session, an accessible Keychain, and pinned SSH access. After VPS lockdown, use an approved management path for certificate delivery. Do not reopen SSH for renewal.
 
 ## Private checks and public-exposure gate
-
-The current `--verify` function tests metadata denial, internal Docker name resolution, external DNS denial, internet denial, and unauthenticated New Relic HTTP access from the shipper UID. Its negative tests can treat a container launch failure as a successful block. Its HTTP checks accept any HTTP status when curl succeeds, including 401, 403, and 500. A curl failure still fails the pipeline because the script enables pipefail. It does not verify actual authenticated ingest, role-socket isolation, proxy containment, time synchronization, or public reachability. Treat it as supplementary output, not a release gate.
-
+The current `--verify` function tests metadata denial, internal Docker name resolution, external DNS denial, and internet denial from the shipper UID. Its negative tests can treat a container launch failure as a successful block. It does not verify role-socket isolation, proxy containment, time synchronization, or public reachability. Treat it as supplementary output, not a release gate.
 Before public exposure, record successful controls and denied operations separately:
 
 1. Confirm the test process actually starts under the same runtime and network as each deployed container. Confirm permitted internal access works before interpreting denied access.
 2. Send synthetic requests through the TLS proxy. Confirm persona, model catalog, status, JSON/SSE framing, and response limits. Record the tested revision and configuration.
 3. Confirm the real bait can write to its socket. Confirm a bait UID cannot submit to host runtime/egress roles. Confirm malformed records fail without stopping collection.
-4. Verify authenticated log and metric ingest using a trusted synthetic test marker. Find that marker in remote queries. Verify all configured producers separately.
+4. Verify evidence collection using a trusted synthetic test marker. Find that marker in the host evidence files. Verify all configured producers separately.
 5. Deny outbound internet, external DNS, cloud metadata, and unintended private-network access from bait and proxy. Check IPv4 and IPv6. Verify provider firewall and host policy independently.
-6. Test restart with a known queued record, a remote outage, a full queue, and a client disconnect. Confirm honest loss reporting and bounded resource use. Check physical disk usage as well as logical backlog.
-7. Test provider-console recovery. Record the accepted load, hardware, latency, resource peaks, and remaining gaps.
+6. Test restart with a known queued record, a full queue, and a client disconnect. Confirm honest loss reporting and bounded resource use. Check physical disk usage as well as logical backlog.
 8. After I01 is implemented, verify each intended public port from a separate authorized test host. Keep management access restricted. Open public ingress only as the final approved deployment action.
 
 Optional SSH disablement requires both `--disable-ssh` and `--console-confirmed` with `--apply`. Do it only after console recovery is tested. These instructions do not authorize that operation.
@@ -263,14 +246,11 @@ sudo df -h /var/lib/attackbox-shipper/queue
 
 The `attackbox` unit wraps detached Compose. Its journal does not replace container logs. Inspect `attackbox-falco-adapter.service`, `attackbox-egress-adapter.service`, and `falco-modern-bpf.service` when their streams stop. An oversized stdin line terminates the adapter scanner; service restart does not recover skipped source records. Native Falco on the host cannot prove the absence of activity inside gVisor.
 
-In New Relic, filter heartbeat records by `stream='heartbeat'`, `source='shipper'`, and the configured hostname. Do not require the bait's instance label on shipper heartbeats. The shipper sends a heartbeat every 30 seconds outside its durable disk queue.
+Check the evidence files on the host for recent activity. Use the console (`cmd/attackbox-live`) or pull evidence to the Mac with `scripts/evidence-pull.sh`. Missing heartbeat, stale bait activity, growing physical disk use, queue corruption, replay gaps, and endpoint failures need investigation. None alone proves compromise.
 
-Interpret `bait_connected` as socket connection presence. Interpret `last_bait_record_age_ms=-1` as no valid bait record yet. Both queue-byte fields report unacknowledged queue bytes. Queue drops omit other possible loss stages. Missing heartbeat, stale bait activity, growing physical disk use, queue corruption, replay gaps, and endpoint failures need investigation. None alone proves compromise.
+The shipper attempts the report at startup and every 30 seconds. It sends no more than 40 rows per write. The shipper reports each final verdict for up to 20 report intervals. A new verdict starts a new interval count.
 
-Use `source='shipper_accounting'` for `ingest_stats` and `producer_boot`. The shipper attempts the report at startup and every 30 seconds. It sends no more than 40 rows per POST and does not retry a failed report. The shipper reports each final verdict for up to 20 report intervals. A new verdict starts a new interval count. This count does not measure confirmed deliveries.
-
-Use `shipper_boot`, `role`, and `boot` to identify a boot report. `loss_scope=committed` excludes remote delivery. If `loss=unknown`, read `loss_reason` before interpreting the counters. Then check queue backlog and remote delivery separately.
-
+Use `shipper_boot`, `role`, and `boot` to identify a boot report. `loss_scope=committed` excludes remote delivery. If `loss=unknown`, read `loss_reason` before interpreting the counters. Then check queue backlog separately.
 ## Stop, restart, recovery, and rebuild
 
 For a planned stop, close public ingress first, then stop bait, adapters, and shipper. The bait handles SIGTERM within its configured deadline. The shipper checkpoints confirmed remote delivery and preserves unacknowledged records for restart. It does not empty the disk queue on shutdown. Keep systemd stop limits consistent with application deadlines.
@@ -334,7 +314,7 @@ This source change requires a paired shipper and host-reader release. It is not 
 
 Bootstrap exports `/usr/local/bin/attackbox-shipper` and `/usr/local/bin/attackbox-hostreader`. It enables `ATTACKBOX_HOST_RECEIPTS=true` in `/etc/attackbox/shipper.env`; an explicit conflicting value fails validation. The runtime and egress units use private state directories `/var/lib/attackbox-falco-reader` and `/var/lib/attackbox-egress-reader`, mode 0700. Each reader has a 128 MiB memory cap. Keep source logs and journal retention long enough to cover the maximum outage.
 
-For migration, stop both adapters, install the paired binaries and units, validate the environment, restart the shipper, then start the adapters. Confirm both role heartbeats and a synthetic source record in New Relic. First start replays retained source data; budget for that backlog. Do not run an old stdin adapter on a receipt-enabled socket.
+For migration, stop both adapters, install the paired binaries and units, validate the environment, restart the shipper, then start the adapters. Confirm both role heartbeats and a synthetic source record in the evidence files. First start replays retained source data; budget for that backlog. Do not run an old stdin adapter on a receipt-enabled socket.
 
 For rollback, stop the readers, restore the previous shipper and unit files, restore the previous environment, then restart in the same order. Preserve cursor directories and queue data. A legacy adapter cannot resume the new source cursor and can miss data during rollback.
 
