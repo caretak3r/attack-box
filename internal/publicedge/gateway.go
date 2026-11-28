@@ -260,11 +260,16 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 	if persona.server != "" {
 		w.Header().Set("Server", persona.server)
 	}
-	if r.Method == http.MethodConnect || r.URL.IsAbs() || r.URL.Path == "" || r.URL.Path[0] != '/' || path.Clean(r.URL.Path) != r.URL.Path {
+	// One trailing slash is a valid target: FastAPI products route paths such as /api/v1/tools/.
+	clean := r.URL.Path
+	if len(clean) > 1 {
+		clean = strings.TrimSuffix(clean, "/")
+	}
+	if r.Method == http.MethodConnect || r.URL.IsAbs() || clean == "" || clean[0] != '/' || path.Clean(clean) != clean {
 		gatewayReply(w, http.StatusBadRequest, "text/plain; charset=utf-8", "invalid request target\n")
 		return
 	}
-	f, label, deployment := gatewayResolve(r.URL.Path)
+	f, label, deployment := gatewayResolve(clean)
 	if f != nil {
 		route = label
 	}
@@ -292,12 +297,14 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 		}
 	}
 	// With a capture, read a body that no handler reads, so that the local record holds it.
+	// A persona handler that parses the body then reads the recorded bytes.
 	// The span keeps its meaning: it reports a chunked body size only when a handler read the body.
 	drain := func() {
 		if bodyRec != nil {
 			counted = nil
 			_ = http.NewResponseController(base).SetReadDeadline(time.Now().Add(2 * time.Second))
 			_, _ = io.Copy(io.Discard, bodyRec)
+			r.Body = io.NopCloser(bytes.NewReader(bodyRec.buf.Bytes()))
 		}
 	}
 
@@ -310,6 +317,13 @@ func (g *Gateway) ServeHTTP(base http.ResponseWriter, req *http.Request) {
 		} else if h := persona.posts[r.URL.Path]; h != nil && r.Method == http.MethodPost {
 			route = r.URL.Path
 			h(w, r)
+		} else if h, label := persona.route(r); h != nil {
+			route = label
+			if source, _, _ := gatewayCredential(r); persona.needKey && source == "" {
+				persona.noKey(w, r)
+			} else {
+				h(w, r)
+			}
 		} else if get && gatewayProbe(r) == "env_file" {
 			route = "/.env"
 			g.envFile(w, r)

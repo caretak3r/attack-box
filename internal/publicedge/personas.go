@@ -2,11 +2,19 @@ package publicedge
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strings"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // gatewayPersona makes one public port answer like the server that usually listens there.
@@ -14,6 +22,7 @@ type gatewayPersona struct {
 	server     string                      // Server header; "" sends none
 	paths      map[string]http.HandlerFunc // exact GET paths; each path is also its http.route label
 	posts      map[string]http.HandlerFunc // exact POST paths, labelled the same way
+	routes     *http.ServeMux              // method-and-pattern routes; they answer noKey until the client sends any credential
 	notFound   http.HandlerFunc            // answer to an unmatched request; nil keeps the gateway's 404
 	notAllowed http.HandlerFunc            // answer to a wrong method on a route family; nil keeps the gateway's 405
 	needKey    bool                        // a route family answers 401 until the client sends any credential
@@ -60,7 +69,16 @@ var gatewayPersonas = map[int]gatewayPersona{
 		posts: map[string]http.HandlerFunc{
 			"/api/v1/auths/signup": gatewayOpenWebUISignup,
 			"/api/v1/auths/signin": gatewayFixed(400, gatewayJSON, `{"detail":"The email or password provided is incorrect. Please check for typos and try logging in again."}`),
-		}},
+		},
+		// The paths of the known attack on an open sign-up: store a tool or a function, then delete it.
+		routes: gatewayRoutes(map[string]http.HandlerFunc{
+			"GET /api/v1/tools/{$}":                   gatewayFixed(200, gatewayJSON, `[]`),
+			"GET /api/v1/functions/{$}":               gatewayFixed(200, gatewayJSON, `[]`),
+			"POST /api/v1/tools/create":               gatewayOpenWebUICreate(false),
+			"POST /api/v1/functions/create":           gatewayOpenWebUICreate(true),
+			"DELETE /api/v1/tools/id/{id}/delete":     gatewayFixed(200, gatewayJSON, `true`),
+			"DELETE /api/v1/functions/id/{id}/delete": gatewayFixed(200, gatewayJSON, `true`),
+		})},
 	4000: {server: "uvicorn", needKey: true, // LiteLLM proxy
 		noKey:    gatewayFixed(401, gatewayJSON, `{"error":{"message":"Authentication Error, No api key passed in.","type":"auth_error","param":"None","code":"401"}}`),
 		notFound: gatewayFixed(404, gatewayJSON, `{"detail":"Not Found"}`),
@@ -69,7 +87,17 @@ var gatewayPersonas = map[int]gatewayPersona{
 			"/health/liveliness": gatewayFixed(200, gatewayJSON, `"I'm alive!"`),
 			"/health/liveness":   gatewayFixed(200, gatewayJSON, `"I'm alive!"`),
 			"/health/readiness":  gatewayFixed(200, gatewayJSON, `{"status":"healthy","db":"connected","cache":null,"litellm_version":"1.79.1","success_callbacks":[],"use_aiohttp_transport":true}`),
-		}},
+		},
+		// Management paths that clients request to list models, make keys and submit code.
+		routes: gatewayRoutes(map[string]http.HandlerFunc{
+			"GET /model/info":     gatewayFixed(200, gatewayJSON, gatewayLiteLLMModels),
+			"GET /v1/model/info":  gatewayFixed(200, gatewayJSON, gatewayLiteLLMModels),
+			"GET /key/list":       gatewayFixed(200, gatewayJSON, `{"keys":[],"total_count":0,"current_page":1,"total_pages":0}`),
+			"POST /key/generate":  gatewayLiteLLMKey,
+			"POST /config/update": gatewayFixed(200, gatewayJSON, `{"message":"Config updated successfully"}`),
+			// The submitted code is recorded with the request; the answer is the server's own time-out text.
+			"POST /guardrails/test_custom_code": gatewayFixed(200, gatewayJSON, `{"success":false,"result":null,"error":"Execution timeout: code took longer than 5 seconds","error_type":"execution"}`),
+		})},
 	8188: {server: "Python/3.12 aiohttp/3.12.15", notFound: gatewayFixed(404, "text/plain; charset=utf-8", "404: Not Found"), // ComfyUI
 		paths: map[string]http.HandlerFunc{
 			"/":                 gatewayFixed(200, gatewayHTML, gatewayComfyPage),
@@ -134,6 +162,87 @@ func gatewayOpenWebUISignup(w http.ResponseWriter, _ *http.Request) {
 	_, _ = rand.Read(sig[:])
 	token := enc([]byte(`{"alg":"HS256","typ":"JWT"}`)) + "." + enc([]byte(`{"id":"`+id+`"}`)) + "." + enc(sig[:])
 	gatewayReply(w, 200, gatewayJSON, `{"id":"`+id+`","name":"admin","role":"admin","profile_image_url":"/user.png","token":"`+token+`","token_type":"Bearer","expires_at":null,"permissions":{}}`)
+}
+
+func gatewayRoutes(routes map[string]http.HandlerFunc) *http.ServeMux {
+	mux := http.NewServeMux()
+	for pattern, h := range routes {
+		mux.HandleFunc(pattern, h)
+	}
+	return mux
+}
+
+// route returns the handler of a method-and-pattern route and its http.route label, the path of the pattern.
+// The labels must match the http.route allowlist in deploy/public-otel/config.yaml.
+func (p gatewayPersona) route(r *http.Request) (http.HandlerFunc, string) {
+	if p.routes == nil {
+		return nil, ""
+	}
+	h, pattern := p.routes.Handler(r)
+	if pattern == "" {
+		return nil, ""
+	}
+	return h.ServeHTTP, strings.TrimSuffix(pattern[strings.IndexByte(pattern, ' ')+1:], "{$}")
+}
+
+var gatewayIdentifierRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
+
+// gatewayOpenWebUICreate answers a new tool or function with its record. Open WebUI runs such code when it stores it;
+// the gateway keeps the request in the local capture and runs nothing.
+func gatewayOpenWebUICreate(function bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var form struct{ ID, Name, Content string }
+		if r.Body == nil || json.NewDecoder(r.Body).Decode(&form) != nil {
+			gatewayReply(w, 422, gatewayJSON, `{"detail":[{"type":"json_invalid","loc":["body",0],"msg":"JSON decode error","input":{},"ctx":{"error":"Expecting value"}}]}`)
+			return
+		}
+		if !gatewayIdentifierRE.MatchString(form.ID) {
+			gatewayReply(w, 400, gatewayJSON, `{"detail":"Only alphanumeric characters and underscores are allowed in the id"}`)
+			return
+		}
+		if len(form.Name) > 64 {
+			form.Name = form.ID
+		}
+		extra := `"access_control":null`
+		if function {
+			kind := "pipe" // the server names the type after the class in the code
+			if strings.Contains(form.Content, "class Filter") {
+				kind = "filter"
+			} else if strings.Contains(form.Content, "class Action") {
+				kind = "action"
+			}
+			extra = `"type":"` + kind + `","is_active":false,"is_global":false`
+		}
+		now := time.Now().Unix()
+		gatewayReply(w, 200, gatewayJSON, fmt.Sprintf(`{"id":"%s","user_id":"%s","name":%s,"meta":{"description":null,"manifest":{}},%s,"updated_at":%d,"created_at":%d}`,
+			form.ID, gatewayUUID(), gatewayQ(form.Name), extra, now, now))
+	}
+}
+
+// gatewayLiteLLMModels is the model list of the LiteLLM management API: the gateway's names behind provider prefixes.
+var gatewayLiteLLMModels = func() string {
+	entries := make([]string, len(gatewayModelList))
+	for i, m := range gatewayModelList {
+		provider := "openai/"
+		if strings.HasPrefix(m, "claude") {
+			provider = "anthropic/"
+		} else if !gatewayHostedModel(m) {
+			provider = "ollama/"
+		}
+		entries[i] = fmt.Sprintf(`{"model_name":"%s","litellm_params":{"model":"%s%s"},"model_info":{"id":"%x","db_model":false}}`, m, provider, m, sha256.Sum256([]byte(m)))
+	}
+	return `{"data":[` + strings.Join(entries, ",") + `]}`
+}()
+
+// gatewayLiteLLMKey answers a key request with a random key that opens nothing. The span records the key,
+// so a later request that presents it shows who asked for it.
+func gatewayLiteLLMKey(w http.ResponseWriter, r *http.Request) {
+	var b [16]byte
+	_, _ = rand.Read(b[:]) // never fails
+	key := "sk-" + base64.RawURLEncoding.EncodeToString(b[:])
+	trace.SpanFromContext(r.Context()).SetAttributes(attribute.String("attackbox.canary.key", key))
+	gatewayReply(w, 200, gatewayJSON, fmt.Sprintf(`{"key":"%s","key_name":"sk-...%s","expires":null,"token":"%x","user_id":null,"team_id":null,"models":[],"spend":0.0,"max_budget":null,"metadata":{},"permissions":{}}`,
+		key, key[len(key)-4:], sha256.Sum256([]byte(key))))
 }
 
 func gatewayComfyQueue(w http.ResponseWriter, _ *http.Request) {
