@@ -19,6 +19,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"time"
@@ -117,7 +118,7 @@ func localClient(raw string, selfSigned bool) (*http.Client, string, error) {
 	return &http.Client{Transport: tr, Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirects prohibited") }}, u.String(), nil
 }
 
-func execute(ctx context.Context, c *http.Client, base, run string, s scenario) result {
+func execute(ctx context.Context, c *http.Client, base, run, userAgent string, s scenario) result {
 	r := result{RunID: run, Scenario: s.name, Marker: "attackbox-synthetic-" + run + "-" + s.name, Started: time.Now().UTC(), Method: s.method, Path: s.path, RequestBytes: len(s.body), RequestSHA256: digest([]byte(s.body)), ExpectedStatus: s.status}
 	start := time.Now()
 	finish := func(err error) result {
@@ -134,10 +135,10 @@ func execute(ctx context.Context, c *http.Client, base, run string, s scenario) 
 	if err != nil {
 		return finish(err)
 	}
-	req.Header.Set("User-Agent", r.Marker)
+	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("X-Attackbox-Research-Run", run)
 	req.Header.Set("X-Attackbox-Research-Scenario", s.name)
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", userAgent+" ("+r.Marker+")")
 	if s.accept != "" {
 		req.Header.Set("Accept", s.accept)
 	}
@@ -234,6 +235,8 @@ func run(args []string, stderr io.Writer) int {
 	proxy := fs.Bool("proxy", false, "expect nginx to reject traversal and oversized requests before Go")
 	output := fs.String("output", "", "new JSONL manifest file (required)")
 	id := fs.String("run-id", "", "reproducible research label; default random")
+	commit := fs.String("commit", "", "12-hex commit; default git HEAD or run-id")
+	userAgent := fs.String("user-agent", "", "optional UA override; default attackbox-deploy-test/<commit>")
 	selfSigned := fs.Bool("self-signed", false, "permit a self-signed certificate for this loopback HTTPS client only")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -263,6 +266,17 @@ func run(args []string, stderr io.Writer) int {
 		return 2
 	}
 	defer client.CloseIdleConnections()
+	if *commit == "" {
+		out, _ := exec.Command("git", "rev-parse", "--short=12", "HEAD").Output()
+		if len(out) >= 12 && out[0] != 0 {
+			*commit = strings.TrimSpace(string(out))
+		} else {
+			*commit = *id
+		}
+	}
+	if *userAgent == "" {
+		*userAgent = "attackbox-deploy-test/" + *commit
+	}
 	out, err := os.OpenFile(*output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		fmt.Fprintln(stderr, "cannot exclusively create manifest:", err)
@@ -279,7 +293,7 @@ func run(args []string, stderr io.Writer) int {
 				s.status = http.StatusBadRequest
 			}
 		}
-		r := execute(ctx, client, base, *id, s)
+		r := execute(ctx, client, base, *id, *userAgent, s)
 		if !r.ResponseVerified {
 			failed++
 		}
@@ -294,7 +308,7 @@ func run(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "manifest close failed:", err)
 		return 1
 	}
-	fmt.Fprintf(stderr, "run_id=%s cases=%d failed=%d; logging_verified=false until independent capture and New Relic checks pass\n", *id, len(cases()), failed)
+	fmt.Fprintf(stderr, "run_id=%s cases=%d failed=%d\n", *id, len(cases()), failed)
 	if failed > 0 {
 		return 1
 	}

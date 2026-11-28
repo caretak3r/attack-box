@@ -49,7 +49,7 @@ Panels show:
 - Host security (Falco, egress blocks: reply noise vs container-initiated)
 - Test environment markers
 
-Own addresses are auto-detected. Data origin: `test` = loopback, the host's own address, or operator addresses. Deploy tests send `User-Agent: attackbox-deploy-test/<12-hex commit>`.
+Own addresses are auto-detected. Data origin: `test` = loopback, the host's own address, or operator addresses. Deploy tests send `User-Agent: attackbox-deploy-test/<12-hex commit> (attackbox-synthetic-<run>-<scenario>)`.
 
 The dashboard runs locally. It never writes to the VPS. See `docs/live-dashboard.md` for panel descriptions.
 
@@ -79,7 +79,7 @@ brew install duckdb  # macOS
 
 # Query shipper events
 duckdb -c "
-SELECT record->>'stream' as stream, 
+SELECT record->>'stream' as stream,
        record->>'action' as action,
        count(*) as count
 FROM read_json_auto('events-*.jsonl')
@@ -136,7 +136,7 @@ Records include `sensor_id` and `deployment_id` for routing. The live dashboard 
 - `test`: loopback (127.0.0.1), host's own external address, or operator addresses
 - `internet`: everything else
 
-Deploy test traffic includes `User-Agent: attackbox-deploy-test/<commit>`. The UA alone never classifies a record.
+Deploy test traffic includes `User-Agent: attackbox-deploy-test/<commit> (attackbox-synthetic-<run>-<scenario>)`. The UA alone never classifies a record.
 
 The private bait stack gets no internet traffic, so its data is test-only. The public gateway serves internet requests.
 

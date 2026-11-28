@@ -13,7 +13,7 @@ import (
 )
 
 // Sink receives log events and metrics. Calls happen on the request path, so
-// an implementation must either never block (NewRelic queues and drops) or
+// an implementation must either never block (remote sinks queue and drop) or
 // write only to a local destination whose stalls the operator accepts
 // (JSONLog writes synchronously to a file or the container log stream).
 // Neither may fail silently: drops and write errors are counted.

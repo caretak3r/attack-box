@@ -144,7 +144,7 @@ var reservedAttrs = []string{
 	"resource", "result", "probe_id", "status", "task_labels",
 	"stream", "body_sha256", "chunk_index", "chunk_count",
 	"instance", "hostname", "timestamp", "message",
-	"service.name", "entity.guid", "entity.name", "entity.type", "newrelic.source", "plugin.type",
+	"service.name", "entity.guid", "entity.name", "entity.type",
 }
 
 // baitOnlyAttrs are the bait's own provenance names. Every role but the bait

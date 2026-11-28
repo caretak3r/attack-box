@@ -29,7 +29,7 @@ The check targets the OpenAI persona. Use `-model` to select an advertised model
 | `oversized` | 413; JSON error | Exactly 1 MiB captured request prefix; incomplete manifest with `body_limit` reason |
 
 The oversized case intentionally cannot produce a complete request-body reconstruction. The client submits 1 MiB plus one byte; the service captures only the allowed 1 MiB prefix. The manifest must state this limit. A complete manifest for that request is a failure.
-Each case uses a distinct user agent, `attackbox-deploy-test-COMMIT-SCENARIO`, plus `X-Attackbox-Research-Run` and `X-Attackbox-Research-Scenario` headers. The commit is the 12-hex prefix. These labels are untrusted input. They do not authenticate traffic, exclude it from alerts, or prove its origin. Each case uses a separate responder session to avoid repeated-run probe state changing the expected response.
+Each case uses a distinct user agent, `attackbox-deploy-test/<12-hex commit> (attackbox-synthetic-<run>-<scenario>)`, plus `X-Attackbox-Research-Run` and `X-Attackbox-Research-Scenario` headers. These labels are untrusted input. They do not authenticate traffic, exclude it from alerts, or prove its origin. Each case uses a separate responder session to avoid repeated-run probe state changing the expected response.
 ## Local candidate gate
 
 Run from `/Users/rohit/attack-box`:

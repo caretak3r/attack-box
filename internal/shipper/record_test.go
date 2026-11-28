@@ -180,7 +180,7 @@ func TestAdmitMetrics(t *testing.T) {
 func TestAdmitForgedIdentity(t *testing.T) {
 	in := ev(telemetry.Event{Stream: telemetry.StreamEdge, Attrs: map[string]any{
 		"source": "runtime", "record_id": "x", "boot": "b", "seq": "1", "instance": "other",
-		"Service.Name": "x", "entity.guid": "g", "hostname": "h", "newrelic.source": "s",
+		"Service.Name": "x", "entity.guid": "g", "hostname": "h",
 		"timestamp": 1.0, "message": "m", "attrs_truncated": false, "kept": "yes",
 	}})
 	a, err := Admit(RoleBait, line(t, in), admitNow)
@@ -536,7 +536,7 @@ func TestAdmitExpandedBound(t *testing.T) {
 }
 
 func TestAdmitItemBound(t *testing.T) {
-	// HTML-escaped characters grow six-fold in the New Relic item, so raw
+	// HTML-escaped characters grow six-fold when stored remotely, so raw
 	// attr bytes within their cap can still make one chunk too large.
 	attrs := map[string]any{}
 	for i := range 30 {

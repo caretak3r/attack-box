@@ -128,7 +128,7 @@ test_public_gateway_restore() (
     }
     awk '/^restore_public_gateway\(\) \{/ {copy=1} copy {print} copy && /^}$/ {exit}' "$DEPLOY_SCRIPT" > "$tmp/function"
     source "$tmp/function"
-    
+
     restore_public_gateway || return 1
     [[ "$(cat "$tmp/calls")" == $'stop attackbox-public-otel.service\nstart attackbox-public.service' ]] || return 1
     fail='start attackbox-public.service'
@@ -191,7 +191,7 @@ test_newrelic_migration() (
     local tmp MODE=apply
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
-    
+
     # Mock functions
     log() { :; }
     ok() { :; }
@@ -209,7 +209,7 @@ test_newrelic_migration() (
     grep() { command grep "$@"; }
     cat() { command cat "$@"; }
     rm() { command rm "$@"; }
-    
+
     # Create fixture NR files
     mkdir -p "$tmp/etc/newrelic-infra" "$tmp/etc/systemd/system/newrelic-infra.service.d" \
         "$tmp/etc/apt/sources.list.d" "$tmp/etc/apt/trusted.gpg.d" \
@@ -219,23 +219,23 @@ test_newrelic_migration() (
         "$tmp/etc/apt/sources.list.d/newrelic-infra.list" \
         "$tmp/etc/apt/trusted.gpg.d/newrelic-infra.gpg" \
         "$tmp/etc/attackbox/otel-license.key" "$tmp/etc/attackbox-public-otel/license.key"
-    
+
     # Create shipper.env with NR line and kept line
     cat > "$tmp/etc/attackbox/shipper.env" <<'ENV'
 ATTACKBOX_CAMPAIGN_ID=test-campaign
 ATTACKBOX_NR_LICENSE_KEY=0123456789abcdef0123456789abcdef01234567
 ATTACKBOX_HOST_ID=test-host
 ENV
-    
+
     # Redirect paths in function
     local old_root="$tmp"
     awk '/^remove_newrelic_migration\(\) \{/,/^}$/' "$DEPLOY_SCRIPT" | \
         sed "s|/etc/|$tmp/etc/|g; s|/usr/|$tmp/usr/|g" > "$tmp/function"
     source "$tmp/function"
-    
+
     # First run - should remove everything
     remove_newrelic_migration
-    
+
     # Verify NR files removed
     [[ ! -e "$tmp/etc/newrelic-infra.yml" ]] || return 1
     [[ ! -e "$tmp/etc/newrelic-infra" ]] || return 1
@@ -244,16 +244,16 @@ ENV
     [[ ! -e "$tmp/etc/apt/trusted.gpg.d/newrelic-infra.gpg" ]] || return 1
     [[ ! -e "$tmp/etc/attackbox/otel-license.key" ]] || return 1
     [[ ! -e "$tmp/etc/attackbox-public-otel/license.key" ]] || return 1
-    
+
     # Verify NR line removed from shipper.env but kept lines remain
     [[ -f "$tmp/etc/attackbox/shipper.env" ]] || return 1
     grep -q 'ATTACKBOX_CAMPAIGN_ID=test-campaign' "$tmp/etc/attackbox/shipper.env" || return 1
     grep -q 'ATTACKBOX_HOST_ID=test-host' "$tmp/etc/attackbox/shipper.env" || return 1
     ! grep -q 'ATTACKBOX_NR_LICENSE_KEY' "$tmp/etc/attackbox/shipper.env" || return 1
-    
+
     # Second run - should be no-op and exit 0
     remove_newrelic_migration
-    
+
     rm -rf "$tmp"
 )
 

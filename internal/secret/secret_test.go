@@ -229,7 +229,7 @@ func TestScrubFingerprintContract(t *testing.T) {
 
 func TestIsCredentialName(t *testing.T) {
 	for _, n := range []string{"Authorization", "X-Auth", "X-Authorization", "Authentication", "X-Credential",
-		"api_key", "X-Refresh-Token", "client_secret", "session-id", "password", "NR_LICENSE_KEY",
+		"api_key", "X-Refresh-Token", "client_secret", "session-id", "password", "LICENSE_KEY",
 		"accessToken", "clientSecret", "APIKey", "XApiKey", `password`, "access%5Ftoken", "api+key"} {
 		if !IsCredentialName(n) {
 			t.Errorf("%q should be a credential name", n)

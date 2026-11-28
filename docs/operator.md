@@ -74,15 +74,15 @@ bash /Users/rohit/attack-box/scripts/test-deploy-ubuntu.sh
 
 The deployment tests are static checks. They do not prove runtime containment. The official-client harness is `/Users/rohit/attack-box/scripts/client_matrix.py`; retain its documented dependencies and interpreter rather than replacing the runtime.
 
-For a local, loopback-only bait with remote telemetry disabled:
+For a local, loopback-only bait:
 
 ```bash
 cd /Users/rohit/attack-box
-ATTACKBOX_NR_DISABLED=true go run /Users/rohit/attack-box/cmd/attackbox -check-config
-ATTACKBOX_NR_DISABLED=true go run /Users/rohit/attack-box/cmd/attackbox
+go run /Users/rohit/attack-box/cmd/attackbox -check-config
+go run /Users/rohit/attack-box/cmd/attackbox
 ```
 
-These examples assume no conflicting `ATTACKBOX_NR_LICENSE_KEY` or `ATTACKBOX_SPOOL_SOCKET` is inherited. Local output can contain hostile text; use synthetic requests during development.
+This example assumes no conflicting `ATTACKBOX_SPOOL_SOCKET` is inherited. Local output can contain hostile text; use synthetic requests during development.
 
 ## Bait command and configuration
 
@@ -107,7 +107,6 @@ Unset or blank settings use defaults. All bait integer limits are positive. All 
 | `ATTACKBOX_MODELS` | Server defaults: `qwen3:8b,gpt-oss:20b,llama3.1:8b` | Comma-separated names, each at most 128 bytes; no spaces/control characters within a name |
 | `ATTACKBOX_TRUSTED_PROXIES` | Empty | Comma-separated IPs or CIDRs; forwarding headers are trusted only from those peers |
 | `ATTACKBOX_SECRET_FILE` | Empty: random process key | Regular file, 32–4096 bytes, no group/other permission bits; stable file needed for stable derived keys |
-| `ATTACKBOX_NR_DISABLED` | `false` | Explicit local-only telemetry mode |
 | `ATTACKBOX_SPOOL_SOCKET` | Empty | Enables host spool mode; absolute Unix path, at most 107 bytes, no NUL |
 | `ATTACKBOX_SPOOL_QUEUE` | `10000` | 1–100000 queued records; separate fixed byte ceiling also applies |
 | `ATTACKBOX_SPOOL_TIMEOUT` | `5s` | Per-record socket write timeout |

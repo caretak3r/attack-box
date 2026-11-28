@@ -580,7 +580,7 @@ func (p *spoolPeer) records(t *testing.T) []telemetry.Record {
 	return out
 }
 
-// TestSpoolMode runs the bait in the spool deployment: no New Relic key, a
+// TestSpoolMode runs the bait in the spool deployment: no cloud provider key, a
 // fake host shipper on a unix socket. Edge, probe and metric records and the
 // stop/stopped events must reach the socket before it closes, and the local
 // log must keep the authoritative stopped record with the spool counters.

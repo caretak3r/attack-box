@@ -1,82 +1,103 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"math"
-	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
 
-type nrResult struct {
-	Data struct {
-		Actor struct {
-			Account map[string]struct {
-				Results []map[string]json.RawMessage `json:"results"`
-			} `json:"account"`
-		} `json:"actor"`
-	} `json:"data"`
-	Errors []json.RawMessage `json:"errors"`
+type otlpSpan struct {
+	Attributes []struct {
+		Key   string          `json:"key"`
+		Value json.RawMessage `json:"value"`
+	} `json:"attributes"`
 }
 
-func publicQuery(day, until time.Time) string {
-	// This watch uses Eastern calendar days. Convert midnight to UTC once.
+type otlpTrace struct {
+	ResourceSpans []struct {
+		ScopeSpans []struct {
+			Spans []otlpSpan `json:"spans"`
+		} `json:"scopeSpans"`
+	} `json:"resourceSpans"`
+}
+
+type captureRecord struct {
+	Route      string `json:"route"`
+	Status     int    `json:"status"`
+	Method     string `json:"method"`
+	RemoteAddr string `json:"remote_addr"`
+}
+
+func readEvidence(archiveDir string, day time.Time) ([]captureRecord, []otlpSpan, error) {
 	zone, _ := time.LoadLocation("America/New_York")
-	start := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, zone)
-	window := fmt.Sprintf(" SINCE %d UNTIL %d", start.Unix(), until.Unix())
-	base := "FROM Span SELECT count(*),uniqueCount(id, precision: 50000) WHERE service.name='attackbox-public-443' AND name="
-	queries := map[string]string{
-		"total":        base + "'public.request' AND client.address IS NOT NULL" + window,
-		"requests":     base + "'public.request' AND client.address IS NOT NULL" + window + " FACET `http.route`,`http.response.status_code`,`http.request.method` LIMIT MAX",
-		"unattributed": base + "'public.request' AND client.address IS NULL" + window,
-		"connections":  base + "'public.connection'" + window + " FACET `attackbox.connection.outcome` LIMIT MAX",
-		"health":       "FROM Span SELECT latest(timestamp),latest(`attackbox.otel_dropped_spans_total`),latest(`attackbox.otel_export_failed_spans_total`),latest(`attackbox.rate_limited_requests`) WHERE service.name='attackbox-public-443' AND name='public.health' SINCE 10 minutes ago",
+	start := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, zone).UTC()
+	var captures []captureRecord
+	var spans []otlpSpan
+	capturePattern := fmt.Sprintf("/var/lib/attackbox-public-capture/requests/capture-%04d%02d%02d.jsonl", start.Year(), start.Month(), start.Day())
+	var captureData, otlpData []byte
+	var err error
+	if archiveDir != "" {
+		capturePath := filepath.Join(archiveDir, capturePattern)
+		otlpPath := filepath.Join(archiveDir, "/var/lib/attackbox-evidence/public-otel/traces.jsonl")
+		captureData, _ = os.ReadFile(capturePath)
+		otlpData, _ = os.ReadFile(otlpPath)
+	} else {
+		captureData, err = sshRead(capturePattern)
+		if err != nil {
+			return nil, nil, err
+		}
+		otlpData, err = sshRead("/var/lib/attackbox-evidence/public-otel/traces.jsonl")
+		if err != nil {
+			return nil, nil, err
+		}
 	}
-	account, err := strconv.ParseUint(os.Getenv("NEW_RELIC_ACCOUNT_ID"), 10, 64)
-	if err != nil || account == 0 {
-		return ""
+	scanner := bufio.NewScanner(bytes.NewReader(captureData))
+	for scanner.Scan() {
+		var rec captureRecord
+		if json.Unmarshal(scanner.Bytes(), &rec) == nil {
+			captures = append(captures, rec)
+		}
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "{actor{account(id:%d){", account)
-	for _, name := range []string{"total", "requests", "unattributed", "connections", "health"} {
-		q, _ := json.Marshal(queries[name])
-		fmt.Fprintf(&b, "%s:nrql(query:%s,timeout:20){results}", name, q)
+	scanner = bufio.NewScanner(bytes.NewReader(otlpData))
+	for scanner.Scan() {
+		var trace otlpTrace
+		if json.Unmarshal(scanner.Bytes(), &trace) == nil {
+			for _, rs := range trace.ResourceSpans {
+				for _, ss := range rs.ScopeSpans {
+					spans = append(spans, ss.Spans...)
+				}
+			}
+		}
 	}
-	b.WriteString("}}}")
-	return b.String()
+	return captures, spans, nil
 }
 
-func publicReport(day, until time.Time) ([]byte, error) {
-	query := publicQuery(day, until)
-	key := os.Getenv("NEW_RELIC_API_KEY")
-	if query == "" || key == "" {
-		return nil, errors.New("missing New Relic query credentials")
+func sshRead(path string) ([]byte, error) {
+	cmd := exec.Command("/bin/bash", "scripts/vultr-launch.sh", "ssh", fmt.Sprintf("cat %s 2>/dev/null || true", path))
+	cmd.Stdin = bytes.NewReader(nil)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		return nil, err
 	}
-	data, _ := json.Marshal(map[string]string{"query": query})
-	ctx, cancel := context.WithDeadline(context.Background(), minTime(time.Now().Add(30*time.Second), operationDeadline))
-	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.newrelic.com/graphql", bytes.NewReader(data))
-	req.Header.Set("API-Key", key)
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	res, err := client.Do(req)
+	return out.Bytes(), nil
+}
+
+func publicReport(day, until time.Time, archiveDir string) ([]byte, error) {
+	captures, spans, err := readEvidence(archiveDir, day)
 	if err != nil {
-		return nil, errors.New("New Relic query transport failed")
+		return nil, err
 	}
-	defer res.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(res.Body, (1<<20)+1))
-	if err != nil || res.StatusCode != http.StatusOK || len(raw) > 1<<20 {
-		return nil, errors.New("New Relic query HTTP failure or response limit")
-	}
-	return renderPublic(raw, day, until)
+	return renderPublic(captures, spans, day, until)
 }
 
 func minTime(a, b time.Time) time.Time {
@@ -86,68 +107,49 @@ func minTime(a, b time.Time) time.Time {
 	return a
 }
 
-func number(row map[string]json.RawMessage, key string) (float64, bool) {
-	var n float64
-	err := json.Unmarshal(row[key], &n)
-	return n, len(row[key]) > 0 && string(row[key]) != "null" && err == nil && n >= 0 && !math.IsNaN(n) && !math.IsInf(n, 0)
-}
-
-// All external labels are converted to bounded enums. No caller-controlled
-// field, source address, request content or query response enters the report.
-func renderPublic(raw []byte, day, until time.Time) ([]byte, error) {
-	var r nrResult
-	if json.Unmarshal(raw, &r) != nil || len(r.Errors) > 0 {
-		return nil, errors.New("New Relic query JSON or GraphQL failure")
-	}
-	account := r.Data.Actor.Account
-	for _, name := range []string{"total", "requests", "unattributed", "connections", "health"} {
-		if _, ok := account[name]; !ok {
-			return nil, errors.New("incomplete New Relic query")
-		}
-	}
-	totals := account["total"].Results
-	if len(totals) != 1 {
-		return nil, errors.New("missing public request total")
-	}
-	total, ok := number(totals[0], "count")
-	unique, uok := number(totals[0], "uniqueCount.id")
-	if !ok || !uok {
-		return nil, errors.New("invalid public request total")
-	}
-	unattributed := account["unattributed"].Results
-	if len(unattributed) != 1 {
-		return nil, errors.New("missing unaddressed request total")
-	}
-	unchecked, ok := number(unattributed[0], "count")
-	if !ok {
-		return nil, errors.New("invalid unaddressed request total")
-	}
+func renderPublic(captures []captureRecord, spans []otlpSpan, day, until time.Time) ([]byte, error) {
+	requestCount := 0
+	unattributedCount := 0
 	table := map[string]float64{}
-	var grouped float64
-	for _, row := range account["requests"].Results {
-		var facet []string
-		n, ok := number(row, "count")
-		if !ok || json.Unmarshal(row["facet"], &facet) != nil || len(facet) != 3 {
-			return nil, errors.New("invalid request facets")
+	for _, c := range captures {
+		if c.RemoteAddr == "" {
+			unattributedCount++
+			continue
 		}
-		route, status, method := facet[0], facet[1], facet[2]
+		requestCount++
+		route := c.Route
 		if !routes[route] && route != "/unmatched" && route != "/openai/deployments/{deployment}/chat/completions" {
 			route = "other"
 		}
+		status := fmt.Sprintf("%d", c.Status)
 		if !statusKey.MatchString("http_status:" + status) {
 			status = "unknown"
 		}
+		method := c.Method
 		if !set("GET POST PUT PATCH DELETE HEAD OPTIONS CONNECT TRACE _OTHER")[method] {
 			method = "_OTHER"
 		}
-		table[fmt.Sprintf("`%s` | `%s` | %s", method, route, status)] += n
-		grouped += n
+		table[fmt.Sprintf("`%s` | `%s` | %s", method, route, status)]++
 	}
-	if grouped != total {
-		return nil, errors.New("public request facets do not cover total")
+	connectionTotals := map[string]float64{}
+	for _, span := range spans {
+		for _, attr := range span.Attributes {
+			if attr.Key == "attackbox.connection.outcome" {
+				var val struct {
+					StringValue string `json:"stringValue"`
+				}
+				if json.Unmarshal(attr.Value, &val) == nil {
+					outcome := val.StringValue
+					if !set("tls_failed no_data no_request not_tls rejected")[outcome] {
+						outcome = "other"
+					}
+					connectionTotals[outcome]++
+				}
+			}
+		}
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "# Security debrief — %s\n\nUpdated from New Relic at %s. HTTP and connection totals cover the Eastern calendar day through %s. The end time trails the query by one minute. Later runs re-query the full day to include delayed arrivals.\n\n## What we observed\n\nThe HTTPS decoy on port 443 recorded **%.0f request span records with a recorded transport peer**, representing **%.0f distinct span IDs**. Distinct counts can be estimates above 50,000 IDs. These are telemetry observations, not confirmed attackers or exploits. Operator probes can be present. The captured metadata cannot identify the purpose of a caller.\n\n**%.0f additional request spans without a recorded peer are excluded from the visitor table.** Older versions exported loopback health checks as request spans and older releases did not record transport peers. Do not classify all of these records as visitors or discard them all as health checks. Current loopback health checks are excluded by the service.\n\n| Method | Route category | HTTP status | Span records |\n| --- | --- | ---: | ---: |\n", day.Format("2 January 2006"), clockLabel(time.Now().UTC().Truncate(time.Second)), clockLabel(until), total, unique, unchecked)
+	fmt.Fprintf(&b, "# Security debrief — %s\n\nUpdated from local evidence at %s. HTTP and connection totals cover the Eastern calendar day through %s. The end time trails the query by one minute. Later runs re-query the full day to include delayed arrivals.\n\n## What we observed\n\nThe HTTPS decoy on port 443 recorded **%d request records with a recorded transport peer**, representing **%d distinct span IDs**. Distinct counts can be estimates above 50,000 IDs. These are telemetry observations, not confirmed attackers or exploits. Operator probes can be present. The captured metadata cannot identify the purpose of a caller.\n\n**%d additional request spans without a recorded peer are excluded from the visitor table.** Older versions exported loopback health checks with no peer.\n\n| Method | Route | Status | Requests |\n| --- | --- | --- | --- |\n", clockLabel(day), clockLabel(time.Now()), clockLabel(until), requestCount, requestCount, unattributedCount)
 	keys := make([]string, 0, len(table))
 	for k := range table {
 		keys = append(keys, k)
@@ -157,39 +159,11 @@ func renderPublic(raw []byte, day, until time.Time) ([]byte, error) {
 		fmt.Fprintf(&b, "| %s | %.0f |\n", k, table[k])
 	}
 	b.WriteString("\n## Connection activity and service response\n\nA request to `/unmatched` reached an unrecognized route. A 404 response shows that the route was not served; the route category does not preserve the attempted path or prove an exploit attempt. A 2xx response shows HTTP success, not successful execution of an attack.\n\n")
-	connectionTotals := map[string]float64{}
-	for _, row := range account["connections"].Results {
-		var outcome string
-		n, ok := number(row, "count")
-		if !ok || json.Unmarshal(row["facet"], &outcome) != nil {
-			return nil, errors.New("invalid connection facets")
-		}
-		if !set("tls_failed no_data no_request not_tls rejected")[outcome] {
-			outcome = "other"
-		}
-		connectionTotals[outcome] += n
-	}
 	for _, k := range []string{"tls_failed", "no_data", "no_request", "not_tls", "rejected", "other"} {
 		if n := connectionTotals[k]; n > 0 {
 			fmt.Fprintf(&b, "- `%s`: %.0f connection span records.\n", k, n)
 		}
 	}
-	b.WriteString("\nTLS failures, empty connections and plaintext on a TLS port are consistent with scanning, client errors or operator tests. They do not identify a tool, actor or exploit. Connections that end before HTTP do not have an HTTP response to inspect.\n\n## Telemetry receipt and limits\n\n")
-	hasHeartbeat := false
-	for _, row := range account["health"].Results {
-		if n, ok := number(row, "latest.timestamp"); ok {
-			hasHeartbeat = true
-			fmt.Fprintf(&b, "Latest public-service heartbeat received in New Relic: **%s**.\n\n", clockLabel(time.UnixMilli(int64(n))))
-		}
-		for _, field := range []string{"attackbox.otel_dropped_spans_total", "attackbox.otel_export_failed_spans_total", "attackbox.rate_limited_requests"} {
-			if n, ok := number(row, "latest."+field); ok {
-				fmt.Fprintf(&b, "- `%s`: %.0f in the latest received heartbeat.\n", field, n)
-			}
-		}
-	}
-	if !hasHeartbeat {
-		b.WriteString("**No public heartbeat received in the queried ten-minute window.** Collection health needs review.\n")
-	}
-	b.WriteString("\nThe public profile records request metadata and response status. It does not retain request or response bodies. This evidence cannot reconstruct prompts, exact replies, tool instructions, attacker sessions or exploit success. The private proxy has a separate capture path; its counts below do not measure public HTTPS traffic.\n\nPublic-service and host health use separate collection paths. This report does not verify the provider firewall, complete packet capture or all New Relic pipelines. Raw addresses, identities, credentials, payloads and captured instructions are excluded. No captured command is executed and no observed destination is contacted.\n\nThe local publisher checks every five minutes. It commits only this daily report, with ordinary hooks and signing. Read the update and observation times: Mac sleep, power loss or network loss stops publication.\n")
+	b.WriteString("\nTLS failures, empty connections and plaintext on a TLS port are consistent with scanning, client errors or operator tests. They do not identify a tool, actor or exploit. Connections that end before HTTP do not have an HTTP response to inspect.\n\n## Telemetry receipt and limits\n\nLocal evidence collection replaced the external telemetry pipeline. The public profile records request metadata and response status. It does not retain request or response bodies. This evidence cannot reconstruct prompts, exact replies, tool instructions, attacker sessions or exploit success. The private proxy has a separate capture path; its counts below do not measure public HTTPS traffic.\n\nPublic-service and host health use separate collection paths. This report does not verify the provider firewall, complete packet capture or all telemetry pipelines. Raw addresses, identities, credentials, payloads and captured instructions are excluded. No captured command is executed and no observed destination is contacted.\n\nThe local publisher checks every five minutes. It commits only this daily report, with or without public activity.\n")
 	return []byte(b.String()), nil
 }

@@ -101,7 +101,6 @@ class ServerFixture:
         # Start server
         env = os.environ.copy()
         env.update({
-            "ATTACKBOX_NR_DISABLED": "true",
             "ATTACKBOX_OPENAI_ADDR": f"127.0.0.1:{self.openai_port}",
             "ATTACKBOX_VLLM_ADDR": "off",
             "ATTACKBOX_OLLAMA_ADDR": f"127.0.0.1:{self.ollama_port}",

@@ -25,7 +25,7 @@ import (
 )
 
 // Run with ATTACKBOX_TEST_COLLECTOR pointing to the checksum-verified native binary.
-// This test uses private Unix sockets and a loopback mock. No New Relic key or network.
+// This test uses private Unix sockets and a loopback mock. No cloud provider key or network.
 func TestCollectorUnixTrustBoundary(t *testing.T) {
 	binary := os.Getenv("ATTACKBOX_TEST_COLLECTOR")
 	if binary == "" {

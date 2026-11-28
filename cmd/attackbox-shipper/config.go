@@ -78,7 +78,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 		c.hostname = "attackbox"
 	}
 
-	// ATTACKBOX_SENSOR_ID names this sensor on every New Relic log and metric.
+	// ATTACKBOX_SENSOR_ID names this sensor on every log and metric record.
 	// Rule: idRule. Default: the host name above in lower case, or "attackbox"
 	// when that does not match the rule. A set value that breaks the rule is a
 	// configuration error.

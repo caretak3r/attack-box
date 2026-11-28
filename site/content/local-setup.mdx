@@ -12,12 +12,11 @@ Use Go 1.26 or later and `curl`. Run the commands from the repository root. This
    go test ./...
    ```
 
-2. Start the bait with a clean environment. This binds the OpenAI persona to loopback and disables remote telemetry.
+2. Start the bait with a clean environment. This binds the OpenAI persona to loopback.
 
-   ```bash filename="Terminal 1" {2-3}
+   ```bash filename="Terminal 1" {2}
    env -i PATH="$PATH" HOME="$HOME" \
-     ATTACKBOX_OPENAI_ADDR=127.0.0.1:18080 \
-     ATTACKBOX_NR_DISABLED=true go run ./cmd/attackbox
+     ATTACKBOX_OPENAI_ADDR=127.0.0.1:18080 go run ./cmd/attackbox
    ```
 
 3. After the server starts, run the health request from a second terminal.

@@ -29,7 +29,7 @@ class IdentityContract(unittest.TestCase):
             module.parse_identities(self.text(**{key: "x" * 63}))
 
     def test_duplicate_or_unknown(self):
-        for extra in ("ATTACKBOX_HOST_ID=x\n", "ATTACKBOX_NR_LICENSE_KEY=secret\n"):
+        for extra in ("ATTACKBOX_HOST_ID=x\n", "ATTACKBOX_LICENSE_KEY=secret\n"):
             with self.assertRaises(ValueError):
                 module.parse_identities(self.text() + extra)
 

@@ -106,7 +106,7 @@ type SpoolStats struct {
 }
 
 // Spool is the bait-side Sink for the spool deployment: it streams Records to
-// the host shipper and never holds a New Relic key. Calls never block. One
+// the host shipper and never holds a cloud provider key. Calls never block. One
 // writer goroutine owns the connection; a batch it has taken from the queue
 // stays in its memory budget until a write of the whole batch succeeds, and
 // is written again after a redial, so a reconnect can duplicate records. A
@@ -266,7 +266,7 @@ func (s *Spool) Gauge(name string, value float64, attrs map[string]string) {
 
 func (s *Spool) metric(kind, name string, value float64, attrs map[string]string) {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
-		return // JSONLog and NewRelic skip these too
+		return // JSONLog and remote sinks skip these too
 	}
 	s.put("metric", MetricRecord{Name: name, Kind: kind, Value: value, At: s.cfg.Now(), Attrs: SafeLabels(attrs)}, false)
 }

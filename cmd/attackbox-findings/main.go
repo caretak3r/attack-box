@@ -258,12 +258,12 @@ func publish(dir string, content []byte) error {
 func run() error {
 	source := flag.String("source", "", "absolute private watch directory")
 	checkout := flag.String("checkout", "", "absolute isolated findings-only checkout")
+	archiveDir := flag.String("archive", "", "absolute evidence archive directory for local reads")
 	deadlineText := flag.String("deadline", "2026-11-24T11:00:00Z", "stop retrying at this UTC deadline")
 	once := flag.Bool("once", false, "publish once and exit")
-	mainDate := flag.String("main-date", "", "publish this YYYY-MM-DD debrief to main; requires NEW_RELIC_API_KEY and NEW_RELIC_ACCOUNT_ID")
-	flag.Parse()
+	mainDate := flag.String("main-date", "", "publish this YYYY-MM-DD debrief to main")
 	if *mainDate != "" {
-		return runMain(*source, *checkout, *deadlineText, *mainDate, *once)
+		return runMain(*source, *checkout, *deadlineText, *mainDate, *archiveDir, *once)
 	}
 	deadline, err := time.Parse(time.RFC3339, *deadlineText)
 	if err != nil || !filepath.IsAbs(*source) || !filepath.IsAbs(*checkout) || (!*once && (time.Until(deadline) <= 0 || time.Until(deadline) > 12*time.Hour)) {

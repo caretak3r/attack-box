@@ -85,7 +85,7 @@ func publishMain(dir, target, expectedOrigin string, content []byte) error {
 	return err
 }
 
-func runMain(source, checkout, deadlineText, date string, once bool) error {
+func runMain(source, checkout, deadlineText, date, archiveDir string, once bool) error {
 	day, err := time.Parse("2006-01-02", date)
 	deadline, e := time.Parse(time.RFC3339, deadlineText)
 	if err != nil || e != nil || !filepath.IsAbs(source) || !filepath.IsAbs(checkout) || time.Until(deadline) <= 0 || time.Until(deadline) > 12*time.Hour {
@@ -126,7 +126,7 @@ func runMain(source, checkout, deadlineText, date string, once bool) error {
 			done = !time.Now().Before(last.Until.Add(2 * time.Minute))
 		}
 		if err == nil {
-			public, err = publicReport(day, time.Now().UTC().Add(-time.Minute))
+			public, err = publicReport(day, time.Now().UTC().Add(-time.Minute), archiveDir)
 		}
 		if err == nil {
 			content := append(public, []byte("\n---\n\n<details>\n<summary>Host and private-proxy evidence</summary>\n\n")...)

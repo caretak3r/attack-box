@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -127,7 +128,7 @@ func TestScenariosRealServerEvidence(t *testing.T) {
 		}
 		found := false
 		for _, e := range events {
-			if e.RequestID == r.LogRequestID && e.Action != "capture" && e.UserAgent == r.Marker {
+			if e.RequestID == r.LogRequestID && e.Action != "capture" && strings.Contains(e.UserAgent, r.Marker) {
 				found = true
 			}
 		}
@@ -136,7 +137,7 @@ func TestScenariosRealServerEvidence(t *testing.T) {
 		}
 		results = append(results, r)
 	}
-	// Optional artifacts are local candidate evidence, never New Relic receipts.
+	// Optional artifacts are local candidate evidence.
 	if dir := os.Getenv("ATTACKBOX_SCENARIO_TEST_REPORT_DIR"); dir != "" {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			t.Fatal(err)
@@ -198,7 +199,7 @@ func TestRedirectAndResponseBounds(t *testing.T) {
 	defer redirect.Close()
 	c, base, _ := localClient(redirect.URL, false)
 	defer c.CloseIdleConnections()
-	r := execute(context.Background(), c, base, "test", cases()[0])
+	r := execute(context.Background(), c, base, "test", "test-ua", cases()[0])
 	if r.Error == "" || r.ResponseVerified || followed.Load() != 0 {
 		t.Fatalf("redirect followed: %+v", r)
 	}
@@ -209,13 +210,13 @@ func TestRedirectAndResponseBounds(t *testing.T) {
 	defer huge.Close()
 	c2, base2, _ := localClient(huge.URL, false)
 	defer c2.CloseIdleConnections()
-	r = execute(context.Background(), c2, base2, "test", cases()[0])
+	r = execute(context.Background(), c2, base2, "test", "test-ua", cases()[0])
 	if r.ResponseComplete || r.ResponseVerified || r.ResponseBytes != maxResponse+1 || r.Error == "" {
 		t.Fatalf("response limit failed: %+v", r)
 	}
 	s := cases()[0]
 	s.body = strings.Repeat("X", maxRequest+1)
-	if r = execute(context.Background(), c2, base2, "test", s); r.Error == "" || r.Status != 0 {
+	if r = execute(context.Background(), c2, base2, "test", "test-ua", s); r.Error == "" || r.Status != 0 {
 		t.Fatal("request limit failed")
 	}
 }
@@ -228,7 +229,7 @@ func TestSelfSignedAndManifestSafety(t *testing.T) {
 	defer srv.Close()
 	c, base, _ := localClient(srv.URL, true)
 	defer c.CloseIdleConnections()
-	if r := execute(context.Background(), c, base, "tls", cases()[0]); !r.ResponseVerified {
+	if r := execute(context.Background(), c, base, "tls", "test-ua", cases()[0]); !r.ResponseVerified {
 		t.Fatalf("loopback self-signed: %+v", r)
 	}
 	path := filepath.Join(t.TempDir(), "manifest.jsonl")
@@ -270,11 +271,38 @@ func TestProxyRejectionRequiresEdgeEnvelope(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		r := execute(context.Background(), client, base, "edge", scenario{name: "oversized", method: "POST", path: "/v1/chat/completions", status: 413, proxyReject: true})
+		r := execute(context.Background(), client, base, "edge", "test-ua", scenario{name: "oversized", method: "POST", path: "/v1/chat/completions", status: 413, proxyReject: true})
 		client.CloseIdleConnections()
 		srv.Close()
 		if r.ResponseVerified != (backendID == "") || r.LoggingVerified {
 			t.Fatalf("edge rejection misclassified: %+v", r)
+		}
+	}
+}
+
+func TestUserAgentOnWire(t *testing.T) {
+	var mu sync.Mutex
+	uas := []string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		uas = append(uas, r.Header.Get("User-Agent"))
+		mu.Unlock()
+		w.Header().Set("X-Request-Id", "req_0123456789abcdef0123456789abcdef")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		fmt.Fprintf(w, `{"data":[]}`)
+	}))
+	defer srv.Close()
+	manifest := filepath.Join(t.TempDir(), "manifest.jsonl")
+	_ = run([]string{"-target", srv.URL, "-model", "test", "-output", manifest, "-run-id", "test", "-commit", "abc123def456"}, io.Discard)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(uas) == 0 {
+		t.Fatal("no requests received")
+	}
+	for _, ua := range uas {
+		if !strings.HasPrefix(ua, "attackbox-deploy-test/abc123def456 (attackbox-synthetic-") {
+			t.Fatalf("got User-Agent %q, want attackbox-deploy-test/abc123def456 (attackbox-synthetic-...)", ua)
 		}
 	}
 }

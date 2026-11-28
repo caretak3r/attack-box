@@ -34,8 +34,7 @@ Install Go 1.26 or later and `curl`. Run these commands from the repository root
 ```bash
 go test ./...
 env -i PATH="$PATH" HOME="$HOME" \
-  ATTACKBOX_OPENAI_ADDR=127.0.0.1:18080 \
-  ATTACKBOX_NR_DISABLED=true go run ./cmd/attackbox
+  ATTACKBOX_OPENAI_ADDR=127.0.0.1:18080 go run ./cmd/attackbox
 ```
 
 After the server starts, run the health request in a second terminal:

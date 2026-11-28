@@ -23,7 +23,7 @@ import (
 
 // Queue is the shipper's bounded disk queue. Every record goes to disk
 // before delivery, and the checkpoint moves only when the caller acknowledges
-// a contiguous prefix of what it read, so a crash or a New Relic outage never
+// a contiguous prefix of what it read, so a crash or a downstream outage never
 // skips a record.
 //
 // On-disk layout, all inside one directory that only the shipper uid can

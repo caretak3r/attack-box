@@ -151,7 +151,7 @@ exporters:
       max_backups: 60
 
 extensions:
-  # Process health only. It does not prove export or New Relic ingestion.
+  # Process health only. It does not prove export or remote ingestion.
   health_check:
     endpoint: 127.0.0.1:13133
     path: /

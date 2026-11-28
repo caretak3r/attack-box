@@ -1,5 +1,5 @@
-// Command attackbox-evidence reconstructs one complete capture from a local
-// New Relic NDJSON/JSON-array export. Hashes verify consistency, not provenance.
+// Command attackbox-evidence reconstructs one complete capture from local
+// shipper evidence JSONL. Hashes verify consistency, not provenance.
 package main
 
 import (
@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 )
 
@@ -24,17 +23,14 @@ const (
 	maxParts  = 32768
 )
 
-type fields map[string]json.RawMessage
 type metadata struct {
 	kind, target, hash, reason      string
 	segment, offset, size, segments int
 	complete                        bool
 }
 type record struct {
-	meta   metadata
-	hash   string
-	count  int
-	chunks map[int]string
+	meta metadata
+	data []byte
 }
 type segment struct {
 	offset int
@@ -46,7 +42,7 @@ func main() { os.Exit(run(os.Args[1:], os.Stdin, os.Stderr)) }
 func run(args []string, stdin io.Reader, stderr io.Writer) int {
 	fs := flag.NewFlagSet("attackbox-evidence", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	input := fs.String("input", "-", "local NDJSON or JSON array; - reads stdin (64 MiB maximum)")
+	input := fs.String("input", "-", "local JSONL; - reads stdin (64 MiB maximum)")
 	output := fs.String("output", "", "new output file, exclusively created with mode 0600")
 	request := fs.String("request-id", "", "required exact server-assigned request ID")
 	kind := fs.String("kind", "", "request_body, response_body, request_metadata, response_metadata, or request_trailers")
@@ -96,74 +92,6 @@ func writeOutput(path string, data []byte) error {
 
 func digest(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 
-// Parse only a bounded record at a time. Unknown nested values stay raw JSON.
-// Reject duplicate field names instead of choosing one ambiguous interpretation.
-func object(raw []byte) (fields, error) {
-	d := json.NewDecoder(bytes.NewReader(raw))
-	t, err := d.Token()
-	if err != nil || t != json.Delim('{') {
-		return nil, errors.New("expected JSON object")
-	}
-	m := fields{}
-	for d.More() {
-		t, err = d.Token()
-		if err != nil {
-			return nil, errors.New("invalid object field")
-		}
-		key, ok := t.(string)
-		if !ok || len(key) > 256 || len(m) >= 128 || m[key] != nil {
-			return nil, errors.New("duplicate or excessive object fields")
-		}
-		var v json.RawMessage
-		if d.Decode(&v) != nil {
-			return nil, errors.New("invalid object value")
-		}
-		m[key] = v
-	}
-	if _, err = d.Token(); err != nil {
-		return nil, errors.New("unterminated object")
-	}
-	return m, nil
-}
-
-func (m fields) str(key string) string {
-	var s string
-	_ = json.Unmarshal(m[key], &s)
-	return s
-}
-
-func (m fields) number(key string, limit int) (int, error) {
-	s := string(m[key])
-	if s == "" || strings.IndexFunc(s, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
-		return 0, errors.New("missing or non-integer evidence number")
-	}
-	n, err := strconv.ParseUint(s, 10, 32)
-	if err != nil || n > uint64(limit) {
-		return 0, errors.New("evidence number exceeds limit")
-	}
-	return int(n), nil
-}
-
-func attributes(raw []byte) (fields, error) {
-	m, err := object(raw)
-	if err != nil {
-		return nil, err
-	}
-	if nested := m["attributes"]; nested != nil {
-		a, err := object(nested)
-		if err != nil {
-			return nil, err
-		}
-		for k, v := range a {
-			if old := m[k]; old != nil && !bytes.Equal(bytes.TrimSpace(old), bytes.TrimSpace(v)) {
-				return nil, errors.New("conflicting nested attributes")
-			}
-			m[k] = v
-		}
-	}
-	return m, nil
-}
-
 func reconstruct(input io.Reader, request, kind string) ([]byte, error) {
 	data, err := io.ReadAll(io.LimitReader(input, maxInput+1))
 	if err != nil || len(data) > maxInput {
@@ -174,105 +102,129 @@ func reconstruct(input io.Reader, request, kind string) ([]byte, error) {
 		return nil, errors.New("empty input")
 	}
 	d := json.NewDecoder(bytes.NewReader(data))
-	array := data[0] == '['
-	if array {
-		_, _ = d.Token()
-	}
 	records := map[string]*record{}
-	for seen := 0; ; seen++ {
-		if array && !d.More() {
+	for seen := 0; d.More(); seen++ {
+		var envelope struct {
+			Record struct {
+				ID    string `json:"id"`
+				Event *struct {
+					Stream    string         `json:"stream"`
+					Action    string         `json:"action"`
+					RequestID string         `json:"request_id"`
+					Attrs     map[string]any `json:"attrs"`
+					Body      string         `json:"body"`
+				} `json:"event"`
+			} `json:"record"`
+		}
+		err = d.Decode(&envelope)
+		if err == io.EOF {
 			break
 		}
-		var raw json.RawMessage
-		err = d.Decode(&raw)
-		if err == io.EOF && !array {
-			break
-		}
-		if err != nil || len(raw) > maxRecord || seen >= maxParts {
+		if err != nil || seen >= maxParts {
 			return nil, errors.New("invalid JSON or export record limit exceeded")
 		}
-		m, err := attributes(raw)
-		if err != nil {
-			return nil, err
-		}
-		if m.str("source") != "bait" || m.str("stream") != "edge" || m.str("action") != "capture" || m.str("request_id") != request {
+		evt := envelope.Record.Event
+		if evt == nil || evt.Stream != "edge" || evt.Action != "capture" || evt.RequestID != request {
 			continue
 		}
-		k := m.str("evidence_kind")
-		if k != kind && !(k == "manifest" && m.str("evidence_target") == kind) {
+		getStr := func(key string) string {
+			if v, ok := evt.Attrs[key].(string); ok {
+				return v
+			}
+			return ""
+		}
+		getNum := func(key string) (float64, bool) {
+			v, ok := evt.Attrs[key].(float64)
+			return v, ok
+		}
+		getBool := func(key string) (bool, bool) {
+			v, ok := evt.Attrs[key].(bool)
+			return v, ok
+		}
+		if getStr("source") != "bait" {
 			continue
 		}
-		if err := addRecord(records, m); err != nil {
+		evidenceKind := getStr("evidence_kind")
+		if evidenceKind != kind && !(evidenceKind == "manifest" && getStr("evidence_target") == kind) {
+			continue
+		}
+		if err := addRecord(records, envelope.Record.ID, evt.Attrs, evt.Body, getStr, getNum, getBool); err != nil {
 			return nil, err
-		}
-	}
-	if array {
-		if t, err := d.Token(); err != nil || t != json.Delim(']') {
-			return nil, errors.New("unterminated export array")
-		}
-		var extra json.RawMessage
-		if d.Decode(&extra) != io.EOF {
-			return nil, errors.New("trailing export data")
 		}
 	}
 	return assemble(records)
 }
 
-func addRecord(records map[string]*record, m fields) error {
-	version, err := m.number("evidence_version", 1)
-	if err != nil || version != 1 || m.str("evidence_encoding") != "base64" || m.str("evidence_scope") != "application" {
+func addRecord(records map[string]*record, id string, attrs map[string]any, body string, getStr func(string) string, getNum func(string) (float64, bool), getBool func(string) (bool, bool)) error {
+	versionF, ok := getNum("evidence_version")
+	if !ok || versionF != 1 || getStr("evidence_encoding") != "base64" || getStr("evidence_scope") != "application" {
 		return errors.New("unsupported or missing capture schema: require version 1, base64, application")
 	}
-	meta := metadata{kind: m.str("evidence_kind"), target: m.str("evidence_target"), hash: m.str("evidence_sha256"), reason: m.str("evidence_reason")}
-	if meta.size, err = m.number("evidence_bytes", maxBody); err != nil {
-		return err
+	meta := metadata{kind: getStr("evidence_kind"), target: getStr("evidence_target"), hash: getStr("evidence_sha256"), reason: getStr("evidence_reason")}
+	bytesF, ok := getNum("evidence_bytes")
+	if !ok || bytesF < 0 || bytesF > maxBody {
+		return errors.New("invalid evidence_bytes")
 	}
+	meta.size = int(bytesF)
+
 	if meta.kind == "manifest" {
-		if meta.segments, err = m.number("evidence_segments", maxParts); err != nil {
-			return err
+		segsF, ok := getNum("evidence_segments")
+		if !ok || segsF < 0 || segsF > maxParts {
+			return errors.New("invalid evidence_segments")
 		}
-		if string(m["evidence_complete"]) != "true" {
+		meta.segments = int(segsF)
+		complete, ok := getBool("evidence_complete")
+		if !ok {
+			return errors.New("manifest missing evidence_complete")
+		}
+		if !complete && meta.reason == "" {
+			return errors.New("incomplete manifest missing reason")
+		}
+		if !complete {
 			return errors.New("capture manifest is incomplete")
 		}
 		meta.complete = true
 	} else {
-		if meta.segment, err = m.number("evidence_segment", maxParts-1); err != nil {
-			return err
+		segF, ok := getNum("evidence_segment")
+		if !ok || segF < 0 || segF > maxParts-1 {
+			return errors.New("invalid evidence_segment")
 		}
-		if meta.offset, err = m.number("evidence_offset", maxBody); err != nil {
-			return err
+		meta.segment = int(segF)
+		offsetF, ok := getNum("evidence_offset")
+		if !ok || offsetF < 0 || offsetF > maxBody {
+			return errors.New("invalid evidence_offset")
 		}
+		meta.offset = int(offsetF)
 	}
-	count, err := m.number("chunk_count", maxParts)
-	if err != nil || count == 0 {
-		return errors.New("invalid chunk count")
-	}
-	index, err := m.number("chunk_index", count-1)
-	if err != nil {
-		return err
-	}
-	id, hash, chunk := m.str("record_id"), m.str("body_sha256"), m.str("body_chunk")
-	if raw := m["body_chunk"]; raw != nil && (bytes.Equal(raw, []byte("null")) || json.Unmarshal(raw, &chunk) != nil) {
-		return errors.New("body_chunk must be a string")
-	}
-	if id == "" || len(id) > 256 || len(hash) != 64 || len(meta.hash) != 64 || len(meta.reason) > 256 {
+
+	if id == "" || len(id) > 256 || len(meta.hash) != 64 || len(meta.reason) > 256 {
 		return errors.New("missing or invalid evidence identity/hash")
 	}
-	if meta.kind != "manifest" && m["body_chunk"] == nil {
-		return errors.New("missing body_chunk")
+	if meta.kind != "manifest" && body == "" {
+		return errors.New("missing body")
 	}
+
 	r := records[id]
-	if r == nil {
-		r = &record{meta: meta, hash: hash, count: count, chunks: map[int]string{}}
-		records[id] = r
+	if r != nil {
+		return errors.New("duplicate record ID")
 	}
-	if r.meta != meta || r.hash != hash || r.count != count {
-		return errors.New("conflicting record metadata")
+
+	var data []byte
+	if body != "" {
+		if !strings.HasPrefix(body, "base64:") || base64.StdEncoding.DecodedLen(len(body)-7) > maxBody+2 {
+			return errors.New("invalid base64 evidence encoding or size")
+		}
+		b, err := base64.StdEncoding.Strict().DecodeString(body[7:])
+		if err != nil {
+			return errors.New("segment encoding invalid")
+		}
+		if len(b) != meta.size || digest(b) != meta.hash {
+			return errors.New("segment length or hash mismatch")
+		}
+		data = b
 	}
-	if previous, ok := r.chunks[index]; ok && previous != chunk {
-		return errors.New("conflicting replayed chunk")
-	}
-	r.chunks[index] = chunk
+
+	records[id] = &record{meta: meta, data: data}
 	return nil
 }
 
@@ -281,46 +233,28 @@ func assemble(records map[string]*record) ([]byte, error) {
 	segments := map[int]segment{}
 	retained := 0
 	for _, r := range records {
-		if len(r.chunks) != r.count {
-			return nil, errors.New("missing record chunk")
-		}
-		var body strings.Builder
-		for i := 0; i < r.count; i++ {
-			body.WriteString(r.chunks[i])
-		}
-		text := body.String()
-		if digest([]byte(text)) != r.hash {
-			return nil, errors.New("record body hash mismatch")
-		}
 		if r.meta.kind == "manifest" {
-			if text != "" || r.count != 1 {
+			if len(r.data) != 0 {
 				return nil, errors.New("invalid manifest body")
 			}
-			if manifest != nil && *manifest != r.meta {
-				return nil, errors.New("conflicting manifests")
+			if manifest != nil {
+				return nil, errors.New("duplicate manifest")
 			}
 			meta := r.meta
 			manifest = &meta
 			continue
 		}
-		if !strings.HasPrefix(text, "base64:") || base64.StdEncoding.DecodedLen(len(text)-7) > maxBody+2 {
-			return nil, errors.New("invalid base64 evidence encoding or size")
-		}
-		b, err := base64.StdEncoding.Strict().DecodeString(text[7:])
-		if err != nil || len(b) != r.meta.size || digest(b) != r.meta.hash {
-			return nil, errors.New("segment encoding, length or hash mismatch")
-		}
 		if old, ok := segments[r.meta.segment]; ok {
-			if old.offset != r.meta.offset || !bytes.Equal(old.data, b) {
+			if old.offset != r.meta.offset || !bytes.Equal(old.data, r.data) {
 				return nil, errors.New("conflicting logical segments")
 			}
 			continue
 		}
-		retained += len(b)
+		retained += len(r.data)
 		if retained > maxBody {
 			return nil, errors.New("decoded evidence exceeds 16 MiB")
 		}
-		segments[r.meta.segment] = segment{r.meta.offset, b}
+		segments[r.meta.segment] = segment{r.meta.offset, r.data}
 	}
 	if manifest == nil {
 		return nil, errors.New("missing complete manifest")

@@ -66,6 +66,8 @@ printf '\n@@failed\n'
 systemctl --failed --no-legend --plain --no-pager || printf '@@failure_failed\n'
 printf '@@files\n'
 stat -c '%%n %%s %%Y' /var/log/falco-events.jsonl /var/lib/attackbox-shipper/queue/checkpoint /var/lib/attackbox-falco-reader/cursor.json /var/lib/attackbox-egress-reader/cursor.json 2>/dev/null || printf '@@failure_files\n'
+printf '@@evidence\n'
+find /var/lib/attackbox-public-capture/requests /var/lib/attackbox-evidence -type f -printf '%%p %%s %%T@\n' 2>/dev/null | sort -k3 -rn | head -20 || printf '@@failure_evidence\n'
 printf '@@proxy\n'
 journalctl -u docker.service --since '@%d' --until '@%d' -n 2000 -o json --no-pager || printf '@@failure_proxy\n'
 printf '@@kernel\n'
@@ -217,7 +219,7 @@ func parse(data []byte, from, until time.Time) sample {
 			} else {
 				s.Counts["http_public_source"]++
 			}
-			if strings.HasPrefix(access.UA, "attackbox-synthetic-") {
+			if strings.Contains(access.UA, "attackbox-synthetic-") {
 				s.Counts["http_synthetic_label_claimed"]++
 			}
 			s.Counts["route:"+route(access.Request)]++
@@ -329,7 +331,7 @@ func report(out string, samples []sample, start, deadline time.Time, state strin
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Overnight watch\n\nState: %s. Start: %s. Deadline: %s. Samples: %d.\n\n", state, start.Format(time.RFC3339), deadline.Format(time.RFC3339), len(samples))
-	b.WriteString("Read-only SSH observations of attackbox. No probes, remediation, attacker contact or VPS configuration changes. New Relic receipt and provider firewall are not checked by this watcher. Counts describe observed activity, not confirmed attacks. Synthetic labels can be forged. Public ingress was closed at setup; re-check before interpreting silence.\n\nCollection runs on the operator Mac and requires power and connectivity. Gaps, capped journals and source rotation can hide events. A stale idle-source cursor alone does not prove failure. Raw paths, query strings, headers and payloads are not stored in this report.\n\n## Activity totals\n\n")
+	b.WriteString("Read-only SSH observations of attackbox. No probes, remediation, attacker contact or VPS configuration changes. Evidence freshness and provider firewall are not checked by this watcher. Counts describe observed activity, not confirmed attacks. Synthetic labels can be forged. Public ingress was closed at setup; re-check before interpreting silence.\n\nCollection runs on the operator Mac and requires power and connectivity. Gaps, capped journals and source rotation can hide events. A stale idle-source cursor alone does not prove failure. Raw paths, query strings, headers and payloads are not stored in this report.\n\n## Activity totals\n\n")
 	b.WriteString("The first snapshot includes a five-minute baseline before the start time. Failed-unit counts are sample occurrences. Falco parse-error counts can include repeated reads of old tail records; they are not unique attack events.\n\n")
 	keys := make([]string, 0, len(counts))
 	for k := range counts {

@@ -111,7 +111,7 @@ func debrief(b *strings.Builder, samples []sample, counts, notices map[string]in
 	if queue, ok := metric(last, "otelcol_exporter_queue_size"); ok {
 		fmt.Fprintf(b, "The telemetry exporter reported a queue size of **%g** at the latest snapshot. A nonzero queue can be transient; one sample does not prove a delivery fault. ", queue)
 	}
-	b.WriteString("The watcher does not query New Relic for receipt. Export counters and a running collector are not end-to-end delivery proof.\n\n")
+	b.WriteString("The watcher does not query the evidence store for receipt. Export counters and a running collector are not end-to-end delivery proof.\n\n")
 	if counts["failed_service_sample_occurrences"] > 0 {
 		fmt.Fprintf(b, "Failed systemd units were reported **%d times across snapshots**. One persistent failure can appear repeatedly. These counts are not distinct outages and do not identify a security incident.\n\n", counts["failed_service_sample_occurrences"])
 	}
@@ -134,7 +134,7 @@ func debrief(b *strings.Builder, samples []sample, counts, notices map[string]in
 	if notices["component_count_not_12"] > 0 {
 		b.WriteString("- The legacy watcher expects twelve components. The audit filter adds a thirteenth. This count warning alone is not an outage; check individual running-state values.\n")
 	}
-	b.WriteString("- Confirm current ingress policy before describing this as a public attack campaign.\n- Use the original private logs and New Relic traces to establish actor sequences, payloads, exact responses and any exploit outcome. This aggregate report cannot establish them.\n- Check the latest observation time. The collector requires Mac power and connectivity; a stopped process can leave a running state.\n\n")
+	b.WriteString("- Confirm current ingress policy before describing this as a public attack campaign.\n- Use the original private logs and local evidence to establish actor sequences, payloads, exact responses and any exploit outcome. This aggregate report cannot establish them.\n- Check the latest observation time. The collector requires Mac power and connectivity; a stopped process can leave a running state.\n\n")
 	b.WriteString("## Recent observation timeline\n\nEach row is one collection window. Rows are not linked attacker sessions. The table shows the latest 12 windows; totals above cover the full watch.\n\n| Window end (EST / UTC) | Observed activity | Collection status |\n| --- | --- | --- |\n")
 	start := max(0, len(samples)-12)
 	for _, s := range samples[start:] {

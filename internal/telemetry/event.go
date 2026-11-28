@@ -7,7 +7,7 @@ import (
 	"unicode/utf8"
 )
 
-// MaxChunk is the largest body chunk in runes. New Relic keeps only the first
+// MaxChunk is the largest body chunk in runes. The sink keeps only the first
 // 4,094 characters of a string attribute, so chunks stay under that.
 const MaxChunk = 3500
 

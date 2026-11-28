@@ -185,32 +185,32 @@ test_prepare() {
 	local name=prepare_creates_valid_scripts
 	local commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 	local prev=$testroot/prev-release
-	
+
 	mkdir -p "$prev"
 	echo "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" > "$prev/bundle.sha256"
-	
+
 	# Create git repo
 	local repo=$testroot/repo
 	mkdir -p "$repo/.git/attackbox-public-ci"
 	cd "$repo"
-	
+
 	echo "$commit linux/amd64 sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" > ".git/attackbox-public-ci/$commit-amd64.verified"
 	echo "fake bundle" > ".git/attackbox-public-ci/$commit-amd64.bundle.tar"
-	
+
 	# Create .vultr/state.json
 	mkdir -p .vultr
 	cat > .vultr/state.json <<JSON
 {"instance_id":"inst-id","firewall_id":"fw-id","ssh_rule_id":12,"admin_cidr":"5.6.7.8/32","main_ip":"1.2.3.4"}
 JSON
-	
+
 	# Create .env with API key
 	echo 'VULTR_API_KEY=test-key-123' > .env
-	
+
 	# Copy release kit
 	mkdir -p scripts/public-release
 	cp -r "$repo_root/scripts/public-release"/*.in scripts/public-release/
 	cp "$repo_root/scripts/public-release/prepare.sh" scripts/public-release/
-	
+
 	# Create SSH config
 	mkdir -p ~/.ssh
 	if ! grep -q "^Host attackbox" ~/.ssh/config 2>/dev/null; then
@@ -221,15 +221,15 @@ Host attackbox-test
 	User root
 CFG
 	fi
-	
+
 	# Mock ssh config lookup in prepare.sh
 	export ATTACKBOX_PUBLIC_NAME=test.example.org
-	
+
 	# Run prepare (will fail on ssh check, so we'll stub it out)
 	# Instead, test the template processing directly
 	local reldir=$testroot/release-test
 	mkdir -p "$reldir"
-	
+
 	local sha=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 	for script in cutover.sh stage.sh firewall.sh verify-staged.py verify-public.py host-proof.py; do
 		sed -e "s|@COMMIT@|$commit|g" \
@@ -248,30 +248,30 @@ CFG
 			"scripts/public-release/$script.in" > "$reldir/$script"
 		chmod 0700 "$reldir/$script"
 	done
-	
+
 	# Check mode 700
 	for f in cutover.sh stage.sh firewall.sh verify-staged.py verify-public.py host-proof.py; do
 		local mode=$(stat -f %Lp "$reldir/$f" 2>/dev/null || stat -c %a "$reldir/$f")
 		[[ $mode == 700 ]] || fail "$name" "$f mode is $mode, not 700"
 	done
-	
+
 	# Check no unsubstituted markers
 	for f in cutover.sh stage.sh firewall.sh verify-staged.py verify-public.py host-proof.py; do
 		if grep -E '@[A-Z_]+@' "$reldir/$f"; then
 			fail "$name" "$f has unsubstituted markers"
 		fi
 	done
-	
+
 	# Check Python compilation
 	for f in verify-staged.py verify-public.py host-proof.py; do
 		python3 -m py_compile "$reldir/$f" 2>&1 || fail "$name" "$f does not compile"
 	done
-	
+
 	# Check shellcheck
 	for f in cutover.sh stage.sh firewall.sh; do
 		shellcheck -s bash -S error "$reldir/$f" 2>&1 || fail "$name" "$f fails shellcheck"
 	done
-	
+
 	pass "$name"
 }
 
@@ -280,9 +280,9 @@ test_cutover_refuses_bad_receipt() {
 	local name=cutover_refuses_bad_receipt
 	local commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 	local reldir=$testroot/release-bad-receipt
-	
+
 	mkdir -p "$reldir"
-	
+
 	# Create a cutover.sh that will fail on SHA check
 	cat > "$reldir/cutover.sh" <<'SCRIPT'
 #!/bin/bash
@@ -299,16 +299,16 @@ sha=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 echo "firewall close" >> "$CALL_LOG"
 SCRIPT
 	chmod +x "$reldir/cutover.sh"
-	
+
 	> "$logfile"
 	if bash "$reldir/cutover.sh" 2>&1; then
 		fail "$name" "cutover should have failed"
 	fi
-	
+
 	if grep -q "firewall close" "$logfile"; then
 		fail "$name" "firewall close was called despite failure"
 	fi
-	
+
 	pass "$name"
 }
 
@@ -316,9 +316,9 @@ SCRIPT
 test_staged_verify_failure() {
 	local name=staged_verify_failure
 	local reldir=$testroot/release-verify-fail
-	
+
 	mkdir -p "$reldir/firewall"
-	
+
 	# Create a verify-staged.py that fails
 	cat > "$reldir/verify-staged.py" <<'PY'
 #!/usr/bin/env python3
@@ -327,7 +327,7 @@ print("verify-staged: missing credential span")
 sys.exit(1)
 PY
 	chmod +x "$reldir/verify-staged.py"
-	
+
 	# Create minimal cutover
 	cat > "$reldir/cutover.sh" <<SCRIPT
 #!/bin/bash
@@ -339,33 +339,33 @@ fi
 echo "firewall open" >> "$CALL_LOG"
 SCRIPT
 	chmod +x "$reldir/cutover.sh"
-	
+
 	> "$logfile"
 	if bash "$reldir/cutover.sh" 2>&1; then
 		fail "$name" "cutover should have failed on verify-staged"
 	fi
-	
+
 	if ! grep -q "firewall close" "$logfile"; then
 		fail "$name" "firewall close was not called"
 	fi
-	
+
 	if grep -q "firewall open" "$logfile"; then
 		fail "$name" "firewall open was called despite failure"
 	fi
-	
+
 	pass "$name"
 }
 
 # Test (d): success path runs steps in order
 test_success_path_order() {
 	local name=success_path_runs_in_order
-	
+
 	# Create minimal scripts that log their execution
 	local prevdir=$testroot/prev-success
 	local reldir=$testroot/release-success
-	
+
 	mkdir -p "$prevdir/firewall" "$reldir/firewall"
-	
+
 	cat > "$prevdir/firewall.sh" <<SCRIPT
 #!/bin/bash
 case \${1:-} in
@@ -375,20 +375,20 @@ case \${1:-} in
 esac
 SCRIPT
 	chmod +x "$prevdir/firewall.sh"
-	
+
 	cat > "$reldir/stage.sh" <<SCRIPT
 #!/bin/bash
 echo "stage" >> "$logfile"
 SCRIPT
 	chmod +x "$reldir/stage.sh"
-	
+
 	cat > "$reldir/verify-staged.py" <<SCRIPT
 #!/usr/bin/env python3
 with open("$logfile", "a") as f:
 	f.write("verify staged\\n")
 SCRIPT
 	chmod +x "$reldir/verify-staged.py"
-	
+
 	cat > "$reldir/firewall.sh" <<SCRIPT
 #!/bin/bash
 case \${1:-} in
@@ -397,14 +397,14 @@ case \${1:-} in
 esac
 SCRIPT
 	chmod +x "$reldir/firewall.sh"
-	
+
 	cat > "$reldir/verify-public.py" <<SCRIPT
 #!/usr/bin/env python3
 with open("$logfile", "a") as f:
 	f.write("verify public\\n")
 SCRIPT
 	chmod +x "$reldir/verify-public.py"
-	
+
 	# Create cutover that calls all steps
 	cat > "$reldir/cutover.sh" <<SCRIPT
 #!/bin/bash
@@ -424,10 +424,10 @@ bash "\$T/firewall.sh" open "\$sha"
 python3 "\$T/verify-public.py"
 SCRIPT
 	chmod +x "$reldir/cutover.sh"
-	
+
 	> "$logfile"
 	bash "$reldir/cutover.sh" 2>&1 || fail "$name" "cutover failed"
-	
+
 	# Verify order
 	local expected="verify open
 close
@@ -438,11 +438,11 @@ verify staged
 preflight
 open
 verify public"
-	
+
 	if ! diff -u <(echo "$expected") "$logfile"; then
 		fail "$name" "steps not in correct order"
 	fi
-	
+
 	pass "$name"
 }
 
@@ -452,44 +452,44 @@ test_verify_scripts_with_fixtures() {
 	local commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 	local sha=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 	local reldir=$testroot/release-verify-fixtures
-	
+
 	mkdir -p "$reldir/firewall"
 	echo "$sha" > "$reldir/bundle.sha256"
 	echo "$commit linux/amd64 sha256:$sha" > "$reldir/$commit-amd64.verified"
-	
+
 	# Create good fixture with all required spans
 	local good_traces=$testroot/fixtures/evidence/attackbox-evidence/public-otel/traces-good.jsonl
 	> "$good_traces"
-	
+
 	# Add credential span
 	cat >> "$good_traces" <<'TRACE'
 {"resourceSpans":[{"scopeSpans":[{"spans":[{"attributes":[{"key":"service.name","value":{"stringValue":"attackbox-public-443"}},{"key":"service.version","value":{"stringValue":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},{"key":"host.id","value":{"stringValue":"test-host"}},{"key":"campaign.id","value":{"stringValue":"https443-aaaaaaaaaaaa"}},{"key":"name","value":{"stringValue":"public.request"}},{"key":"server.port","value":{"intValue":"443"}},{"key":"client.address","value":{"stringValue":"1.2.3.4"}},{"key":"attackbox.credential.source","value":{"stringValue":"authorization"}},{"key":"attackbox.credential.type","value":{"stringValue":"anthropic"}},{"key":"attackbox.credential.value","value":{"stringValue":"sk-ant-staging-synthetic-proof"}},{"key":"gen_ai.request.model","value":{"stringValue":"gpt-4o"}}]}]}]}]}
 TRACE
-	
+
 	# Add proxy credential span
 	cat >> "$good_traces" <<'TRACE'
 {"resourceSpans":[{"scopeSpans":[{"spans":[{"attributes":[{"key":"service.name","value":{"stringValue":"attackbox-public-443"}},{"key":"service.version","value":{"stringValue":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},{"key":"host.id","value":{"stringValue":"test-host"}},{"key":"campaign.id","value":{"stringValue":"https443-aaaaaaaaaaaa"}},{"key":"name","value":{"stringValue":"public.request"}},{"key":"server.port","value":{"intValue":"443"}},{"key":"client.address","value":{"stringValue":"1.2.3.4"}},{"key":"attackbox.credential.source","value":{"stringValue":"proxy-authorization"}},{"key":"attackbox.credential.value","value":{"stringValue":"c3RhZ2luZzpzeW50aGV0aWM="}}]}]}]}]}
 TRACE
-	
+
 	# Add health span
 	cat >> "$good_traces" <<'TRACE'
 {"resourceSpans":[{"scopeSpans":[{"spans":[{"attributes":[{"key":"service.name","value":{"stringValue":"attackbox-public-443"}},{"key":"service.version","value":{"stringValue":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},{"key":"host.id","value":{"stringValue":"test-host"}},{"key":"campaign.id","value":{"stringValue":"https443-aaaaaaaaaaaa"}},{"key":"name","value":{"stringValue":"public.health"}},{"key":"server.port","value":{"intValue":"443"}},{"key":"client.address","value":{"stringValue":"1.2.3.4"}}]}]}]}]}
 TRACE
-	
+
 	# Add plain port spans (all 9 ports)
 	for port in 80 1234 3000 4000 8000 8080 8188 8888 11434; do
 		cat >> "$good_traces" <<TRACE
 {"resourceSpans":[{"scopeSpans":[{"spans":[{"attributes":[{"key":"service.name","value":{"stringValue":"attackbox-public-443"}},{"key":"service.version","value":{"stringValue":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},{"key":"host.id","value":{"stringValue":"test-host"}},{"key":"campaign.id","value":{"stringValue":"https443-aaaaaaaaaaaa"}},{"key":"name","value":{"stringValue":"public.request"}},{"key":"server.port","value":{"intValue":"$port"}},{"key":"client.address","value":{"stringValue":"1.2.3.4"}}]}]}]}]}
 TRACE
 	done
-	
+
 	# Bad fixture 1: missing credential span
 	local bad_no_cred=$testroot/fixtures/evidence/attackbox-evidence/public-otel/traces-bad-no-cred.jsonl
 	> "$bad_no_cred"
 	cat >> "$bad_no_cred" <<'TRACE'
 {"resourceSpans":[{"scopeSpans":[{"spans":[{"attributes":[{"key":"service.name","value":{"stringValue":"attackbox-public-443"}},{"key":"service.version","value":{"stringValue":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},{"key":"host.id","value":{"stringValue":"test-host"}},{"key":"campaign.id","value":{"stringValue":"https443-aaaaaaaaaaaa"}},{"key":"name","value":{"stringValue":"public.request"}},{"key":"server.port","value":{"intValue":"443"}},{"key":"client.address","value":{"stringValue":"1.2.3.4"}}]}]}]}]}
 TRACE
-	
+
 	# Bad fixture 2: forbidden client field
 	local bad_forbidden=$testroot/fixtures/evidence/attackbox-evidence/public-otel/traces-bad-forbidden.jsonl
 	> "$bad_forbidden"
@@ -502,7 +502,7 @@ TRACE
 	cat >> "$bad_forbidden" <<'TRACE'
 {"resourceSpans":[{"scopeSpans":[{"spans":[{"attributes":[{"key":"service.name","value":{"stringValue":"attackbox-public-443"}},{"key":"service.version","value":{"stringValue":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},{"key":"host.id","value":{"stringValue":"test-host"}},{"key":"campaign.id","value":{"stringValue":"https443-aaaaaaaaaaaa"}},{"key":"name","value":{"stringValue":"public.health"}},{"key":"server.port","value":{"intValue":"443"}},{"key":"client.address","value":{"stringValue":"1.2.3.4"}}]}]}]}]}
 TRACE
-	
+
 	# Add plain port spans to bad fixtures too
 	for port in 80 1234 3000 4000 8000 8080 8188 8888 11434; do
 		for f in "$bad_no_cred" "$bad_forbidden"; do
@@ -511,11 +511,11 @@ TRACE
 TRACE
 		done
 	done
-	
+
 	# Create test verify script that reads from fixtures
 	# We'll test that the scripts work with ATTACKBOX_EVIDENCE_ROOT override
 	# For this test, we just verify the fixtures are parseable
-	
+
 	# Test good fixture parsing
 	python3 <<PY || fail "$name" "good fixture parsing failed"
 import json, os
@@ -531,7 +531,7 @@ with open(traces_file) as f:
 					attrs = {a["key"]: a.get("value",{}) for a in sp.get("attributes",[])}
 					assert "service.name" in attrs or "name" in attrs
 PY
-	
+
 	# Test bad fixture 1 detection (missing credential)
 	python3 <<PY || fail "$name" "bad fixture 1 should detect missing credential"
 import json
@@ -551,7 +551,7 @@ if has_cred:
 	import sys
 	sys.exit(1)
 PY
-	
+
 	# Test bad fixture 2 detection (forbidden field)
 	python3 <<PY || fail "$name" "bad fixture 2 should detect forbidden field"
 import json
@@ -572,7 +572,7 @@ if client_fields == 0:
 	import sys
 	sys.exit(1)
 PY
-	
+
 	pass "$name"
 }
 
