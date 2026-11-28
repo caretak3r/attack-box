@@ -22,17 +22,17 @@ import (
 // an over-long string is cut on a rune boundary and the event is flagged, so
 // evidence is kept. Every limit is far above what the bait itself produces.
 const (
-	MaxLine       = 2 << 20 // bytes per wire line without the newline
-	MaxBody       = 1 << 20 // Event.Body bytes, the bait's ATTACKBOX_MAX_LOG_BODY cap
-	MaxExpanded   = 16 << 20
-	MaxItem       = telemetry.MinPayloadBytes - itemHeadroom // one chunk as a New Relic log item; fits the smallest POST
+	MaxLine       = 2 << 20  // bytes per wire line without the newline
+	MaxBody       = 1 << 20  // Event.Body bytes, the bait's ATTACKBOX_MAX_LOG_BODY cap
+	MaxExpanded   = 16 << 20 // total expanded size across all chunks
+	MaxItem       = 72 << 10 // one encoded chunk; above the largest MaxChunk chunk with full attrs, so only MaxExpanded caps big bodies
 	maxDepth      = 6
 	maxNodes      = 4096
 	maxKeys       = 128
 	maxArray      = 256
 	maxKeyLen     = 128
 	maxString     = 4096
-	maxAttrBytes  = 128 << 10 // all keys and strings in Attrs
+	maxAttrBytes  = 128 << 10
 	maxLabels     = 16
 	maxLabelLen   = 64
 	maxMetricKeys = 8
@@ -46,11 +46,6 @@ const (
 // at least MaxData.
 const MaxData = 8 << 20
 
-// itemHeadroom is what a POST keeps for the envelope and common attributes
-// around an item.
-const itemHeadroom = 8 << 10
-
-// Fixed-field byte caps.
 var fieldCaps = struct{ id, ip, ua, token, resource, result int }{128, 64, 2048, 64, 1024, 64}
 
 // RejectError is an admission failure. Reason is a bounded token, safe as a
@@ -139,20 +134,17 @@ var roleMetrics = map[Role]map[string]string{
 // EgressBlockedMetric is the plan's egress_blocked_total counter.
 const EgressBlockedMetric = "attackbox.egress_blocked"
 
-// reservedAttrs are removed from producer Attrs: New Relic lets item
-// attributes override common attributes, and the rest are set by the
-// shipper. Matching is case-insensitive.
+// reservedAttrs are removed from producer Attrs: the shipper sets these.
+// Matching is case-insensitive.
 var reservedAttrs = []string{
-	"instance", "service.name", "hostname", "entity.guid", "entity.name", "entity.type",
-	"newrelic.source", "plugin.type", "timestamp", "message",
 	"source", "record_id", "boot", "seq",
 	"schema_version", "ingest_ts", "producer_ts", "sensor_id", "deployment_id", "shipper_boot",
 	"timestamp_clamped", "attrs_truncated", "fields_truncated", "reserved_attrs_removed",
-	// Event.Attributes lets a fixed field win only when it is non-empty, so
-	// an attr of the same name would otherwise slip past validation.
 	"session_id", "request_id", "src_ip", "user_agent", "persona", "action",
 	"resource", "result", "probe_id", "status", "task_labels",
 	"stream", "body_sha256", "chunk_index", "chunk_count",
+	"instance", "hostname", "timestamp", "message",
+	"service.name", "entity.guid", "entity.name", "entity.type", "newrelic.source", "plugin.type",
 }
 
 // baitOnlyAttrs are the bait's own provenance names. Every role but the bait
@@ -308,13 +300,14 @@ func admitEvent(role Role, e telemetry.Event, key, boot string, seq uint64, vers
 	e.Attrs = attrs
 
 	// Bound what this record becomes after the final-hop Chunk: every item
-	// must fit a New Relic POST and the total has a hard ceiling.
+	// must fit the evidence envelope and the total has a hard ceiling.
 	total := 0
 	for _, c := range telemetry.Chunk(e, telemetry.MaxChunk) {
-		n, err := telemetry.LogItemSize(c)
+		data, err := json.Marshal(c)
 		if err != nil {
 			return e, reject("encode", err)
 		}
+		n := len(data)
 		if n > MaxItem {
 			return e, reject("item_size", nil)
 		}

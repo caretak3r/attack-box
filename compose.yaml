@@ -75,8 +75,7 @@ services:
       # Redaction secret from Docker secret
       ATTACKBOX_SECRET_FILE: "/run/secrets/attackbox_secret"
 
-      # Spool socket (no New Relic key in bait)
-      ATTACKBOX_SPOOL_SOCKET: "/run/attackbox/spool.sock"
+      # Spool socket (host shipper owns the ingest key)
       ATTACKBOX_SPOOL_QUEUE: "10000"
       ATTACKBOX_SPOOL_TIMEOUT: "5s"
 
@@ -213,8 +212,7 @@ services:
     # Restart policy
     restart: unless-stopped
 
-    # Host journald owns retention; native Infrastructure reads docker.service.
-    # Bait keeps its separate Go evidence route and local log driver above.
+    # Host journald owns retention.
     logging:
       driver: journald
       options:
@@ -259,7 +257,7 @@ secrets:
 # 3. No forced net-raw capability
 # 4. No Docker socket or management ports exposed
 # 5. No metrics ports exposed (Prometheus/etc.)
-# 6. Bait has no New Relic key (uses SPOOL_SOCKET)
+# 6. Bait has no ingest key (uses SPOOL_SOCKET)
 # 7. Only intended /run/attackbox mount (read-only)
 # 8. Published ports default to loopback (127.0.0.1)
 # 9. gVisor (runsc) runtime is a hard requirement for production deployment

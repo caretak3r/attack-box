@@ -12,7 +12,7 @@ import (
 
 func TestRenderAccountingAndOriginalBytes(t *testing.T) {
 	lines := []string{"unparsed input", `type=USER_AUTH msg=audit(1.1:2): res=failed`}
-	b, e := render(lines, "boot", "batch", nil)
+	b, e := render(lines, "boot", "batch")
 	if e != nil {
 		t.Fatal(e)
 	}

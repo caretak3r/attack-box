@@ -14,18 +14,18 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"attackbox/internal/telemetry"
 )
 
-// Ingest limits and defaults.
 const (
-	DefaultIdleTimeout = 2 * time.Minute  // the bait heartbeats every 30 s
-	DefaultLineTimeout = 30 * time.Second // one line, first fragment to newline
+	// MaxAccountingRows is the most events one accounting report carries.
+	MaxAccountingRows = 40
+	// Ingest limits and defaults.
+	DefaultIdleTimeout = 2 * time.Minute
+	DefaultLineTimeout = 30 * time.Second
 	DefaultMaxBatch    = 256
-	DefaultMaxInvalid  = 3
-	maxBoots           = 8       // remembered producer boots per role
-	maxBatchBytes      = 4 << 20 // admitted payload bytes per durable append
+	DefaultMaxInvalid  = 5000
+	maxBoots           = 8
+	maxBatchBytes      = 4 << 20
 	readBuffer         = 64 << 10
 )
 
@@ -88,7 +88,7 @@ func (c *IngestConfig) setDefaults() error {
 		c.sleep = sleepCtx
 	}
 	if c.maxRows == 0 {
-		c.maxRows = telemetry.MaxAccountingEvents
+		c.maxRows = MaxAccountingRows
 	}
 	if c.IdleTimeout < 0 || c.LineTimeout < 0 || c.MaxBatch < 0 || c.MaxInvalid < 0 {
 		return errors.New("shipper ingest: timeouts and limits must be positive")

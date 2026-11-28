@@ -1,5 +1,5 @@
 // attackbox-auditfilter preserves audit groups and removes one verified routine
-// observation. It has no network access or New Relic credential.
+// observation. It has no network access.
 package main
 
 import (
@@ -16,7 +16,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -127,77 +126,8 @@ func (o *output) write(data []byte) error {
 	}
 	return o.file.Sync()
 }
-func processTrusted(r auditfilter.Record) bool {
-	pid, e := strconv.Atoi(r.Fields["pid"])
-	if e != nil || pid < 2 {
-		return false
-	}
-	dir := fmt.Sprintf("/proc/%d", pid)
-	// The kernel audit SYSCALL already identifies the executable at event time.
-	// Reading another process's /proc/exe would require CAP_SYS_PTRACE in this
-	// capability-free service. Keep that capability absent. Verify the recorded
-	// identity against live unit, UID, parent, and process start time instead.
-	b, e := os.ReadFile(dir + "/cgroup")
-	if e != nil {
-		return false
-	}
-	if !strings.Contains("\n"+string(b), "\n0::/system.slice/newrelic-infra.service\n") {
-		return false
-	}
-	b, e = os.ReadFile(dir + "/status")
-	if e != nil {
-		return false
-	}
-	if !strings.Contains(string(b), "\nUid:\t0\t0\t0\t0\n") {
-		return false
-	}
-	// A PID may have exited or been reused. Keep historical observations unless
-	// this process started before the recorded event.
-	b, e = os.ReadFile(dir + "/stat")
-	if e != nil {
-		return false
-	}
-	end := strings.LastIndexByte(string(b), ')')
-	if end < 0 {
-		return false
-	}
-	fields := strings.Fields(string(b)[end+1:])
-	if len(fields) < 20 {
-		return false
-	}
-	if fields[1] != r.Fields["ppid"] {
-		return false
-	}
-	ticks, e := strconv.ParseFloat(fields[19], 64)
-	if e != nil {
-		return false
-	}
-	up, e := os.ReadFile("/proc/uptime")
-	if e != nil {
-		return false
-	}
-	u := strings.Fields(string(up))
-	if len(u) < 1 {
-		return false
-	}
-	secs, e := strconv.ParseFloat(u[0], 64)
-	if e != nil {
-		return false
-	}
-	when, _, ok := strings.Cut(r.ID, ":")
-	if !ok {
-		return false
-	}
-	at, e := strconv.ParseFloat(when, 64)
-	if e != nil {
-		return false
-	}
-	// Linux amd64 USER_HZ is 100. This filter profile is explicitly x86_64 only.
-	started := float64(time.Now().UnixNano())/1e9 - secs + ticks/100
-	return at >= started+1 && at <= float64(time.Now().Unix())+2
-}
-func render(lines []string, boot, batch string, trust auditfilter.Trust) ([]byte, error) {
-	entries, stats := auditfilter.Batch(lines, boot, trust)
+func render(lines []string, boot, batch string) ([]byte, error) {
+	entries, stats := auditfilter.Batch(lines, boot)
 	var b strings.Builder
 	enc := json.NewEncoder(&b)
 	for _, entry := range entries {
@@ -214,7 +144,7 @@ func render(lines []string, boot, batch string, trust auditfilter.Trust) ([]byte
 			lastEvent = record.ID
 		}
 	}
-	summary := map[string]any{"first_audit_event_id": firstEvent, "last_audit_event_id": lastEvent, "message": "attackbox audit batch", "action": "audit_budget_batch", "audit_policy": auditfilter.Policy, "audit_reader_boot_id": boot, "audit_batch_id": batch, "input_rows": stats.InputRows, "kept_rows": stats.KeptRows, "suppressed_rows": stats.SuppressedRows, "kept_events": stats.KeptEvents, "suppressed_events": stats.SuppressedEvents}
+	summary := map[string]any{"first_audit_event_id": firstEvent, "last_audit_event_id": lastEvent, "message": "attackbox audit batch", "action": "audit_budget_batch", "audit_policy": auditfilter.Policy, "audit_reader_boot_id": boot, "audit_batch_id": batch, "input_rows": stats.InputRows, "kept_rows": stats.KeptRows, "kept_events": stats.KeptEvents}
 	if e := enc.Encode(summary); e != nil {
 		return nil, e
 	}
@@ -250,7 +180,7 @@ func follow(ctx context.Context, source, stateDir, outputDir string) error {
 			return nil
 		}
 		sum := sha256.Sum256([]byte(first))
-		data, e := render(lines, strings.TrimSpace(string(boot)), fmt.Sprintf("%x", sum), processTrusted)
+		data, e := render(lines, strings.TrimSpace(string(boot)), fmt.Sprintf("%x", sum))
 		if e != nil {
 			return e
 		}
@@ -327,7 +257,7 @@ func main() {
 		if e := scanner.Err(); e != nil {
 			log.Fatal(e)
 		}
-		b, e := render(lines, "offline", "offline", nil)
+		b, e := render(lines, "offline", "offline")
 		if e != nil {
 			log.Fatal(e)
 		}

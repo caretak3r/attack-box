@@ -24,9 +24,7 @@ type config struct {
 	queueDir        string
 	queueBytes      int64
 	segmentBytes    int64
-	nrLicenseKey    string
-	nrLogURL        string
-	nrMetricURL     string
+	evidenceDir     string
 	hostname        string
 	sensorID        string
 	deploymentID    string
@@ -62,22 +60,14 @@ func loadConfig(getenv func(string) string) (config, error) {
 		errs = append(errs, errors.New("ATTACKBOX_SHIP_SEGMENT_BYTES must be 1MB..256MB"))
 	}
 
-	// New Relic settings
-	c.nrLicenseKey = getenv("ATTACKBOX_NR_LICENSE_KEY")
-	if c.nrLicenseKey == "" {
-		errs = append(errs, errors.New("ATTACKBOX_NR_LICENSE_KEY is required"))
-	} else if err := telemetry.ValidLicenseKey(c.nrLicenseKey); err != nil {
-		errs = append(errs, err)
-	}
-
-	c.nrLogURL = getenv("ATTACKBOX_NR_LOG_URL")
-	if c.nrLogURL == "" {
-		c.nrLogURL = "https://log-api.newrelic.com/log/v1"
-	}
-
-	c.nrMetricURL = getenv("ATTACKBOX_NR_METRIC_URL")
-	if c.nrMetricURL == "" {
-		c.nrMetricURL = "https://metric-api.newrelic.com/metric/v1"
+	// Evidence directory
+	c.evidenceDir = getenv("ATTACKBOX_EVIDENCE_DIR")
+	if c.evidenceDir == "" {
+		if stateDir := getenv("STATE_DIRECTORY"); stateDir != "" {
+			c.evidenceDir = stateDir
+		} else {
+			c.evidenceDir = "/var/lib/attackbox-evidence/shipper"
+		}
 	}
 
 	c.hostname = getenv("HOSTNAME")

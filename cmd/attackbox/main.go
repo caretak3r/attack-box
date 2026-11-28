@@ -1,7 +1,7 @@
 // Command attackbox runs the bait inference API. It serves the generic
 // OpenAI-compatible, vLLM and Ollama personas on separate listeners, answers
-// from local templates, writes JSON lines to stdout and, unless deliberately
-// disabled, ships the same events to New Relic.
+// from local templates, writes JSON lines to stdout and ships the same events
+// to the host shipper via a Unix socket.
 //
 // Configuration is read from ATTACKBOX_* environment variables; see the
 // "Process entry point" section of implementation_plan.md. Flags:
@@ -72,14 +72,21 @@ func cli(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 		return 2
 	}
 	if *check {
-		mode := "enabled"
-		switch {
-		case cfg.nrDisabled:
-			mode = "disabled"
-		case cfg.spoolSocket != "":
-			mode = "off (host shipper), spool " + cfg.spoolSocket
+		fmt.Fprintln(stdout, "configuration ok")
+		for _, l := range cfg.listeners {
+			fmt.Fprintf(stdout, "  %s listener %s\n", l.persona, l.addr)
 		}
-		fmt.Fprintf(stdout, "configuration ok: %d listener(s), new relic %s\n", len(cfg.listeners), mode)
+		for _, m := range cfg.models {
+			fmt.Fprintf(stdout, "  model %s\n", m)
+		}
+		if cfg.spoolSocket != "" {
+			fmt.Fprintf(stdout, "  spool %s\n", cfg.spoolSocket)
+		} else {
+			fmt.Fprintln(stdout, "  local log only, no remote sink")
+		}
+		if cfg.tracing.Socket != "" {
+			fmt.Fprintf(stdout, "  otel collector %s\n", cfg.tracing.Socket)
+		}
 		return 0
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -131,9 +138,8 @@ func healthcheck(raw string) error {
 type app struct {
 	tracing   *observability.Runtime
 	cfg       config
-	local     *telemetry.Async    // JSONLog behind a bounded queue, off the request path
-	nr        *telemetry.NewRelic // direct mode only
-	spool     *telemetry.Spool    // spool mode only: the host shipper owns egress
+	local     *telemetry.Async // JSONLog behind a bounded queue, off the request path
+	spool     *telemetry.Spool // spool mode only: the host shipper owns egress
 	sink      telemetry.Sink
 	servers   []*http.Server
 	listeners []net.Listener
@@ -145,8 +151,8 @@ type app struct {
 }
 
 // provenance is the bait-assigned attribute map: one value per process, laid
-// over every event of the local log, the direct New Relic sink and the spool.
-// fp_scope says what the redactor did, not what the setting asked for.
+// over every event of the local log and the spool. fp_scope says what the
+// redactor did, not what the setting asked for.
 func provenance(cfg config, r *telemetry.Redactor) map[string]any {
 	scope := "boot"
 	if cfg.secretFile != "" && !r.KeyReplaced() {
@@ -181,33 +187,6 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 			_ = tracing.Close()
 		}
 	}()
-	if cfg.nrKey != "" {
-		nr, err := telemetry.NewNewRelic(telemetry.NRConfig{
-			LicenseKey:        cfg.nrKey,
-			LogURL:            cfg.nrLogURL,
-			MetricURL:         cfg.nrMetricURL,
-			FlushInterval:     time.Second,
-			HeartbeatInterval: cfg.beat,
-			Common:            map[string]any{"service.name": "attackbox", "instance": cfg.instance},
-			// The client builds its own heartbeat, outside the sink wrapper.
-			HeartbeatAttrs: func() map[string]any {
-				attrs := maps.Clone(stamp)
-				attrs["local_dropped_total"] = a.local.Dropped()
-				return attrs
-			},
-			// Delivery failures go to the local log only, never back into
-			// the queue that is failing.
-			OnError: func(err error) {
-				a.local.Emit(telemetry.Event{Stream: telemetry.StreamRuntime, Action: "newrelic_error", Result: "error", Attrs: map[string]any{"error": err.Error()}})
-			},
-		})
-		if err != nil {
-			a.closeLocal()
-			return nil, err
-		}
-		a.nr = nr
-		a.sink = telemetry.Multi{a.local, telemetry.WithStamp(nr, stamp)}
-	}
 	if cfg.spoolSocket != "" {
 		sp, err := telemetry.NewSpool(telemetry.SpoolConfig{
 			Socket:       cfg.spoolSocket,
@@ -215,11 +194,9 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 			WriteTimeout: cfg.spoolTimeout,
 			Heartbeat:    cfg.beat,
 			Stamp:        stamp,
-			// The spool cannot see the local queue's counter.
 			HeartbeatAttrs: func() map[string]any {
 				return map[string]any{"local_dropped_total": a.local.Dropped()}
 			},
-			// As for New Relic: failures go to the local log only.
 			OnError: func(err error) {
 				a.local.Emit(telemetry.Event{Stream: telemetry.StreamRuntime, Action: "spool_error", Result: "error", Attrs: map[string]any{"error": err.Error()}})
 			},
@@ -282,11 +259,6 @@ func newApp(cfg config, logOut io.Writer) (*app, error) {
 			bindErr := fmt.Errorf("%s listener %s: %w", l.persona, l.addr, err)
 			var remoteErr error
 			ctx, cancel := context.WithTimeout(context.Background(), cfg.shutdownTimeout)
-			if a.nr != nil {
-				if err := a.nr.Close(ctx); err != nil {
-					remoteErr = fmt.Errorf("new relic close: %w", err)
-				}
-			}
 			if a.spool != nil {
 				if err := a.spool.Close(ctx); err != nil {
 					remoteErr = fmt.Errorf("spool close: %w", err)
@@ -340,8 +312,7 @@ func (a *app) trackHandler(next http.Handler) http.Handler {
 }
 
 // run serves until ctx ends or a listener fails, then shuts down: listeners
-// stop, in-flight requests get shutdownTimeout, and New Relic is flushed.
-// It returns an error if a listener failed or New Relic lost events.
+// stop and in-flight requests get shutdownTimeout.
 func (a *app) run(ctx context.Context) error {
 	healthCtx, stopHealth := context.WithCancel(context.Background())
 	healthDone := make(chan struct{})
@@ -364,7 +335,7 @@ func (a *app) run(ctx context.Context) error {
 			}
 		}
 	}()
-	a.runtime("start", "ok", map[string]any{"version": version, "listeners": a.addrs(), "newrelic": a.nr != nil, "spool": a.spool != nil})
+	a.runtime("start", "ok", map[string]any{"version": version, "listeners": a.addrs(), "spool": a.spool != nil})
 	// Request contexts derive from base. When the grace period ends it is
 	// cancelled with server.ErrShutdown, so cut holds are logged as
 	// server_shutdown rather than client_closed.
@@ -385,8 +356,6 @@ func (a *app) run(ctx context.Context) error {
 	case serveErr = <-errc:
 	}
 
-	// Emitted before the drain so New Relic has the whole flush window for
-	// it; the local "stopped" event below is the authoritative final record.
 	reason := "signal"
 	if serveErr != nil {
 		reason = "listener_error"
@@ -424,19 +393,6 @@ func (a *app) run(ctx context.Context) error {
 	<-healthDone
 	traceErr := a.tracing.Close()
 	attrs := a.tracing.Health()
-	var nrErr error
-	if a.nr != nil {
-		flushCtx, cancelFlush := context.WithTimeout(context.Background(), a.cfg.shutdownTimeout)
-		nrErr = a.nr.Close(flushCtx)
-		cancelFlush()
-		st := a.nr.Stats()
-		for k, v := range map[string]any{"nr_sent": st.Sent, "nr_dropped": st.Dropped, "nr_lost": st.Lost, "nr_errors": st.Errors, "nr_retries": st.Retries} {
-			attrs[k] = v
-		}
-		if nrErr == nil {
-			nrErr = lossError(st)
-		}
-	}
 	var spErr error
 	if a.spool != nil {
 		// The host shipper gets a stopped record with the spool counters as
@@ -449,15 +405,14 @@ func (a *app) run(ctx context.Context) error {
 		spErr = a.spool.Close(flushCtx)
 		cancelFlush()
 	}
-	stopped := a.stopped(serveErr, errors.Join(nrErr, spErr, traceErr), attrs)
-	// Written locally only: the remote sink is closed at this point.
+	stopped := a.stopped(serveErr, errors.Join(spErr, traceErr), attrs)
 	a.local.Emit(stopped)
-	return errors.Join(serveErr, nrErr, spErr, traceErr, a.closeLocal())
+	return errors.Join(serveErr, spErr, traceErr, a.closeLocal())
 }
 
-// stopped builds the final runtime record. attrs holds the New Relic
-// counters, if any; spool and local counters are read now. A forced shutdown
-// never reports a clean end, so it sets forced and a result of error.
+// stopped builds the final runtime record. attrs holds the spool and local
+// counters. A forced shutdown never reports a clean end, so it sets forced and
+// a result of error.
 func (a *app) stopped(serveErr, remoteErr error, nrAttrs map[string]any) telemetry.Event {
 	attrs := make(map[string]any, len(nrAttrs)+20)
 	for k, v := range nrAttrs {
@@ -481,18 +436,6 @@ func (a *app) stopped(serveErr, remoteErr error, nrAttrs map[string]any) telemet
 		result = "error"
 	}
 	return telemetry.Event{Stream: telemetry.StreamRuntime, Action: "stopped", Result: result, Attrs: attrs}
-}
-
-// lossError reports events New Relic never accepted, or nil if none.
-func lossError(st telemetry.Stats) error {
-	if st.Lost == 0 && st.Dropped == 0 {
-		return nil
-	}
-	msg := fmt.Sprintf("new relic: %d lost, %d dropped", st.Lost, st.Dropped)
-	if st.LastError != "" {
-		msg += "; last error: " + st.LastError
-	}
-	return errors.New(msg)
 }
 
 func (a *app) runtime(action, result string, attrs map[string]any) {

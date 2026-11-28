@@ -18,7 +18,7 @@ import (
 // preserves arbitrary bytes through UTF-8 JSON transport. It is not a packet
 // capture: net/http has already parsed headers and decoded transfer framing.
 // A segment is deliberately small enough for the bounded spool and admission
-// path. New Relic's final-hop chunks retain a second, transport-level hash.
+// path.
 const evidenceSegmentBytes = 12 << 10
 const evidenceFlushInterval = 250 * time.Millisecond
 

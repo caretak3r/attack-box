@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -23,14 +22,12 @@ import (
 	"attackbox/internal/telemetry"
 )
 
-const testNRKey = "0123456789abcdef0123456789abcdef0123NRAL"
-
 func envOf(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
 }
 
 func TestLoadConfigDefaults(t *testing.T) {
-	c, err := loadConfig(envOf(map[string]string{"ATTACKBOX_NR_DISABLED": "true"}))
+	c, err := loadConfig(envOf(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,8 +61,6 @@ func TestLoadConfigFull(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err := loadConfig(envOf(map[string]string{
-		"ATTACKBOX_NR_LICENSE_KEY":  testNRKey,
-		"ATTACKBOX_NR_LOG_URL":      "http://127.0.0.1:1/log",
 		"ATTACKBOX_OPENAI_ADDR":     "127.0.0.1:18080",
 		"ATTACKBOX_VLLM_ADDR":       ":8000",
 		"ATTACKBOX_OLLAMA_ADDR":     "[::1]:11434",
@@ -91,7 +86,7 @@ func TestLoadConfigFull(t *testing.T) {
 	if len(c.trustedProxies) != 2 || c.trustedProxies[1].String() != "10.0.0.5/32" {
 		t.Fatalf("proxies = %v", c.trustedProxies)
 	}
-	c2, err := loadConfig(envOf(map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SECRET_FILE": secret, "ATTACKBOX_TIMING": "false"}))
+	c2, err := loadConfig(envOf(map[string]string{"ATTACKBOX_SECRET_FILE": secret, "ATTACKBOX_TIMING": "false"}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,14 +96,11 @@ func TestLoadConfigFull(t *testing.T) {
 	if c2.timing {
 		t.Fatal("ATTACKBOX_TIMING=false must turn response pacing off")
 	}
-	if c.spoolSocket != "" || c.spoolQueue != telemetry.DefaultSpoolQueue || c.spoolTimeout != telemetry.DefaultSpoolTimeout {
-		t.Fatalf("spool defaults = %q %d %v", c.spoolSocket, c.spoolQueue, c.spoolTimeout)
-	}
 	c3, err := loadConfig(envOf(map[string]string{"ATTACKBOX_SPOOL_SOCKET": "/run/attackbox/spool.sock", "ATTACKBOX_SPOOL_QUEUE": "100000", "ATTACKBOX_SPOOL_TIMEOUT": "2s"}))
 	if err != nil {
 		t.Fatalf("spool mode needs no key: %v", err)
 	}
-	if c3.nrKey != "" || c3.nrDisabled || c3.spoolSocket != "/run/attackbox/spool.sock" || c3.spoolQueue != 100000 || c3.spoolTimeout != 2*time.Second {
+	if c3.spoolSocket != "/run/attackbox/spool.sock" || c3.spoolQueue != 100000 || c3.spoolTimeout != 2*time.Second {
 		t.Fatalf("spool config = %+v", c3)
 	}
 }
@@ -142,39 +134,32 @@ func TestLoadConfigErrors(t *testing.T) {
 		env  map[string]string
 		want string
 	}{
-		"nr key required":   {map[string]string{}, "ATTACKBOX_NR_LICENSE_KEY is required"},
-		"nr user key":       {map[string]string{"ATTACKBOX_NR_LICENSE_KEY": "NRAK-example"}, "not an ingest license key"},
-		"nr key shape":      {map[string]string{"ATTACKBOX_NR_LICENSE_KEY": "abc123"}, "must be 40 characters"},
-		"nr conflict":       {map[string]string{"ATTACKBOX_NR_DISABLED": "true", "ATTACKBOX_NR_LICENSE_KEY": testNRKey}, "conflicts"},
-		"bad bool":          {map[string]string{"ATTACKBOX_NR_DISABLED": "maybe"}, "want true or false"},
-		"bad timing":        {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_TIMING": "fast"}, "ATTACKBOX_TIMING"},
-		"bad duration":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_HOLD_SILENT": "soon"}, "ATTACKBOX_HOLD_SILENT"},
-		"negative duration": {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_IDLE_INTERVAL": "-1s"}, "ATTACKBOX_IDLE_INTERVAL"},
-		"hold over stream":  {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_HOLD_SILENT": "10s", "ATTACKBOX_MAX_STREAM": "5s"}, "must not exceed"},
-		"bad int":           {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_SESSIONS": "0"}, "ATTACKBOX_MAX_SESSIONS"},
-		"no listeners":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_OPENAI_ADDR": "off"}, "no listener enabled"},
-		"bad addr":          {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_OPENAI_ADDR": "example.com:80"}, "host must be an IP"},
-		"bad port":          {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_VLLM_ADDR": ":99999"}, "invalid port"},
-		"dup addr":          {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_VLLM_ADDR": "127.0.0.1:8080"}, "already used"},
-		"wildcard overlap":  {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_VLLM_ADDR": ":8080"}, "already used"},
-		"bad proxy":         {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_TRUSTED_PROXIES": "proxy.local"}, "not an IP or CIDR"},
-		"bad model":         {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MODELS": "a\x01b"}, "invalid model"},
-		"bad instance":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_INSTANCE": "has space"}, "ATTACKBOX_INSTANCE"},
-		"short secret":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SECRET_FILE": short}, "at least 32 bytes"},
-		"missing secret":    {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SECRET_FILE": "/nonexistent/secret"}, "ATTACKBOX_SECRET_FILE"},
-		"open secret":       {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SECRET_FILE": open}, "readable by group or others"},
-		"group secret":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SECRET_FILE": group}, "readable by group or others"},
-		"dir secret":        {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SECRET_FILE": dir}, "not a regular file"},
-		"huge secret":       {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SECRET_FILE": huge}, "at most 4096"},
-		"sessions cap":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_SESSIONS": "100001"}, "ATTACKBOX_MAX_SESSIONS: want an integer from 1 to 100000"},
-		"body cap":          {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_BODY_BYTES": "9223372036854775807"}, "ATTACKBOX_MAX_BODY_BYTES"},
-		"log body cap":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_LOG_BODY": "1048577"}, "ATTACKBOX_MAX_LOG_BODY"},
-		"in-flight cap":     {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_IN_FLIGHT": "10001"}, "ATTACKBOX_MAX_IN_FLIGHT"},
-		"per-source cap":    {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_PER_SOURCE": "1001"}, "ATTACKBOX_MAX_PER_SOURCE"},
-		"per-source>total":  {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_MAX_PER_SOURCE": "20", "ATTACKBOX_MAX_IN_FLIGHT": "10"}, "must not exceed ATTACKBOX_MAX_IN_FLIGHT"},
-		"duration cap":      {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SHUTDOWN_TIMEOUT": "2h"}, "ATTACKBOX_SHUTDOWN_TIMEOUT"},
-		"spool+disabled":    {map[string]string{"ATTACKBOX_NR_DISABLED": "1", "ATTACKBOX_SPOOL_SOCKET": "/run/attackbox/spool.sock"}, "ATTACKBOX_NR_DISABLED=true conflicts with ATTACKBOX_SPOOL_SOCKET"},
-		"spool+key":         {map[string]string{"ATTACKBOX_NR_LICENSE_KEY": testNRKey, "ATTACKBOX_SPOOL_SOCKET": "/run/attackbox/spool.sock"}, "only the host shipper holds the key"},
+		"bad timing":        {map[string]string{"ATTACKBOX_TIMING": "fast"}, "ATTACKBOX_TIMING"},
+		"bad duration":      {map[string]string{"ATTACKBOX_HOLD_SILENT": "soon"}, "ATTACKBOX_HOLD_SILENT"},
+		"negative duration": {map[string]string{"ATTACKBOX_IDLE_INTERVAL": "-1s"}, "ATTACKBOX_IDLE_INTERVAL"},
+		"hold over stream":  {map[string]string{"ATTACKBOX_HOLD_SILENT": "10s", "ATTACKBOX_MAX_STREAM": "5s"}, "must not exceed"},
+		"bad int":           {map[string]string{"ATTACKBOX_MAX_SESSIONS": "0"}, "ATTACKBOX_MAX_SESSIONS"},
+		"no listeners":      {map[string]string{"ATTACKBOX_OPENAI_ADDR": "off"}, "no listener enabled"},
+		"bad addr":          {map[string]string{"ATTACKBOX_OPENAI_ADDR": "example.com:80"}, "host must be an IP"},
+		"bad port":          {map[string]string{"ATTACKBOX_VLLM_ADDR": ":99999"}, "invalid port"},
+		"dup addr":          {map[string]string{"ATTACKBOX_VLLM_ADDR": "127.0.0.1:8080"}, "already used"},
+		"wildcard overlap":  {map[string]string{"ATTACKBOX_VLLM_ADDR": ":8080"}, "already used"},
+		"bad proxy":         {map[string]string{"ATTACKBOX_TRUSTED_PROXIES": "proxy.local"}, "not an IP or CIDR"},
+		"bad model":         {map[string]string{"ATTACKBOX_MODELS": "a\x01b"}, "invalid model"},
+		"bad instance":      {map[string]string{"ATTACKBOX_INSTANCE": "has space"}, "ATTACKBOX_INSTANCE"},
+		"short secret":      {map[string]string{"ATTACKBOX_SECRET_FILE": short}, "at least 32 bytes"},
+		"missing secret":    {map[string]string{"ATTACKBOX_SECRET_FILE": "/nonexistent/secret"}, "ATTACKBOX_SECRET_FILE"},
+		"open secret":       {map[string]string{"ATTACKBOX_SECRET_FILE": open}, "readable by group or others"},
+		"group secret":      {map[string]string{"ATTACKBOX_SECRET_FILE": group}, "readable by group or others"},
+		"dir secret":        {map[string]string{"ATTACKBOX_SECRET_FILE": dir}, "not a regular file"},
+		"huge secret":       {map[string]string{"ATTACKBOX_SECRET_FILE": huge}, "at most 4096"},
+		"sessions cap":      {map[string]string{"ATTACKBOX_MAX_SESSIONS": "100001"}, "ATTACKBOX_MAX_SESSIONS: want an integer from 1 to 100000"},
+		"body cap":          {map[string]string{"ATTACKBOX_MAX_BODY_BYTES": "9223372036854775807"}, "ATTACKBOX_MAX_BODY_BYTES"},
+		"log body cap":      {map[string]string{"ATTACKBOX_MAX_LOG_BODY": "1048577"}, "ATTACKBOX_MAX_LOG_BODY"},
+		"in-flight cap":     {map[string]string{"ATTACKBOX_MAX_IN_FLIGHT": "10001"}, "ATTACKBOX_MAX_IN_FLIGHT"},
+		"per-source cap":    {map[string]string{"ATTACKBOX_MAX_PER_SOURCE": "1001"}, "ATTACKBOX_MAX_PER_SOURCE"},
+		"per-source>total":  {map[string]string{"ATTACKBOX_MAX_PER_SOURCE": "20", "ATTACKBOX_MAX_IN_FLIGHT": "10"}, "must not exceed ATTACKBOX_MAX_IN_FLIGHT"},
+		"duration cap":      {map[string]string{"ATTACKBOX_SHUTDOWN_TIMEOUT": "2h"}, "ATTACKBOX_SHUTDOWN_TIMEOUT"},
 		"relative spool":    {map[string]string{"ATTACKBOX_SPOOL_SOCKET": "spool.sock"}, "ATTACKBOX_SPOOL_SOCKET: spool: socket path must be absolute"},
 		"long spool":        {map[string]string{"ATTACKBOX_SPOOL_SOCKET": "/" + strings.Repeat("s", 107)}, "at most 107"},
 		"spool queue cap":   {map[string]string{"ATTACKBOX_SPOOL_SOCKET": "/run/s.sock", "ATTACKBOX_SPOOL_QUEUE": "100001"}, "ATTACKBOX_SPOOL_QUEUE: want an integer from 1 to 100000"},
@@ -196,20 +181,13 @@ func TestCLIFlags(t *testing.T) {
 		t.Fatalf("version: code %d out %q", code, out.String())
 	}
 	out.Reset()
-	if code := cli([]string{"-check-config"}, envOf(map[string]string{"ATTACKBOX_NR_DISABLED": "1"}), &out, &errb); code != 0 || !strings.Contains(out.String(), "new relic disabled") {
+	if code := cli([]string{"-check-config"}, envOf(nil), &out, &errb); code != 0 || !strings.Contains(out.String(), "configuration ok") {
 		t.Fatalf("check-config: code %d out %q err %q", code, out.String(), errb.String())
 	}
 	out.Reset()
 	if code := cli([]string{"-check-config"}, envOf(map[string]string{"ATTACKBOX_SPOOL_SOCKET": "/run/attackbox/spool.sock"}), &out, &errb); code != 0 ||
-		!strings.Contains(out.String(), "new relic off (host shipper), spool /run/attackbox/spool.sock") {
+		!strings.Contains(out.String(), "spool /run/attackbox/spool.sock") {
 		t.Fatalf("check-config spool: code %d out %q err %q", code, out.String(), errb.String())
-	}
-	errb.Reset()
-	if code := cli([]string{"-check-config"}, envOf(nil), &out, &errb); code != 2 || !strings.Contains(errb.String(), "ATTACKBOX_NR_LICENSE_KEY") {
-		t.Fatalf("missing key: code %d err %q", code, errb.String())
-	}
-	if code := cli([]string{"stray"}, envOf(nil), &out, &errb); code != 2 {
-		t.Fatalf("stray arg code %d", code)
 	}
 	if code := cli([]string{"-nope"}, envOf(nil), &out, &errb); code != 2 {
 		t.Fatalf("bad flag code %d", code)
@@ -268,27 +246,6 @@ func (s *syncBuf) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.b.String()
-}
-
-// nrIntake is a fake New Relic Log and Metric API.
-type nrIntake struct {
-	mu    sync.Mutex
-	posts map[string][][]byte
-	keys  []string
-}
-
-func (n *nrIntake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	zr, err := gzip.NewReader(r.Body)
-	if err != nil {
-		w.WriteHeader(400)
-		return
-	}
-	b, _ := io.ReadAll(zr)
-	n.mu.Lock()
-	n.posts[r.URL.Path] = append(n.posts[r.URL.Path], b)
-	n.keys = append(n.keys, r.Header.Get("Api-Key"))
-	n.mu.Unlock()
-	w.WriteHeader(http.StatusAccepted)
 }
 
 func startApp(t *testing.T, env map[string]string) (*app, *syncBuf, context.CancelFunc, chan error) {
@@ -356,18 +313,10 @@ func get(t *testing.T, url string) (*http.Response, string) {
 	return resp, string(b)
 }
 
-// TestLiveThreePersonas runs the real listeners on loopback with a fake New
-// Relic intake and checks each persona, streaming, shared sessions, local
-// logs, redaction and the shutdown flush.
+// TestLiveThreePersonas runs the real listeners on loopback and checks each
+// persona, streaming, shared sessions, local logs and redaction.
 func TestLiveThreePersonas(t *testing.T) {
-	intake := &nrIntake{posts: map[string][][]byte{}}
-	nr := httptest.NewServer(intake)
-	defer nr.Close()
-
 	a, logs, cancel, done := startApp(t, map[string]string{
-		"ATTACKBOX_NR_LICENSE_KEY":            testNRKey,
-		"ATTACKBOX_NR_LOG_URL":                nr.URL + "/log/v1",
-		"ATTACKBOX_NR_METRIC_URL":             nr.URL + "/metric/v1",
 		"ATTACKBOX_OPENAI_ADDR":               "127.0.0.1:0",
 		"ATTACKBOX_VLLM_ADDR":                 "127.0.0.1:0",
 		"ATTACKBOX_OLLAMA_ADDR":               "127.0.0.1:0",
@@ -429,7 +378,7 @@ func TestLiveThreePersonas(t *testing.T) {
 	}
 
 	out := logs.String()
-	if strings.Contains(out, bearer) || strings.Contains(out, testNRKey) {
+	if strings.Contains(out, bearer) {
 		t.Fatal("raw credential in local log")
 	}
 	personas := map[string]bool{}
@@ -442,64 +391,22 @@ func TestLiveThreePersonas(t *testing.T) {
 			started = true
 		}
 		if l["stream"] == "runtime" && l["action"] == "stopped" {
-			stopped = l["result"] == "ok" && l["nr_lost"] == float64(0) && l["nr_sent"].(float64) > 0 &&
-				l["nr_retries"] == float64(0) && l["local_dropped"] == float64(0)
+			stopped = l["result"] == "ok" && l["local_dropped"] == float64(0)
 		}
 	}
 	if !personas["openai"] || !personas["vllm"] || !personas["ollama"] || !started || !stopped {
 		t.Fatalf("personas %v started %v stopped %v\n%s", personas, started, stopped, out)
 	}
-
-	intake.mu.Lock()
-	defer intake.mu.Unlock()
-	if len(intake.posts["/log/v1"]) == 0 || len(intake.posts["/metric/v1"]) == 0 {
-		t.Fatalf("nr posts = %d logs, %d metrics", len(intake.posts["/log/v1"]), len(intake.posts["/metric/v1"]))
-	}
-	for _, k := range intake.keys {
-		if k != testNRKey {
-			t.Fatalf("Api-Key = %q", k)
-		}
-	}
-	var shipped strings.Builder
-	for _, p := range intake.posts["/log/v1"] {
-		shipped.Write(p)
-	}
-	s := shipped.String()
-	if strings.Contains(s, bearer) || !strings.Contains(s, `"instance":"test-box"`) || !strings.Contains(s, `"persona":"ollama"`) || !strings.Contains(s, `"action":"stop"`) {
-		t.Fatalf("shipped logs unexpected: %.400s", s)
-	}
-}
-
-// TestNRFailureIsReported checks that a failing intake makes run return an
-// error and logs the failure locally, instead of claiming delivery.
-func TestNRFailureIsReported(t *testing.T) {
-	nr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(403) }))
-	defer nr.Close()
-	a, logs, cancel, done := startApp(t, map[string]string{
-		"ATTACKBOX_NR_LICENSE_KEY": testNRKey,
-		"ATTACKBOX_NR_LOG_URL":     nr.URL + "/log/v1",
-		"ATTACKBOX_NR_METRIC_URL":  nr.URL + "/metric/v1",
-		"ATTACKBOX_OPENAI_ADDR":    "127.0.0.1:0",
-	})
-	get(t, "http://"+a.addrs()["openai"]+"/health")
-	err := stop(t, cancel, done)
-	if err == nil || !strings.Contains(err.Error(), "lost") {
-		t.Fatalf("run err = %v, want lost-events error", err)
-	}
-	out := logs.String()
-	if !strings.Contains(out, `"action":"newrelic_error"`) || !strings.Contains(out, `"result":"error"`) || strings.Contains(out, testNRKey) {
-		t.Fatalf("local log: %s", out)
-	}
 }
 
 func TestLocalOnlyAndPortConflict(t *testing.T) {
-	a, logs, cancel, done := startApp(t, map[string]string{"ATTACKBOX_NR_DISABLED": "true", "ATTACKBOX_OPENAI_ADDR": "127.0.0.1:0"})
+	a, logs, cancel, done := startApp(t, map[string]string{"ATTACKBOX_OPENAI_ADDR": "127.0.0.1:0"})
 	addr := a.addrs()["openai"]
 	if resp, _ := get(t, "http://"+addr+"/health"); resp.StatusCode != 200 {
 		t.Fatalf("health %d", resp.StatusCode)
 	}
 
-	cfg, err := loadConfig(envOf(map[string]string{"ATTACKBOX_NR_DISABLED": "true", "ATTACKBOX_OPENAI_ADDR": addr}))
+	cfg, err := loadConfig(envOf(map[string]string{"ATTACKBOX_OPENAI_ADDR": addr}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,7 +456,6 @@ func (c heldReadConn) Read(p []byte) (int, error) {
 
 func TestShutdownCutsHolds(t *testing.T) {
 	cfg, err := loadConfig(envOf(map[string]string{
-		"ATTACKBOX_NR_DISABLED":               "true",
 		"ATTACKBOX_OPENAI_ADDR":               "127.0.0.1:0",
 		"ATTACKBOX_SHUTDOWN_TIMEOUT":          "500ms",
 		"ATTACKBOX_SKIP_SELF_PROBE_DETECTION": "true",
@@ -604,60 +510,6 @@ func TestShutdownCutsHolds(t *testing.T) {
 	request, stopped := strings.Index(out, `"direction":"request"`), strings.Index(out, `"action":"stopped"`)
 	if request < 0 || stopped <= request {
 		t.Fatalf("expected the interrupted request log before stopped:\n%s", out)
-	}
-}
-
-// TestPartialBindClosesNewRelic checks that a failed second listener closes
-// the New Relic shipper and reports its close error instead of dropping it.
-func TestPartialBindClosesNewRelic(t *testing.T) {
-	release := make(chan struct{})
-	nr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select { // hang until the test ends, so Close hits its deadline
-		case <-release:
-		case <-r.Context().Done():
-		}
-	}))
-	defer nr.Close() // waits for handlers, after release below
-	defer close(release)
-
-	busy, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer busy.Close()
-	cfg, err := loadConfig(envOf(map[string]string{
-		"ATTACKBOX_NR_LICENSE_KEY":   testNRKey,
-		"ATTACKBOX_NR_LOG_URL":       nr.URL + "/log/v1",
-		"ATTACKBOX_NR_METRIC_URL":    nr.URL + "/metric/v1",
-		"ATTACKBOX_OPENAI_ADDR":      "127.0.0.1:0",
-		"ATTACKBOX_VLLM_ADDR":        busy.Addr().String(),
-		"ATTACKBOX_SHUTDOWN_TIMEOUT": "150ms",
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	start := time.Now()
-	_, err = newApp(cfg, io.Discard)
-	if err == nil || !strings.Contains(err.Error(), "vllm listener") || !strings.Contains(err.Error(), "new relic close") {
-		t.Fatalf("err = %v, want bind and new relic close errors", err)
-	}
-	if strings.Contains(err.Error(), testNRKey) {
-		t.Fatal("key in error")
-	}
-	if d := time.Since(start); d > 3*time.Second {
-		t.Fatalf("partial-bind cleanup took %v", d)
-	}
-}
-
-func TestLossError(t *testing.T) {
-	if err := lossError(telemetry.Stats{}); err != nil {
-		t.Fatalf("clean stats: %v", err)
-	}
-	if err := lossError(telemetry.Stats{Dropped: 3}); err == nil || err.Error() != "new relic: 0 lost, 3 dropped" {
-		t.Fatalf("no last error: %v", err)
-	}
-	if err := lossError(telemetry.Stats{Lost: 2, LastError: "status 403"}); err == nil || err.Error() != "new relic: 2 lost, 0 dropped; last error: status 403" {
-		t.Fatalf("with last error: %v", err)
 	}
 }
 
@@ -740,8 +592,8 @@ func TestSpoolMode(t *testing.T) {
 		"ATTACKBOX_TIMING":                    "false",
 		"ATTACKBOX_SKIP_SELF_PROBE_DETECTION": "true",
 	})
-	if a.nr != nil || a.spool == nil {
-		t.Fatal("spool mode must not build a New Relic client")
+	if a.spool == nil {
+		t.Fatal("spool mode must build the spool")
 	}
 	const bearer = "sk-proj-REALLOOKINGSECRET0123456789"
 	resp, _ := post(t, "http://"+a.addrs()["openai"]+"/v1/chat/completions",
@@ -807,12 +659,12 @@ func TestSpoolMode(t *testing.T) {
 		if l["stream"] == "runtime" && l["action"] == "stopped" {
 			local = l
 		}
-		if l["action"] == "start" && (l["spool"] != true || l["newrelic"] != false) {
+		if l["action"] == "start" && l["spool"] != true {
 			t.Fatalf("start event = %v", l)
 		}
 	}
 	if local == nil || local["result"] != "ok" || local["spool_written"] != float64(len(recs)) ||
-		local["spool_lost"] != float64(0) || local["spool_dropped"] != float64(0) || local["nr_sent"] != nil {
+		local["spool_lost"] != float64(0) || local["spool_dropped"] != float64(0) {
 		t.Fatalf("local stopped = %v (socket got %d records)", local, len(recs))
 	}
 }
@@ -1040,96 +892,6 @@ func TestProvenanceSpoolMode(t *testing.T) {
 	}
 }
 
-// TestProvenanceDirectNR checks the stamps on events and on the heartbeat that
-// the New Relic client builds for itself, and that metrics keep their labels.
-// No secret file is set, so the scope is boot.
-func TestProvenanceDirectNR(t *testing.T) {
-	intake := &nrIntake{posts: map[string][][]byte{}}
-	nr := httptest.NewServer(intake)
-	defer nr.Close()
-	var epoch string
-	a, logs, cancel, done := startAppWith(t, map[string]string{
-		"ATTACKBOX_NR_LICENSE_KEY":            testNRKey,
-		"ATTACKBOX_NR_LOG_URL":                nr.URL + "/log/v1",
-		"ATTACKBOX_NR_METRIC_URL":             nr.URL + "/metric/v1",
-		"ATTACKBOX_OPENAI_ADDR":               "127.0.0.1:0",
-		"ATTACKBOX_TIMING":                    "false",
-		"ATTACKBOX_SKIP_SELF_PROBE_DETECTION": "true",
-	}, func(c *config) {
-		c.beat = 20 * time.Millisecond
-		epoch = telemetry.NewRedactor(c.derive("redact")).Epoch()
-	})
-	get(t, "http://"+a.addrs()["openai"]+"/v1/models")
-	shipped := func() map[string]map[string]any {
-		intake.mu.Lock()
-		defer intake.mu.Unlock()
-		out := map[string]map[string]any{}
-		for _, p := range intake.posts["/log/v1"] {
-			var env []struct {
-				Logs []struct {
-					Attributes map[string]any `json:"attributes"`
-				} `json:"logs"`
-			}
-			if err := json.Unmarshal(p, &env); err != nil {
-				t.Errorf("log post is not JSON: %v", err)
-				continue
-			}
-			for _, c := range env {
-				for _, l := range c.Logs {
-					out[l.Attributes["stream"].(string)+"/"+l.Attributes["action"].(string)] = l.Attributes
-				}
-			}
-		}
-		return out
-	}
-	waitFor(t, "a direct heartbeat", func() bool { return shipped()["heartbeat/heartbeat"] != nil })
-	if err := stop(t, cancel, done); err != nil {
-		t.Fatalf("run: %v", err)
-	}
-
-	items := shipped()
-	var edge bool
-	for w, attrs := range items {
-		edge = edge || strings.HasPrefix(w, telemetry.StreamEdge+"/")
-		wantProvenance(t, "nr "+w, attrs, epoch, "boot")
-	}
-	for _, w := range []string{"runtime/start", "runtime/stop", "heartbeat/heartbeat"} {
-		if items[w] == nil {
-			t.Errorf("no %s shipped; saw %d kinds", w, len(items))
-		}
-	}
-	if !edge {
-		t.Error("no edge event shipped")
-	}
-	if beat := items["heartbeat/heartbeat"]; beat != nil {
-		if _, ok := beat["local_dropped_total"]; !ok {
-			t.Errorf("nr heartbeat has no local_dropped_total: %v", beat)
-		}
-	}
-	var stopped bool
-	for _, l := range logs.lines(t) {
-		if l["action"] == "stopped" {
-			stopped = true
-			wantProvenance(t, "local stopped", l, epoch, "boot")
-			if _, ok := l["local_dropped_total"]; !ok || l["forced"] != false {
-				t.Errorf("local stopped: local_dropped_total %v forced %v", l["local_dropped_total"], l["forced"])
-			}
-		}
-	}
-	if !stopped {
-		t.Error("no local stopped")
-	}
-	intake.mu.Lock()
-	defer intake.mu.Unlock()
-	for _, p := range intake.posts["/metric/v1"] {
-		for _, k := range provKeys {
-			if bytes.Contains(p, []byte(k)) {
-				t.Errorf("metric post carries %s: %.200s", k, p)
-			}
-		}
-	}
-}
-
 // gatedWriter blocks every write until gate is closed.
 type gatedWriter struct {
 	syncBuf
@@ -1144,7 +906,7 @@ func (g *gatedWriter) Write(p []byte) (int, error) {
 // TestProvenanceOnLocalDropped checks that local_dropped, which the queue
 // writes itself, passes through the stamp.
 func TestProvenanceOnLocalDropped(t *testing.T) {
-	cfg, err := loadConfig(envOf(map[string]string{"ATTACKBOX_NR_DISABLED": "true", "ATTACKBOX_OPENAI_ADDR": "127.0.0.1:0"}))
+	cfg, err := loadConfig(envOf(map[string]string{"ATTACKBOX_OPENAI_ADDR": "127.0.0.1:0"}))
 	if err != nil {
 		t.Fatal(err)
 	}

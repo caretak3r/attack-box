@@ -1,5 +1,5 @@
 [Unit]
-Description=Attack-box telemetry shipper
+Description=Attack-box evidence shipper
 Documentation=https://github.com/example/attack-box
 After=network-online.target nftables.service
 Wants=network-online.target
@@ -27,11 +27,10 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadOnlyPaths=/
-ReadWritePaths=/run/attackbox /var/lib/attackbox-shipper
+ReadWritePaths=/run/attackbox /var/lib/attackbox-shipper /var/lib/attackbox-evidence
 
-# State directory (mode 0700, owned by abx-ship)
-StateDirectory=attackbox-shipper
-StateDirectoryMode=0700
+# State directory: attackbox-shipper (queue) and attackbox-evidence/shipper (evidence files)
+StateDirectory=attackbox-shipper attackbox-evidence/shipper
 
 # Runtime directory: abx-ship:abx-bait, mode 0710. Primary group abx-bait means
 # the 0220 sockets are created abx-ship:abx-bait, so the bait (gid 65532) can
@@ -70,8 +69,8 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 ProtectClock=yes
 
-# Network access for New Relic egress
-PrivateNetwork=no
+# No network access needed for local evidence files
+PrivateNetwork=yes
 
 # System calls
 SystemCallFilter=@system-service

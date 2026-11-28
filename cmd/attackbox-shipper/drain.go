@@ -21,46 +21,32 @@ type drainQueue interface {
 	Ack(n int) error
 }
 
-// drainSink is the part of telemetry.NewRelic the drain loop uses. Both calls
-// block until New Relic accepts the item or the attempt fails.
-type drainSink interface {
-	ShipEvent(telemetry.Event) error
-	ShipMetric(name, kind string, value float64, at time.Time, attrs map[string]string) error
-}
-
-// batchDrainSink is optional so small test/adapter sinks keep the single-item
-// contract. The production client accepts a whole bounded batch synchronously.
-type batchDrainSink interface {
-	ShipRecords([]telemetry.Record) error
-}
-
-type rejectedStore interface {
-	Put(shipper.Entry, string) error
+// evidenceWriter is the part the drain uses to write evidence envelopes.
+type evidenceWriter interface {
+	Write(role string, records []struct {
+		Seq  uint64
+		Data []byte
+	}) error
 }
 
 const (
-	drainReadMax      = telemetry.MaxShipRecords // entries per Read
+	drainReadMax      = 200 // entries per Read
 	drainReadMaxBytes = 512 << 10
-	drainAckEvery     = 200 // checkpoint after this many delivered records
+	drainAckEvery     = 200
 	drainAckInterval  = time.Second
-	drainIdlePoll     = 100 * time.Millisecond // wait before re-reading an empty queue
-	drainRetryWait    = 250 * time.Millisecond // wait after the sink failed a delivery
+	drainIdlePoll     = 100 * time.Millisecond
+	drainRetryWait    = 250 * time.Millisecond
 )
 
-// drain reads entries from the queue and delivers them to New Relic
-// synchronously. It checkpoints remote receipts or fsynced rejected records, so a crash or
-// New Relic outage replays everything the checkpoint does not cover. A failed
-// transient failure stays in memory and is retried; nothing behind it is delivered or
-// acknowledged first. Uncertain recovery suppresses metrics up to
-// uncertainThrough to avoid double-counting.
-func drain(ctx context.Context, q drainQueue, nr drainSink, uncertain bool, uncertainThrough uint64, rejected ...rejectedStore) error {
+// drain reads entries from the queue and writes them to local evidence files
+// synchronously. It checkpoints fsynced writes, so a crash replays everything
+// the checkpoint does not cover. A failed write stays in memory and is retried;
+// nothing behind it is delivered or acknowledged first. Uncertain recovery
+// suppresses metrics up to uncertainThrough to avoid double-counting.
+func drain(ctx context.Context, q drainQueue, w evidenceWriter, role string, uncertain bool, uncertainThrough uint64) error {
 	var skipThrough uint64
 	if uncertain {
 		skipThrough = uncertainThrough
-		// Signal the suppressed range.
-		if err := nr.ShipMetric("attackbox.metric_replay_gap", "gauge", 1, time.Now(), nil); err != nil {
-			return fmt.Errorf("failed to emit metric_replay_gap: %w", err)
-		}
 	}
 
 	var (
@@ -91,12 +77,10 @@ func drain(ctx context.Context, q drainQueue, nr drainSink, uncertain bool, unce
 			idle = len(entries) == 0
 		}
 
-		n, blocked, err := deliver(ctx, nr, pending, skipThrough, rejected...)
+		n, blocked, err := deliver(ctx, w, role, pending, skipThrough)
 		pending = pending[n:]
 		toAck += n
 		if err != nil {
-			// Fail closed on a payload that does not decode, but keep what
-			// was delivered before it.
 			return errors.Join(err, checkpoint())
 		}
 
@@ -123,116 +107,55 @@ func drain(ctx context.Context, q drainQueue, nr drainSink, uncertain bool, unce
 		t.Stop()
 	}
 
-	// Shutdown: ack what was delivered. Entries still pending replay on the
-	// next start. The checkpoint error outranks ctx.Err, which the caller
-	// treats as a clean stop.
 	if err := checkpoint(); err != nil {
 		return err
 	}
 	return ctx.Err()
 }
 
-// deliver hands entries to the sink in order and returns how many were taken
-// from the front. blocked reports that the sink failed an item, so the rest
-// must wait. Metrics at or below skipThrough are taken but not shipped. A
-// delivery that succeeded counts even if ctx ended during the call, but
-// nothing after it is attempted. err is set for a payload that does not decode.
-func deliver(ctx context.Context, nr drainSink, entries []shipper.Entry, skipThrough uint64, rejected ...rejectedStore) (n int, blocked bool, err error) {
-	if batch, ok := nr.(batchDrainSink); ok {
-		return deliverBatch(ctx, batch, entries, skipThrough, rejected...)
+// deliver writes entries to the evidence writer in one batch. blocked reports
+// that the writer failed, so the rest must wait. Metrics at or below skipThrough
+// are taken but not written. err is set for a payload that does not decode.
+func deliver(ctx context.Context, w evidenceWriter, role string, entries []shipper.Entry, skipThrough uint64) (n int, blocked bool, err error) {
+	if len(entries) == 0 || ctx.Err() != nil {
+		return 0, false, nil
+	}
+	var batch []struct {
+		Seq  uint64
+		Data []byte
 	}
 	for _, e := range entries {
 		if ctx.Err() != nil {
-			return n, false, nil
+			break
 		}
 		var rec telemetry.Record
 		if err := json.Unmarshal(e.Data, &rec); err != nil {
 			return n, false, fmt.Errorf("corrupt queue payload at seq %d: %w", e.Seq, err)
 		}
-		switch {
-		case rec.Event != nil:
-			if err := nr.ShipEvent(*rec.Event); err != nil {
-				return n, true, nil
-			}
-		case rec.Metric != nil && e.Seq > skipThrough:
-			m := rec.Metric
-			if err := nr.ShipMetric(m.Name, m.Kind, m.Value, m.At, m.Attrs); err != nil {
-				return n, true, nil
-			}
-		}
-		n++
-	}
-	return n, false, nil
-}
-
-// deliverBatch never acknowledges a partial remote result. A failed request
-// leaves all entries pending, even if an earlier POST in the batch succeeded.
-// Stable record/chunk IDs allow log dedup; count metrics remain at-least-once.
-// Do not wait for more entries to fill a batch: low-volume traffic ships on
-// the first Read, at most drainIdlePoll after reaching an empty queue.
-func deliverBatch(ctx context.Context, nr batchDrainSink, entries []shipper.Entry, skipThrough uint64, rejected ...rejectedStore) (int, bool, error) {
-	if ctx.Err() != nil || len(entries) == 0 {
-		return 0, false, nil
-	}
-	records := make([]telemetry.Record, 0, len(entries))
-	for _, e := range entries {
-		var rec telemetry.Record
-		if err := json.Unmarshal(e.Data, &rec); err != nil {
-			return 0, false, fmt.Errorf("corrupt queue payload at seq %d: %w", e.Seq, err)
-		}
-		if (rec.Event == nil) == (rec.Metric == nil) {
-			return 0, false, fmt.Errorf("invalid queue payload at seq %d: exactly one event or metric required", e.Seq)
-		}
 		if rec.Metric != nil && e.Seq <= skipThrough {
+			n++
 			continue
 		}
-		records = append(records, rec)
+		batch = append(batch, struct {
+			Seq  uint64
+			Data []byte
+		}{e.Seq, e.Data})
+		n++
 	}
-	if ctx.Err() != nil {
-		return 0, false, nil
+	if len(batch) == 0 {
+		return n, false, nil
 	}
-	if len(records) > 0 {
-		_, span := observability.Tracer(ctx).Start(ctx, "shipper.export", trace.WithNewRoot(), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attribute.Int("attackbox.batch_records", len(records))))
-		sc := span.SpanContext()
-		if sc.IsValid() {
-			for i := range records {
-				if e := records[i].Event; e != nil {
-					if e.Attrs == nil {
-						e.Attrs = map[string]any{}
-					}
-					e.Attrs["export.trace.id"] = sc.TraceID().String()
-					e.Attrs["export.span.id"] = sc.SpanID().String()
-				}
-			}
-		}
-		err := nr.ShipRecords(records)
-		if err != nil {
-			span.SetStatus(codes.Error, "export_failed")
-			span.SetAttributes(attribute.String("error.type", "export_failed"))
-		} else {
-			span.SetAttributes(attribute.Int("attackbox.batch_accepted", len(records)))
-		}
-		span.End()
-		if err != nil {
-			reason, permanent := telemetry.RejectionReason(err)
-			if !permanent || len(rejected) == 0 || rejected[0] == nil {
-				return 0, true, nil
-			}
-			if len(entries) > 1 {
-				mid := len(entries) / 2
-				n, blocked, err := deliverBatch(ctx, nr, entries[:mid], skipThrough, rejected...)
-				if blocked || err != nil || n != mid {
-					return n, blocked, err
-				}
-				m, blocked, err := deliverBatch(ctx, nr, entries[mid:], skipThrough, rejected...)
-				return n + m, blocked, err
-			}
-			if err := rejected[0].Put(entries[0], reason); err != nil {
-				return 0, false, fmt.Errorf("retain rejected record at seq %d: %w", entries[0].Seq, err)
-			}
-			return 1, false, nil
-		}
+	_, span := observability.Tracer(ctx).Start(ctx, "shipper.export", trace.WithNewRoot(), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attribute.Int("attackbox.batch_records", len(batch))))
+	werr := w.Write(role, batch)
+	if werr != nil {
+		span.SetStatus(codes.Error, "")
+		span.SetAttributes(attribute.String("error.type", "export_failed"))
+	} else {
+		span.SetAttributes(attribute.Int("attackbox.batch_accepted", len(batch)))
 	}
-	// An accepted batch counts even if cancellation arrived during the POST.
-	return len(entries), false, nil
+	span.End()
+	if werr != nil {
+		return 0, true, nil
+	}
+	return n, false, nil
 }

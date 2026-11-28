@@ -23,7 +23,7 @@
 //     there is no percent-decoding, so encoded and raw forms of one secret
 //     get different fingerprints.
 //
-// The dedicated New Relic account is the remaining blast-radius control.
+// Local evidence stays on the host; the Mac pulls it over SSH.
 package secret
 
 import (

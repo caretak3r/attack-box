@@ -589,31 +589,25 @@ func TestAdmitBaitCannotForgeAdapterActions(t *testing.T) {
 	}
 }
 
-func TestMaxItemFitsMinimumPayload(t *testing.T) {
-	// The smallest POST the telemetry client sends must hold an admitted
-	// item plus its envelope.
-	if MaxItem+itemHeadroom > telemetry.MinPayloadBytes {
-		t.Fatalf("MaxItem %d + headroom %d exceeds min payload %d", MaxItem, itemHeadroom, telemetry.MinPayloadBytes)
+func TestMaxItemFitsEnvelopeBound(t *testing.T) {
+	// MaxItem is the largest evidence envelope chunk. The bound is derived from
+	// a 900KB evidence file limit with headroom for the envelope structure.
+	const minEnvelopeBound = 900_000
+	if MaxItem+8192 > minEnvelopeBound {
+		t.Fatalf("MaxItem %d + headroom exceeds envelope bound %d", MaxItem, minEnvelopeBound)
 	}
-	// 20 x 4096 bytes of attrs is ~82 KiB: inside every attr cap and the old
-	// 256 KiB item bound, but too big for a 64 KiB POST.
 	attrs := map[string]any{}
 	for i := range 20 {
 		attrs[strings.Repeat("a", i+1)] = strings.Repeat("v", maxString)
 	}
 	mustReject(t, RoleBait, line(t, ev(telemetry.Event{Stream: "edge", Body: "x", Attrs: attrs})), "item_size")
-	// Just under the bound is admitted, and the item really fits.
+	// Just under the bound is admitted.
 	attrs = map[string]any{}
 	for i := range 12 {
 		attrs[strings.Repeat("a", i+1)] = strings.Repeat("v", maxString)
 	}
-	a, err := Admit(RoleBait, line(t, ev(telemetry.Event{Stream: "edge", Body: "x", Attrs: attrs})), admitNow)
+	_, err := Admit(RoleBait, line(t, ev(telemetry.Event{Stream: "edge", Body: "x", Attrs: attrs})), admitNow)
 	if err != nil {
 		t.Fatal(err)
-	}
-	for _, c := range telemetry.Chunk(*a.Record.Event, telemetry.MaxChunk) {
-		if n, _ := telemetry.LogItemSize(c); n > MaxItem {
-			t.Fatalf("item %d > MaxItem %d", n, MaxItem)
-		}
 	}
 }

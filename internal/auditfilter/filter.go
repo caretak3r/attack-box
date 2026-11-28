@@ -1,4 +1,5 @@
-// Package auditfilter compacts complete audit events without interpreting payloads.
+// Package auditfilter compacts complete audit events without interpreting
+// payloads.
 package auditfilter
 
 import (
@@ -72,12 +73,11 @@ type Entry struct {
 	Rows       int    `json:"audit_source_rows"`
 	Reason     string `json:"audit_decision"`
 }
-type Stats struct{ InputRows, KeptRows, SuppressedRows, KeptEvents, SuppressedEvents int }
-type Trust func(Record) bool
+type Stats struct{ InputRows, KeptRows, KeptEvents int }
 
 // Batch is bounded by the caller. Split or malformed groups pass through in full.
 // Suppression requires a complete group and independently verified live process identity.
-func Batch(lines []string, boot string, trust Trust) ([]Entry, Stats) {
+func Batch(lines []string, boot string) ([]Entry, Stats) {
 	groups := map[string][]Record{}
 	var order []string
 	for i, line := range lines {
@@ -96,11 +96,6 @@ func Batch(lines []string, boot string, trust Trust) ([]Entry, Stats) {
 	for _, key := range order {
 		g := groups[key]
 		reason := "retained"
-		if complete(g) && routine(g, trust) {
-			stats.SuppressedRows += len(g)
-			stats.SuppressedEvents++
-			continue
-		}
 		if !complete(g) {
 			reason = "retained_incomplete_or_unknown"
 		}
@@ -160,27 +155,4 @@ func complete(g []Record) bool {
 		}
 	}
 	return syscall == 1 && title == 1 && paths == expected
-}
-func routine(g []Record, trust Trust) bool {
-	var s Record
-	for _, r := range g {
-		if r.Kind == "SYSCALL" {
-			s = r
-		}
-	}
-	f := s.Fields
-	if trust == nil || f["arch"] != "c000003e" || f["success"] != "yes" || f["uid"] != "0" || f["euid"] != "0" || f["auid"] != "4294967295" || f["key"] != "network_connect" {
-		return false
-	}
-	// Only successful routing-netlink socket creation by the native infrastructure
-	// agent. No IP connections, execution, writes, or failed operations are dropped.
-	if f["exe"] != "/usr/bin/newrelic-infra" || f["syscall"] != "41" || f["a0"] != "10" || f["a1"] != "80003" || f["a2"] != "0" || f["items"] != "0" || len(g) != 2 {
-		return false
-	}
-	for _, r := range g {
-		if r.Kind == "PROCTITLE" && r.Fields["proctitle"] != "/usr/bin/newrelic-infra" && r.Fields["proctitle"] != hex.EncodeToString([]byte("/usr/bin/newrelic-infra")) {
-			return false
-		}
-	}
-	return trust(s)
 }

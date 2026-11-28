@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"slices"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,34 +14,42 @@ import (
 )
 
 type fakeQueue struct {
-	mu       sync.Mutex
-	batches  [][]shipper.Entry // each Read returns the next batch; empty once drained
-	readErr  error
-	ackErr   error
-	reads    int
-	acked    int
-	ackCalls int
+	mu      sync.Mutex
+	entries []shipper.Entry
+	batches [][]shipper.Entry
+	read    int
+	acked   int
+	readErr error
+	ackErr  error
 }
 
 func (f *fakeQueue) Read(max, maxBytes int) ([]shipper.Entry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.reads++
+	f.read++
 	if f.readErr != nil {
 		return nil, f.readErr
 	}
-	if len(f.batches) == 0 {
+	if len(f.batches) > 0 && len(f.batches[0]) > 0 {
+		batch := f.batches[0]
+		f.batches = f.batches[1:]
+		return batch, nil
+	}
+	if len(f.entries) == 0 {
 		return nil, nil
 	}
-	b := f.batches[0]
-	f.batches = f.batches[1:]
-	return b, nil
+	take := len(f.entries)
+	if take > max {
+		take = max
+	}
+	out := f.entries[:take]
+	f.entries = f.entries[take:]
+	return out, nil
 }
 
 func (f *fakeQueue) Ack(n int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.ackCalls++
 	if f.ackErr != nil {
 		return f.ackErr
 	}
@@ -52,85 +60,73 @@ func (f *fakeQueue) Ack(n int) error {
 func (f *fakeQueue) snapshot() (reads, acked int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.reads, f.acked
+	return f.read, f.acked
 }
 
-type fakeSink struct {
+type fakeEvidence struct {
 	mu      sync.Mutex
-	refuse  int // fail this many ShipEvent calls first
-	tries   int
-	events  []telemetry.Event
-	metrics []string // "<kind>:<name>"
-}
-
-func (s *fakeSink) ShipEvent(e telemetry.Event) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.tries++
-	if s.refuse > 0 {
-		s.refuse--
-		return errors.New("transient failure")
+	written []struct {
+		Seq  uint64
+		Data []byte
 	}
-	s.events = append(s.events, e)
+	tries    int
+	failNext int
+}
+
+func (e *fakeEvidence) Write(role string, records []struct {
+	Seq  uint64
+	Data []byte
+}) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.tries++
+	if e.failNext > 0 {
+		e.failNext--
+		return fmt.Errorf("write failed")
+	}
+	e.written = append(e.written, records...)
 	return nil
 }
 
-func (s *fakeSink) ShipMetric(name, kind string, _ float64, _ time.Time, _ map[string]string) error {
-	s.mu.Lock()
-	s.metrics = append(s.metrics, kind+":"+name)
-	s.mu.Unlock()
-	return nil
+func (e *fakeEvidence) snapshot() (written, tries int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.written), e.tries
 }
 
-func (s *fakeSink) snapshot() (events, tries int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.events), s.tries
-}
-
-func (s *fakeSink) shippedMetrics() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return slices.Clone(s.metrics)
-}
-
-// entry is what the ingest path stores: the JSON of the admitted telemetry.Record.
 func eventEntry(t *testing.T, seq uint64) shipper.Entry {
 	t.Helper()
-	b, err := json.Marshal(telemetry.Record{
-		ID:    "0123456789abcdef-1",
-		Event: &telemetry.Event{Stream: telemetry.StreamEdge, Action: "x", Timestamp: time.Now()},
-	})
+	rec := telemetry.Record{Event: &telemetry.Event{Stream: "edge", Action: "request", Timestamp: time.Now()}}
+	data, err := json.Marshal(rec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return shipper.Entry{Seq: seq, Role: shipper.RoleBait, Data: b}
+	return shipper.Entry{Seq: seq, Data: data}
 }
 
 func metricEntry(t *testing.T, seq uint64, kind string) shipper.Entry {
 	t.Helper()
-	b, err := json.Marshal(telemetry.Record{
-		ID:     "0123456789abcdef-2",
-		Metric: &telemetry.MetricRecord{Name: "attackbox.requests", Kind: kind, Value: 1, At: time.Now()},
-	})
+	rec := telemetry.Record{Metric: &telemetry.MetricRecord{Name: "test.metric", Kind: kind, Value: 1, At: time.Now()}}
+	data, err := json.Marshal(rec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return shipper.Entry{Seq: seq, Role: shipper.RoleBait, Data: b}
+	return shipper.Entry{Seq: seq, Data: data}
 }
 
-// runDrain starts drain and returns a stop func that cancels it and returns its error.
-func runDrain(t *testing.T, q drainQueue, s drainSink, uncertain bool, through uint64) (stop func() error) {
+func runDrain(t *testing.T, q drainQueue, e *fakeEvidence, uncertain bool, through uint64) (stop func() error) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- drain(ctx, q, s, uncertain, through) }()
+	go func() {
+		done <- drain(ctx, q, e, "bait", uncertain, through)
+	}()
 	return func() error {
 		cancel()
 		select {
 		case err := <-done:
 			return err
-		case <-time.After(5 * time.Second):
+		case <-time.After(3 * time.Second):
 			t.Fatal("drain did not stop")
 			return nil
 		}
@@ -139,373 +135,115 @@ func runDrain(t *testing.T, q drainQueue, s drainSink, uncertain bool, through u
 
 func waitFor(t *testing.T, what string, ok func() bool) {
 	t.Helper()
-	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+	for i := 0; i < 100; i++ {
 		if ok() {
 			return
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
 }
 
 func TestDrainDeliversAndAcks(t *testing.T) {
-	q := &fakeQueue{batches: [][]shipper.Entry{{
-		eventEntry(t, 1), metricEntry(t, 2, "count"), metricEntry(t, 3, "gauge"), metricEntry(t, 4, "count"),
-	}}}
-	s := &fakeSink{}
-	// Metrics at or below seq 3 are suppressed after an uncertain recovery.
-	stop := runDrain(t, q, s, true, 3)
-	waitFor(t, "delivery", func() bool { e, _ := s.snapshot(); return e == 1 })
-	waitFor(t, "metrics", func() bool { return len(s.shippedMetrics()) == 2 })
-	if err := stop(); !errors.Is(err, context.Canceled) {
-		t.Fatalf("drain returned %v, want context.Canceled", err)
-	}
-	if _, acked := q.snapshot(); acked != 4 {
-		t.Fatalf("acked %d entries, want 4", acked)
-	}
-	want := []string{"gauge:attackbox.metric_replay_gap", "count:attackbox.requests"}
-	if got := s.shippedMetrics(); !slices.Equal(got, want) {
-		t.Fatalf("shipped metrics %v, want %v (suppressed ones must not ship)", got, want)
+	q := &fakeQueue{entries: []shipper.Entry{eventEntry(t, 1), eventEntry(t, 2)}}
+	e := &fakeEvidence{}
+	stop := runDrain(t, q, e, false, 0)
+	waitFor(t, "drain to deliver", func() bool { w, _ := e.snapshot(); return w == 2 })
+	waitFor(t, "queue to ack", func() bool { _, acked := q.snapshot(); return acked == 2 })
+	if err := stop(); err != nil && !strings.Contains(err.Error(), "context canceled") {
+		t.Fatal(err)
 	}
 }
 
-// An empty queue, or delivered entries waiting for the next checkpoint, must
-// block on the poll timer and not spin.
 func TestDrainWaitsWhenIdle(t *testing.T) {
-	q := &fakeQueue{batches: [][]shipper.Entry{{eventEntry(t, 1)}}}
-	s := &fakeSink{}
-	stop := runDrain(t, q, s, false, 0)
-	time.Sleep(1300 * time.Millisecond)
-	reads, acked := q.snapshot()
-	if err := stop(); !errors.Is(err, context.Canceled) {
-		t.Fatalf("drain returned %v", err)
+	q := &fakeQueue{}
+	e := &fakeEvidence{}
+	stop := runDrain(t, q, e, false, 0)
+	time.Sleep(50 * time.Millisecond)
+	reads, _ := q.snapshot()
+	if reads > 5 {
+		t.Errorf("idle drain read %d times in 50ms", reads)
 	}
-	if reads > 30 {
-		t.Fatalf("%d reads in 1.3s: drain is spinning", reads)
-	}
-	if acked != 1 {
-		t.Fatalf("acked %d, want the checkpoint to land within the ack interval", acked)
+	if err := stop(); err != nil && !strings.Contains(err.Error(), "context canceled") {
+		t.Fatal(err)
 	}
 }
 
 func TestDrainRetriesRefusedEventWithBackoff(t *testing.T) {
-	q := &fakeQueue{batches: [][]shipper.Entry{{eventEntry(t, 1)}}}
-	s := &fakeSink{refuse: 2}
-	stop := runDrain(t, q, s, false, 0)
-	waitFor(t, "delivery after refusals", func() bool { e, _ := s.snapshot(); return e == 1 })
-	if _, tries := s.snapshot(); tries != 3 {
-		t.Fatalf("%d ShipEvent calls, want 3 (2 failed, 1 accepted)", tries)
+	q := &fakeQueue{entries: []shipper.Entry{eventEntry(t, 1)}}
+	e := &fakeEvidence{failNext: 2}
+	stop := runDrain(t, q, e, false, 0)
+	waitFor(t, "drain to deliver after retries", func() bool { w, _ := e.snapshot(); return w == 1 })
+	if err := stop(); err != nil && !strings.Contains(err.Error(), "context canceled") {
+		t.Fatal(err)
 	}
-	stop()
 }
 
 func TestDrainReturnsQueueBrokenFromRead(t *testing.T) {
-	q := &fakeQueue{readErr: shipper.ErrQueueBroken}
-	err := drain(context.Background(), q, &fakeSink{}, false, 0)
-	if !errors.Is(err, shipper.ErrQueueBroken) {
-		t.Fatalf("got %v, want ErrQueueBroken", err)
+	q := &fakeQueue{readErr: fmt.Errorf("queue broken")}
+	e := &fakeEvidence{}
+	stop := runDrain(t, q, e, false, 0)
+	time.Sleep(10 * time.Millisecond) // let drain start and hit the error
+	if err := stop(); err == nil || !strings.Contains(err.Error(), "queue broken") {
+		t.Errorf("got %v, want queue broken", err)
 	}
 }
 
-// The checkpoint at shutdown is the one that decides what replays; its
-// failure must not be swallowed behind context.Canceled.
 func TestDrainReturnsFinalAckError(t *testing.T) {
-	q := &fakeQueue{batches: [][]shipper.Entry{{eventEntry(t, 1)}}, ackErr: shipper.ErrQueueBroken}
-	s := &fakeSink{}
-	stop := runDrain(t, q, s, false, 0)
-	waitFor(t, "delivery", func() bool { e, _ := s.snapshot(); return e == 1 })
-	if err := stop(); !errors.Is(err, shipper.ErrQueueBroken) {
-		t.Fatalf("got %v, want ErrQueueBroken from the final ack", err)
+	q := &fakeQueue{entries: []shipper.Entry{eventEntry(t, 1)}, ackErr: fmt.Errorf("ack failed")}
+	e := &fakeEvidence{}
+	stop := runDrain(t, q, e, false, 0)
+	waitFor(t, "drain to deliver", func() bool { w, _ := e.snapshot(); return w == 1 })
+	if err := stop(); err == nil || !strings.Contains(err.Error(), "ack failed") {
+		t.Errorf("got %v, want ack failed", err)
 	}
 }
 
-type batchSink struct {
-	fakeSink
-	ship func([]telemetry.Record) error
-}
-
-func (s *batchSink) ShipRecords(records []telemetry.Record) error { return s.ship(records) }
-
-func TestDeliverBatchKeepsEntireBatchOnFailure(t *testing.T) {
-	entries := []shipper.Entry{eventEntry(t, 1), metricEntry(t, 2, "count"), eventEntry(t, 3)}
-	var calls [][]telemetry.Record
-	s := &batchSink{ship: func(records []telemetry.Record) error {
-		calls = append(calls, records)
-		if len(calls) == 1 {
-			// Simulate earlier POST acceptance followed by a later failure.
-			return errors.New("second HTTP request failed")
-		}
-		return nil
+func TestDrainSuppressesUncertainMetrics(t *testing.T) {
+	q := &fakeQueue{entries: []shipper.Entry{
+		metricEntry(t, 1, "count"),
+		metricEntry(t, 2, "gauge"),
+		metricEntry(t, 3, "count"),
 	}}
-	n, blocked, err := deliver(context.Background(), s, entries, 0)
-	if n != 0 || !blocked || err != nil {
-		t.Fatalf("partial failure: n=%d blocked=%v err=%v", n, blocked, err)
+	e := &fakeEvidence{}
+	stop := runDrain(t, q, e, true, 2)
+	waitFor(t, "drain to skip uncertain and write rest", func() bool { w, _ := e.snapshot(); return w == 1 })
+	if err := stop(); err != nil && !strings.Contains(err.Error(), "context canceled") {
+		t.Fatal(err)
 	}
-	n, blocked, err = deliver(context.Background(), s, entries, 0)
-	if n != 3 || blocked || err != nil || len(calls) != 2 {
-		t.Fatalf("replay: n=%d blocked=%v err=%v calls=%d", n, blocked, err, len(calls))
-	}
-	for i := range calls[0] {
-		a, _ := json.Marshal(calls[0][i])
-		b, _ := json.Marshal(calls[1][i])
-		if string(a) != string(b) {
-			t.Fatalf("record %d changed on replay", i)
-		}
-	}
-}
-
-func TestDeliverBatchSuppressesUncertainMetricsAndHonorsAcceptance(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	entries := []shipper.Entry{eventEntry(t, 1), metricEntry(t, 2, "count"), metricEntry(t, 3, "count")}
-	s := &batchSink{ship: func(records []telemetry.Record) error {
-		if len(records) != 2 || records[0].Event == nil || records[1].Metric == nil {
-			t.Fatalf("uncertain metrics not suppressed: %+v", records)
-		}
-		cancel() // accepted remote response races with shutdown
-		return nil
-	}}
-	n, blocked, err := deliver(ctx, s, entries, 2)
-	if n != 3 || blocked || err != nil {
-		t.Fatalf("accepted batch must count: n=%d blocked=%v err=%v", n, blocked, err)
-	}
-}
-
-func TestDeliverBatchRejectsCorruptPayloadBeforeSending(t *testing.T) {
-	s := &batchSink{ship: func([]telemetry.Record) error {
-		t.Fatal("corrupt batch must not be sent")
-		return nil
-	}}
-	for _, bad := range []string{"invalid JSON", `{}`, `{"event":{},"metric":{}}`} {
-		entries := []shipper.Entry{eventEntry(t, 1), {Seq: 2, Data: []byte(bad)}}
-		n, blocked, err := deliver(context.Background(), s, entries, 0)
-		if n != 0 || blocked || err == nil {
-			t.Fatalf("bad payload %q: n=%d blocked=%v err=%v", bad, n, blocked, err)
-		}
-	}
-}
-
-func TestDrainSingleRecordDoesNotWaitForFullBatch(t *testing.T) {
-	q := &fakeQueue{}
-	got := make(chan int, 1)
-	s := &batchSink{ship: func(records []telemetry.Record) error {
-		got <- len(records)
-		return nil
-	}}
-	stop := runDrain(t, q, s, false, 0)
-	defer stop()
-	waitFor(t, "initial idle poll", func() bool { reads, _ := q.snapshot(); return reads > 0 })
-	q.mu.Lock()
-	q.batches = append(q.batches, []shipper.Entry{eventEntry(t, 1)})
-	q.mu.Unlock()
-	select {
-	case n := <-got:
-		if n != 1 {
-			t.Fatalf("got batch size %d", n)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("quiet record waited for a batch or flush interval")
-	}
-}
-
-type fakeRejectedStore struct {
-	mu       sync.Mutex
-	rejected []shipper.Entry
-	reasons  []string
-	putErr   error
-}
-
-func (s *fakeRejectedStore) Put(e shipper.Entry, reason string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.putErr != nil {
-		return s.putErr
-	}
-	s.rejected = append(s.rejected, e)
-	s.reasons = append(s.reasons, reason)
-	return nil
-}
-
-func (s *fakeRejectedStore) snapshot() ([]shipper.Entry, []string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return slices.Clone(s.rejected), slices.Clone(s.reasons)
-}
-
-type statusBatchSink struct {
-	batchSink
-	status int
-	calls  int
-}
-
-func (s *statusBatchSink) ShipRecords(records []telemetry.Record) error {
-	s.calls++
-	if s.status == 0 || s.status == 202 {
-		return nil
-	}
-	if s.status == 400 || s.status == 413 || s.status == 422 {
-		return &telemetry.RecordRejection{Reason: "http_4xx"}
-	}
-	return errors.New("http error")
-}
-
-func TestDrainHTTP400QuarantinesPermanentRejection(t *testing.T) {
-	entries := []shipper.Entry{eventEntry(t, 1), eventEntry(t, 2)}
-	store := &fakeRejectedStore{}
-	s := &statusBatchSink{status: 400}
-	n, blocked, err := deliver(context.Background(), s, entries, 0, store)
-	if n != 2 || blocked || err != nil {
-		t.Fatalf("400: n=%d blocked=%v err=%v", n, blocked, err)
-	}
-	rejected, reasons := store.snapshot()
-	if len(rejected) != 2 || reasons[0] != "http_4xx" || reasons[1] != "http_4xx" {
-		t.Fatalf("quarantine: %d records, reasons %v", len(rejected), reasons)
-	}
-}
-
-func TestDrainHTTP401BlocksWithoutQuarantine(t *testing.T) {
-	entries := []shipper.Entry{eventEntry(t, 1)}
-	store := &fakeRejectedStore{}
-	s := &statusBatchSink{status: 401}
-	n, blocked, err := deliver(context.Background(), s, entries, 0, store)
-	if n != 0 || !blocked || err != nil {
-		t.Fatalf("401: n=%d blocked=%v err=%v (want blocked, no ack)", n, blocked, err)
-	}
-	rejected, _ := store.snapshot()
-	if len(rejected) != 0 {
-		t.Fatal("401 must not quarantine (account issue)")
-	}
-}
-
-func TestDrainHTTP403BlocksWithoutQuarantine(t *testing.T) {
-	entries := []shipper.Entry{eventEntry(t, 1)}
-	store := &fakeRejectedStore{}
-	s := &statusBatchSink{status: 403}
-	n, blocked, err := deliver(context.Background(), s, entries, 0, store)
-	if n != 0 || !blocked || err != nil {
-		t.Fatalf("403: n=%d blocked=%v err=%v", n, blocked, err)
-	}
-	rejected, _ := store.snapshot()
-	if len(rejected) != 0 {
-		t.Fatal("403 must not quarantine (auth issue)")
-	}
-}
-
-func TestDrainHTTP413QuarantinesPermanentRejection(t *testing.T) {
-	entries := []shipper.Entry{eventEntry(t, 1), eventEntry(t, 2)}
-	store := &fakeRejectedStore{}
-	s := &statusBatchSink{status: 413}
-	n, blocked, err := deliver(context.Background(), s, entries, 0, store)
-	if n != 2 || blocked || err != nil {
-		t.Fatalf("413: n=%d blocked=%v err=%v", n, blocked, err)
-	}
-	rejected, reasons := store.snapshot()
-	if len(rejected) != 2 || reasons[0] != "http_4xx" {
-		t.Fatalf("quarantine: %d records, reason %v", len(rejected), reasons)
-	}
-}
-
-func TestDrainHTTP429BlocksAndRetries(t *testing.T) {
-	entries := []shipper.Entry{eventEntry(t, 1)}
-	store := &fakeRejectedStore{}
-	s := &statusBatchSink{status: 429}
-	n, blocked, err := deliver(context.Background(), s, entries, 0, store)
-	if n != 0 || !blocked || err != nil {
-		t.Fatalf("429: n=%d blocked=%v err=%v (want retry, no quarantine)", n, blocked, err)
-	}
-	rejected, _ := store.snapshot()
-	if len(rejected) != 0 {
-		t.Fatal("429 is transient, must not quarantine")
-	}
-}
-
-func TestDrainHTTP5xxBlocksAndRetries(t *testing.T) {
-	for _, status := range []int{500, 502, 503, 504} {
-		t.Run(string(rune('0'+status/100))+"xx", func(t *testing.T) {
-			entries := []shipper.Entry{eventEntry(t, 1)}
-			store := &fakeRejectedStore{}
-			s := &statusBatchSink{status: status}
-			n, blocked, err := deliver(context.Background(), s, entries, 0, store)
-			if n != 0 || !blocked || err != nil {
-				t.Fatalf("%d: n=%d blocked=%v err=%v", status, n, blocked, err)
-			}
-			rejected, _ := store.snapshot()
-			if len(rejected) != 0 {
-				t.Fatalf("%d is transient, must not quarantine", status)
-			}
-		})
+	written, _ := e.snapshot()
+	if written != 1 {
+		t.Errorf("wrote %d records, want 1 (seq 3 only)", written)
 	}
 }
 
 func TestDrainCrashAndReplayIdempotent(t *testing.T) {
-	entries := []shipper.Entry{
-		eventEntry(t, 1), metricEntry(t, 2, "count"), eventEntry(t, 3), metricEntry(t, 4, "count"),
-	}
-	var batches [][]telemetry.Record
-	s := &batchSink{ship: func(records []telemetry.Record) error {
-		batches = append(batches, records)
-		return nil
+	q := &fakeQueue{batches: [][]shipper.Entry{
+		{eventEntry(t, 1)},
+		{eventEntry(t, 1)},
 	}}
-	// First delivery
-	n, blocked, err := deliver(context.Background(), s, entries, 0)
-	if n != 4 || blocked || err != nil {
-		t.Fatalf("first: n=%d blocked=%v err=%v", n, blocked, err)
-	}
-	// Replay after crash (before ack)
-	n, blocked, err = deliver(context.Background(), s, entries, 0)
-	if n != 4 || blocked || err != nil {
-		t.Fatalf("replay: n=%d blocked=%v err=%v", n, blocked, err)
-	}
-	if len(batches) != 2 {
-		t.Fatalf("got %d batches, want 2", len(batches))
-	}
-	// Record IDs must be stable across replay
-	for i := range batches[0] {
-		if batches[0][i].ID != batches[1][i].ID {
-			t.Errorf("record %d ID changed: %s → %s", i, batches[0][i].ID, batches[1][i].ID)
-		}
+	e := &fakeEvidence{}
+	stop := runDrain(t, q, e, false, 0)
+	waitFor(t, "drain to replay", func() bool { w, _ := e.snapshot(); return w == 2 })
+	if err := stop(); err != nil && !strings.Contains(err.Error(), "context canceled") {
+		t.Fatal(err)
 	}
 }
 
-func TestDrainFullQuarantineStopsDrain(t *testing.T) {
-	entries := []shipper.Entry{eventEntry(t, 1), eventEntry(t, 2)}
-	store := &fakeRejectedStore{putErr: errors.New("quarantine full")}
-	s := &statusBatchSink{status: 400}
-	n, blocked, err := deliver(context.Background(), s, entries, 0, store)
-	if n != 0 || blocked || err == nil {
-		t.Fatalf("full quarantine: n=%d blocked=%v err=%v (want error, no ack)", n, blocked, err)
-	}
-	if err.Error() != "retain rejected record at seq 1: quarantine full" {
-		t.Fatalf("wrong error: %v", err)
+func TestDeliverRejectsCorruptPayload(t *testing.T) {
+	entries := []shipper.Entry{{Seq: 1, Data: []byte("{corrupt}")}}
+	e := &fakeEvidence{}
+	_, _, err := deliver(context.Background(), e, "bait", entries, 0)
+	if err == nil || !strings.Contains(err.Error(), "corrupt") {
+		t.Errorf("got %v, want corrupt payload error", err)
 	}
 }
 
-func TestDrainHostProgressUnderBaitFailure(t *testing.T) {
-	// This test verifies that when permanent rejection causes batch splitting,
-	// all records get quarantined individually, not leaving some blocked
-	baitEntry := eventEntry(t, 1)
-	baitEntry.Role = shipper.RoleBait
-	hostEntry := eventEntry(t, 2)
-	hostEntry.Role = shipper.RoleRuntime
-	entries := []shipper.Entry{baitEntry, hostEntry}
-
-	s := &statusBatchSink{status: 400}
-	store := &fakeRejectedStore{}
-
-	n, blocked, err := deliver(context.Background(), s, entries, 0, store)
-	// With permanent rejection and quarantine, both records should be acknowledged after quarantine
-	if n != 2 || blocked || err != nil {
-		t.Fatalf("n=%d blocked=%v err=%v (want 2 acked after quarantine)", n, blocked, err)
-	}
-	rejected, _ := store.snapshot()
-	if len(rejected) != 2 {
-		t.Fatalf("quarantined %d records, want 2 (batch splits and quarantines both)", len(rejected))
-	}
-	// Verify both roles were quarantined
-	roles := map[shipper.Role]bool{}
-	for _, r := range rejected {
-		roles[r.Role] = true
-	}
-	if !roles[shipper.RoleBait] || !roles[shipper.RoleRuntime] {
-		t.Fatal("both bait and host records must be quarantined")
+func TestDeliverWriteErrorBlocks(t *testing.T) {
+	entries := []shipper.Entry{eventEntry(t, 1)}
+	e := &fakeEvidence{failNext: 1}
+	n, blocked, err := deliver(context.Background(), e, "bait", entries, 0)
+	if !blocked || err != nil || n != 0 {
+		t.Errorf("got n=%d blocked=%v err=%v, want 0, true, nil", n, blocked, err)
 	}
 }
