@@ -31,7 +31,7 @@ sequenceDiagram
 
 **What explained the split?** The gateway's body limit was 65,536 bytes. All eight rejected requests had reported sizes above that limit: 65,633 to 121,353 bytes. The smallest rejection was only 97 bytes over. Every request carried a recognized credential source, so credential presence alone did not distinguish success from rejection. No credential value was needed for this analysis.
 
-The four accepted requests all named `local-instruct-8b`. Their final user messages were distinct: 5, 923, 9,451 and 548 characters, respectively. These are message lengths, not whole-request sizes. Even the five-character final message arrived inside a 64,757-byte body. None matched the benign phrase catalog used for this review. Their wording is withheld. The host retained no request body for the eight size rejections.
+The four accepted requests all named `local-instruct-8b`. Their final user messages were distinct: 5, 923, 9,451 and 548 characters, respectively. These are message lengths, not whole-request sizes. The first three messages remain withheld. Request 12 has a privately reviewed excerpt below. The host retained no request body for the eight size rejections.
 
 ## Host, target, and headers
 
@@ -65,9 +65,15 @@ Every request advertised a Go HTTP client in `User-Agent` and sent `Content-Type
 - **05:03:37:** `stream: true`, `max_tokens: 32768`, `stream_options`, and **31 tool definitions**. The message array contained one system message and three user messages; its final user text was only five characters. The 64,757 bytes describe the whole request, including definitions and earlier messages.
 - **05:14:13, 05:29:42, and 05:31:28:** `stream: false`, `max_tokens: 1500`, and a `thinking` field. Each message array contained one system message and one user message. None supplied a `tools` field. The middle request had the longest final user message (9,451 characters), not the largest body.
 
-**The 05:31:28.163 UTC request in detail:** `POST /v1/chat/completions HTTP/1.1`, no query. The 2,744-byte JSON body had `model: "local-instruct-8b"`, `max_tokens: 1500`, `stream: false`, and `thinking: {"type":"disabled"}`. `messages[0]` was a 639-character system message. `messages[1].content` was the **548-character user prompt**; its wording is withheld, not missing. This request did **not** include the 31 tool definitions. [Inspect its headers and body projection](https://silent.engineer/attack-box/findings/chat-body-limit/#request-12).
+**The 05:31:28.163 UTC request in detail:** `POST /v1/chat/completions HTTP/1.1`, no query. The 2,744-byte JSON body had `model: "local-instruct-8b"`, `max_tokens: 1500`, `stream: false`, and `thinking: {"type":"disabled"}`. `messages[0]` was a 639-character system message. `messages[1].content` was the 548-character user prompt. This request did **not** include the 31 tool definitions.
 
-No retained request included an assistant-role or tool-role message. The gateway did not execute these tools. No body fields, model name, or intent can be recovered for the eight rejected requests from the capture. Raw prompts, full user-agent strings, and the destination address are not published.
+**What did the prompt say?** The client supplied Chinese notes organized as nodes to condense, a parent–child relation, and an earlier task objective. The objective was explicit:
+
+> 目标：拿下后台权限 拿下服务器权限 获取数据 源码等 全量信息
+
+English translation: “Objective: gain backend access, gain server access, and obtain all available information, including data and source code.” The same message said `但未形成管理或服务器执行链` (“but no chain to administrative access or server-side execution was established”). Both statements came from the client. They do not establish the status of any external system or show that the decoy was the intended target. [Open request 12 for its headers and reviewed prompt excerpt](https://silent.engineer/attack-box/findings/chat-body-limit/#request-12). Each `[redacted]` marks a removal; the excerpt omits target identifiers, a private file reference, and operational details.
+
+No retained request included an assistant-role or tool-role message. The gateway did not execute these tools. No body fields, model name, or intent can be recovered for the eight rejected requests from the capture. Full user-agent strings, destination addresses, and unreviewed message text are not published.
 
 ## The 31 tool definitions
 
