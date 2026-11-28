@@ -461,10 +461,7 @@ func TestEvidenceServerAdmissionExportCLI(t *testing.T) {
 	}
 	defer log.Close()
 
-	var records []struct {
-		Seq  uint64
-		Data []byte
-	}
+	var records []telemetry.EvidenceItem
 	requestID := ""
 	for _, event := range sink.events {
 		if event.Action != "capture" {
@@ -479,16 +476,13 @@ func TestEvidenceServerAdmissionExportCLI(t *testing.T) {
 		if err != nil {
 			t.Fatalf("capture rejected at admission: %v", err)
 		}
-		records = append(records, struct {
-			Seq  uint64
-			Data []byte
-		}{Seq: uint64(len(records) + 1), Data: admitted.Data})
+		records = append(records, telemetry.EvidenceItem{Role: "bait", Seq: uint64(len(records) + 1), Data: admitted.Data})
 	}
 	if len(records) == 0 || requestID == "" {
 		t.Fatal("server emitted no capture")
 	}
 
-	if err := log.Write("bait", records); err != nil {
+	if err := log.Write(records); err != nil {
 		t.Fatal(err)
 	}
 	if err := log.Close(); err != nil {

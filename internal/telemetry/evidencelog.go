@@ -64,13 +64,18 @@ func NewEvidenceLog(cfg EvidenceConfig) (*EvidenceLog, error) {
 	return &EvidenceLog{cfg: cfg}, nil
 }
 
+// EvidenceItem is one queued record for Write: the verified producer role, the
+// queue sequence and the JSON record.
+type EvidenceItem struct {
+	Role string
+	Seq  uint64
+	Data []byte
+}
+
 // Write appends envelopes, fsync the file, then returns. A write or fsync
 // error leaves the queue unacknowledged, so the drain will retry. Caller MUST
 // checkpoint only after a successful Write.
-func (e *EvidenceLog) Write(role string, records []struct {
-	Seq  uint64
-	Data []byte
-}) error {
+func (e *EvidenceLog) Write(records []EvidenceItem) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	now := e.cfg.Now()
@@ -96,7 +101,7 @@ func (e *EvidenceLog) Write(role string, records []struct {
 		if err := json.Unmarshal(r.Data, &rec); err != nil {
 			return fmt.Errorf("evidencelog: decode seq %d: %w", r.Seq, err)
 		}
-		env := Envelope{Ts: ts, Role: role, Seq: r.Seq, Record: rec}
+		env := Envelope{Ts: ts, Role: r.Role, Seq: r.Seq, Record: rec}
 		line, err := json.Marshal(env)
 		if err != nil {
 			return fmt.Errorf("evidencelog: encode seq %d: %w", r.Seq, err)
@@ -173,19 +178,4 @@ func (e *EvidenceLog) enforceRetention(currentDay string) error {
 		total -= f.size
 	}
 	return nil
-}
-
-// ShipEvent wraps one event record for the drain's sync interface.
-func (e *EvidenceLog) ShipEvent(evt Event) error {
-	return fmt.Errorf("evidencelog: ShipEvent not implemented; use Write")
-}
-
-// ShipMetric wraps one metric record for the drain's sync interface.
-func (e *EvidenceLog) ShipMetric(name string, kind string, value float64, at time.Time, attrs map[string]string) error {
-	return fmt.Errorf("evidencelog: ShipMetric not implemented; use Write")
-}
-
-// ShipRecords is a no-op placeholder; the drain calls Write directly.
-func (e *EvidenceLog) ShipRecords([]Record) error {
-	return fmt.Errorf("evidencelog: ShipRecords not implemented; use Write")
 }

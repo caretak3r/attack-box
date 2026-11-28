@@ -64,19 +64,13 @@ func (f *fakeQueue) snapshot() (reads, acked int) {
 }
 
 type fakeEvidence struct {
-	mu      sync.Mutex
-	written []struct {
-		Seq  uint64
-		Data []byte
-	}
+	mu       sync.Mutex
+	written  []telemetry.EvidenceItem
 	tries    int
 	failNext int
 }
 
-func (e *fakeEvidence) Write(role string, records []struct {
-	Seq  uint64
-	Data []byte
-}) error {
+func (e *fakeEvidence) Write(records []telemetry.EvidenceItem) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.tries++
@@ -119,7 +113,7 @@ func runDrain(t *testing.T, q drainQueue, e *fakeEvidence, uncertain bool, throu
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- drain(ctx, q, e, "bait", uncertain, through)
+		done <- drain(ctx, q, e, uncertain, through)
 	}()
 	return func() error {
 		cancel()
@@ -233,7 +227,7 @@ func TestDrainCrashAndReplayIdempotent(t *testing.T) {
 func TestDeliverRejectsCorruptPayload(t *testing.T) {
 	entries := []shipper.Entry{{Seq: 1, Data: []byte("{corrupt}")}}
 	e := &fakeEvidence{}
-	_, _, err := deliver(context.Background(), e, "bait", entries, 0)
+	_, _, err := deliver(context.Background(), e, entries, 0)
 	if err == nil || !strings.Contains(err.Error(), "corrupt") {
 		t.Errorf("got %v, want corrupt payload error", err)
 	}
@@ -242,7 +236,7 @@ func TestDeliverRejectsCorruptPayload(t *testing.T) {
 func TestDeliverWriteErrorBlocks(t *testing.T) {
 	entries := []shipper.Entry{eventEntry(t, 1)}
 	e := &fakeEvidence{failNext: 1}
-	n, blocked, err := deliver(context.Background(), e, "bait", entries, 0)
+	n, blocked, err := deliver(context.Background(), e, entries, 0)
 	if !blocked || err != nil || n != 0 {
 		t.Errorf("got n=%d blocked=%v err=%v, want 0, true, nil", n, blocked, err)
 	}

@@ -19,7 +19,7 @@ func TestExportSpanIndependentAndNoEvidencePayload(t *testing.T) {
 	ctx, parent := tr.Start(context.Background(), "unrelated-request")
 	ctx = observability.WithTracer(ctx, tr)
 	e := &fakeEvidence{}
-	n, blocked, err := deliver(ctx, e, "bait", []shipper.Entry{eventEntry(t, 1)}, 0)
+	n, blocked, err := deliver(ctx, e, []shipper.Entry{eventEntry(t, 1)}, 0)
 	if n != 1 || blocked || err != nil {
 		t.Fatal(n, blocked, err)
 	}
@@ -43,7 +43,7 @@ func TestExportSpanErrorNeverLeaksCredentials(t *testing.T) {
 	tr := p.Tracer("test")
 	ctx := observability.WithTracer(context.Background(), tr)
 	e := &fakeEvidence{failNext: 1}
-	n, blocked, err := deliver(ctx, e, "bait", []shipper.Entry{eventEntry(t, 1)}, 0)
+	n, blocked, err := deliver(ctx, e, []shipper.Entry{eventEntry(t, 1)}, 0)
 	if n != 0 || !blocked || err != nil {
 		t.Fatal(n, blocked, err)
 	}

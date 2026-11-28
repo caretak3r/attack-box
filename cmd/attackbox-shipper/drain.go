@@ -23,10 +23,7 @@ type drainQueue interface {
 
 // evidenceWriter is the part the drain uses to write evidence envelopes.
 type evidenceWriter interface {
-	Write(role string, records []struct {
-		Seq  uint64
-		Data []byte
-	}) error
+	Write(records []telemetry.EvidenceItem) error
 }
 
 const (
@@ -43,7 +40,7 @@ const (
 // the checkpoint does not cover. A failed write stays in memory and is retried;
 // nothing behind it is delivered or acknowledged first. Uncertain recovery
 // suppresses metrics up to uncertainThrough to avoid double-counting.
-func drain(ctx context.Context, q drainQueue, w evidenceWriter, role string, uncertain bool, uncertainThrough uint64) error {
+func drain(ctx context.Context, q drainQueue, w evidenceWriter, uncertain bool, uncertainThrough uint64) error {
 	var skipThrough uint64
 	if uncertain {
 		skipThrough = uncertainThrough
@@ -77,7 +74,7 @@ func drain(ctx context.Context, q drainQueue, w evidenceWriter, role string, unc
 			idle = len(entries) == 0
 		}
 
-		n, blocked, err := deliver(ctx, w, role, pending, skipThrough)
+		n, blocked, err := deliver(ctx, w, pending, skipThrough)
 		pending = pending[n:]
 		toAck += n
 		if err != nil {
@@ -113,17 +110,15 @@ func drain(ctx context.Context, q drainQueue, w evidenceWriter, role string, unc
 	return ctx.Err()
 }
 
-// deliver writes entries to the evidence writer in one batch. blocked reports
-// that the writer failed, so the rest must wait. Metrics at or below skipThrough
-// are taken but not written. err is set for a payload that does not decode.
-func deliver(ctx context.Context, w evidenceWriter, role string, entries []shipper.Entry, skipThrough uint64) (n int, blocked bool, err error) {
+// deliver writes entries to the evidence writer in one batch, each with its
+// producer role. blocked reports that the writer failed, so the rest must wait.
+// Metrics at or below skipThrough are taken but not written. err is set for a
+// payload that does not decode.
+func deliver(ctx context.Context, w evidenceWriter, entries []shipper.Entry, skipThrough uint64) (n int, blocked bool, err error) {
 	if len(entries) == 0 || ctx.Err() != nil {
 		return 0, false, nil
 	}
-	var batch []struct {
-		Seq  uint64
-		Data []byte
-	}
+	var batch []telemetry.EvidenceItem
 	for _, e := range entries {
 		if ctx.Err() != nil {
 			break
@@ -136,17 +131,14 @@ func deliver(ctx context.Context, w evidenceWriter, role string, entries []shipp
 			n++
 			continue
 		}
-		batch = append(batch, struct {
-			Seq  uint64
-			Data []byte
-		}{e.Seq, e.Data})
+		batch = append(batch, telemetry.EvidenceItem{Role: e.Role.String(), Seq: e.Seq, Data: e.Data})
 		n++
 	}
 	if len(batch) == 0 {
 		return n, false, nil
 	}
 	_, span := observability.Tracer(ctx).Start(ctx, "shipper.export", trace.WithNewRoot(), trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attribute.Int("attackbox.batch_records", len(batch))))
-	werr := w.Write(role, batch)
+	werr := w.Write(batch)
 	if werr != nil {
 		span.SetStatus(codes.Error, "")
 		span.SetAttributes(attribute.String("error.type", "export_failed"))

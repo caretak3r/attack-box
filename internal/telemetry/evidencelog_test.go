@@ -27,30 +27,31 @@ func TestEvidenceLogWrite(t *testing.T) {
 	rec2 := Record{Metric: &MetricRecord{Name: "test.counter", Kind: "count", Value: 1, At: now}}
 	data2, _ := json.Marshal(rec2)
 
-	records := []struct {
-		Seq  uint64
-		Data []byte
-	}{
-		{Seq: 1, Data: data1},
-		{Seq: 2, Data: data2},
+	records := []EvidenceItem{
+		{Role: "bait", Seq: 1, Data: data1},
+		{Role: "runtime", Seq: 2, Data: data2},
 	}
-	if err := log.Write("bait", records); err != nil {
+	if err := log.Write(records); err != nil {
 		t.Fatal(err)
 	}
 
 	path := filepath.Join(dir, "events-20261128.jsonl")
-	content, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lines := 0
-	for _, b := range content {
-		if b == '\n' {
-			lines++
+	defer f.Close()
+	var got []Envelope
+	for dec := json.NewDecoder(f); dec.More(); {
+		var env Envelope
+		if err := dec.Decode(&env); err != nil {
+			t.Fatal(err)
 		}
+		got = append(got, env)
 	}
-	if lines != 2 {
-		t.Errorf("got %d lines, want 2", lines)
+	if len(got) != 2 || got[0].Role != "bait" || got[0].Seq != 1 || got[0].Record.Event == nil ||
+		got[1].Role != "runtime" || got[1].Seq != 2 || got[1].Record.Metric == nil {
+		t.Fatalf("envelopes = %+v, want bait event seq 1 then runtime metric seq 2", got)
 	}
 }
 
@@ -72,18 +73,12 @@ func TestEvidenceLogRollover(t *testing.T) {
 
 	rec := Record{Event: &Event{Stream: "edge", Action: "request", Timestamp: day1}}
 	data, _ := json.Marshal(rec)
-	if err := log.Write("bait", []struct {
-		Seq  uint64
-		Data []byte
-	}{{1, data}}); err != nil {
+	if err := log.Write([]EvidenceItem{{"bait", 1, data}}); err != nil {
 		t.Fatal(err)
 	}
 
 	now = day2
-	if err := log.Write("bait", []struct {
-		Seq  uint64
-		Data []byte
-	}{{2, data}}); err != nil {
+	if err := log.Write([]EvidenceItem{{"bait", 2, data}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -114,10 +109,7 @@ func TestEvidenceLogRetentionByAge(t *testing.T) {
 
 	rec := Record{Event: &Event{Stream: "edge", Action: "request", Timestamp: now}}
 	data, _ := json.Marshal(rec)
-	if err := log.Write("bait", []struct {
-		Seq  uint64
-		Data []byte
-	}{{1, data}}); err != nil {
+	if err := log.Write([]EvidenceItem{{"bait", 1, data}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -146,10 +138,7 @@ func TestEvidenceLogRetentionBySize(t *testing.T) {
 
 	rec := Record{Event: &Event{Stream: "edge", Action: "request", Timestamp: now}}
 	data, _ := json.Marshal(rec)
-	if err := log.Write("bait", []struct {
-		Seq  uint64
-		Data []byte
-	}{{1, data}}); err != nil {
+	if err := log.Write([]EvidenceItem{{"bait", 1, data}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -175,10 +164,7 @@ func TestEvidenceLogCheckpointAfterWrite(t *testing.T) {
 
 	rec := Record{Event: &Event{Stream: "edge", Action: "request", Timestamp: now}}
 	data, _ := json.Marshal(rec)
-	if err := log.Write("bait", []struct {
-		Seq  uint64
-		Data []byte
-	}{{1, data}}); err != nil {
+	if err := log.Write([]EvidenceItem{{"bait", 1, data}}); err != nil {
 		t.Fatal(err)
 	}
 
