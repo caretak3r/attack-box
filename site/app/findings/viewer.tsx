@@ -1,6 +1,8 @@
 'use client'
 
 import { useState, useEffect } from 'react'
+import Link from 'next/link'
+import { journeys } from './journeys'
 import styles from './findings.module.css'
 
 export type DayData = {
@@ -292,6 +294,16 @@ export function FindingsViewer({ days }: ViewerProps) {
       </header>
 
       <main className={styles.main}>
+        <section className={styles.scope} aria-labelledby="peer-journeys">
+          <h2 id="peer-journeys">Peer journeys · request by request</h2>
+          <p>Each report follows one TCP peer. The date and port filters do not hide these reports.</p>
+          <ul>
+            {journeys.map(report => <li key={report.slug}>
+              <Link className={styles.link} href={`/findings/${report.slug}/`}>{report.title}</Link>
+              <p>{report.summary}</p>
+            </li>)}
+          </ul>
+        </section>
         {day && (
           <section className={styles.scope} aria-label="Selected day">
             <div>
@@ -313,14 +325,6 @@ export function FindingsViewer({ days }: ViewerProps) {
         )}
 
         {!day && <p className={styles.hint}>{days.length} reports · {mapped.length} public maps · includes partial days. Written reports without a map do not contribute to totals.</p>}
-        {(!day || day.date === '2026-11-26' || day.date === '2026-11-27') && <p className={styles.hint}>
-          Case study · Nov 26–27: <a className={styles.link} href="https://github.com/caretak3r/attack-box/blob/main/findings/2026-11-27/ollama-prompt-journey.md">One Ollama client’s prompt journey</a> — 33 requests with prompts, from a three-model comparison to repeated chat turns.
-          {' '}Five requests ended with the exact user message <code>hi</code>. Wording withheld for the other 13 distinct prompts.
-          {' '}<a className={styles.link} href="https://github.com/caretak3r/attack-box/blob/main/findings/2026-11-27/cleared-prompts.json">Cleared prompt file</a>
-        </p>}
-        {(!day || day.date === '2026-11-28') && <p className={styles.hint}>
-          Case study · Nov 28: <a className={styles.link} href="https://github.com/caretak3r/attack-box/blob/main/findings/2026-11-28/chat-body-limit.md">Twelve chat requests on one port</a> — eight exceeded the size limit; four received HTTP 200.
-        </p>}
         {(filter.port >= 0 || filter.endpoint) && <p className={styles.hint}>Showing {filter.endpoint || `port ${filter.port || 'unknown'}`} · <button className={styles.link} onClick={() => setFilter(emptyFilter)}>Clear filter</button></p>}
         {(!day || day.hasMap) && (
           <section className={styles.overview} aria-label="Volume">
