@@ -35,8 +35,15 @@ regexes = [
 [[allowlists]]
 condition = 'AND'
 regexTarget = 'secret'
-paths = ['''(?:^|/)cmd/attackbox\-shipper/main_test\.go$''', '''(?:^|/)cmd/attackbox\-shipper/rejection_test\.go$''', '''(?:^|/)internal/telemetry/newrelic_test\.go$''', '''(?:^|/)scripts/test\-vultr\-launch\.sh$''']
+paths = ['''(?:^|/)cmd/attackbox\-shipper/main_test\.go$''', '''(?:^|/)cmd/attackbox\-shipper/rejection_test\.go$''', '''(?:^|/)internal/telemetry/newrelic_test\.go$''', '''(?:^|/)scripts/test\-vultr\-launch\.sh$''', '''(?:^|/)scripts/test\-deploy\-ubuntu\.sh$''']
 regexes = ['''^0123456789abcdef0123456789abcdef01234567$''']
+
+# Reflection-filter test input in the public gateway intent tests.
+[[allowlists]]
+condition = 'AND'
+regexTarget = 'secret'
+paths = ['''(?:^|/)internal/publicedge/intent_test\.go$''']
+regexes = ['''^sk\-1234567890abcdefghijk1234567890$''']
 
 [[allowlists]]
 condition = 'AND'
