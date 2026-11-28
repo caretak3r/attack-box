@@ -1,7 +1,7 @@
 // attackbox-live serves a loopback dashboard of public gateway traffic.
-// It follows the host capture files over the existing SSH alias and polls
-// New Relic for pre-HTTP connections. Captured text is data: it is parsed,
-// bounded, kept in memory only, and sent to the page as JSON.
+// It reads capture files, OTLP traces, and shipper events over SSH or from
+// a local archive. Captured text is data: parsed, bounded, kept in memory,
+// and served as JSON to the web UI.
 package main
 
 import (
@@ -9,19 +9,16 @@ import (
 	"bytes"
 	"context"
 	"embed"
+	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"flag"
-	"fmt"
 	"io"
-	"io/fs"
-	"net"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
-	"path"
-	"regexp"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,235 +30,1029 @@ import (
 var webFS embed.FS
 
 const (
-	maxLine  = 128 << 10 // one capture record stays under this
-	feedSize = 300
-	topSize  = 100
-	flowSize = 10
+	maxLineLength      = 128 << 10
+	maxPreviewRuns     = 80
+	feedSize           = 300
+	flowSize           = 10
+	timelineBuckets    = 60
+	flowOtherSources   = "__other_sources__"
+	flowOtherEndpoints = "__other_endpoints__"
 )
 
 type event struct {
-	Seq           uint64      `json:"seq"`
 	Time          time.Time   `json:"time"`
-	Kind          string      `json:"kind"`   // request or connection
-	Source        string      `json:"source"` // capture or newrelic
+	Seq           uint64      `json:"seq"`
+	Kind          string      `json:"kind"`
+	Source        string      `json:"source"`
+	Origin        string      `json:"origin"`
 	IP            string      `json:"ip"`
-	Own           bool        `json:"own,omitempty"` // the source is one of the operator's own addresses
 	Port          int         `json:"port"`
-	Endpoint      string      `json:"endpoint"`
-	Method        string      `json:"method,omitempty"`
-	Target        string      `json:"target,omitempty"`
+	Route         string      `json:"route"`
+	Method        string      `json:"method"`
+	Target        string      `json:"target"`
 	Host          string      `json:"host,omitempty"`
-	UserAgent     string      `json:"user_agent,omitempty"`
-	Route         string      `json:"route,omitempty"`
-	Status        int         `json:"status,omitempty"`
-	Probe         string      `json:"probe,omitempty"`
+	UserAgent     string      `json:"user_agent"`
+	Status        int         `json:"status"`
+	Probe         string      `json:"probe"`
 	Proto         string      `json:"proto,omitempty"`
-	Outcome       string      `json:"outcome,omitempty"`
+	Headers       [][2]string `json:"headers,omitempty"`
 	SNI           string      `json:"sni,omitempty"`
+	Outcome       string      `json:"outcome,omitempty"`
 	ContentType   string      `json:"content_type,omitempty"`
 	Model         string      `json:"model,omitempty"`
-	BodyBytes     int64       `json:"body_bytes,omitempty"`
-	BodyTruncated bool        `json:"body_truncated,omitempty"`
+	Stream        bool        `json:"stream,omitempty"`
+	Tools         string      `json:"tools,omitempty"`
+	SystemMsg     bool        `json:"system_msg,omitempty"`
+	MCPMethod     string      `json:"mcp_method,omitempty"`
+	CanaryKey     string      `json:"canary_key,omitempty"`
+	Credential    string      `json:"credential,omitempty"`
+	BodyBytes     int64       `json:"body_bytes"`
 	BodySHA256    string      `json:"body_sha256,omitempty"`
-	Preview       string      `json:"preview,omitempty"`
-	Headers       [][2]string `json:"headers,omitempty"`
+	BodyTruncated bool        `json:"body_truncated,omitempty"`
+	RuleName      string      `json:"rule_name,omitempty"`
+	Priority      string      `json:"priority,omitempty"`
+	BlockType     string      `json:"block_type,omitempty"`
 	Body          string      `json:"body,omitempty"`
-
-	id  string // New Relic span id, for de-duplication
-	hay string // lower-case text that the filter searches
+	spanMerged    bool
 }
 
-func clip(s string, n int) string {
-	if len(s) > n {
-		return strings.ToValidUTF8(s[:n], "")
+func parseCapture(line []byte, port int) (event, bool) {
+	var raw struct {
+		Time          string      `json:"time"`
+		Peer          string      `json:"peer"`
+		Port          int         `json:"port"`
+		Method        string      `json:"method"`
+		Target        string      `json:"target"`
+		Route         string      `json:"route"`
+		Status        int         `json:"status"`
+		Body          string      `json:"body"`
+		BodyBytes     int64       `json:"body_bytes"`
+		BodySHA256    string      `json:"body_sha256"`
+		BodyTruncated bool        `json:"body_truncated"`
+		Host          string      `json:"host"`
+		UA            string      `json:"user_agent"`
+		CT            string      `json:"content_type"`
+		Probe         string      `json:"probe"`
+		Proto         string      `json:"proto"`
+		Headers       [][2]string `json:"headers"`
 	}
-	return s
+	if err := json.Unmarshal(line, &raw); err != nil {
+		return event{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, raw.Time)
+	if err != nil {
+		return event{}, false
+	}
+	if raw.Port != 0 {
+		port = raw.Port
+	}
+	if raw.BodyBytes == 0 && raw.Body != "" {
+		raw.BodyBytes = int64(len(raw.Body))
+	}
+	e := event{
+		Time:          t,
+		Kind:          "request",
+		Source:        "capture",
+		IP:            raw.Peer,
+		Port:          port,
+		Method:        raw.Method,
+		Target:        raw.Target,
+		Route:         raw.Route,
+		Status:        raw.Status,
+		Body:          raw.Body,
+		BodyBytes:     raw.BodyBytes,
+		BodySHA256:    raw.BodySHA256,
+		BodyTruncated: raw.BodyTruncated,
+		Host:          raw.Host,
+		UserAgent:     raw.UA,
+		ContentType:   raw.CT,
+		Probe:         raw.Probe,
+		Proto:         raw.Proto,
+		Headers:       raw.Headers,
+	}
+	if raw.Body != "" {
+		var obj map[string]any
+		if json.Unmarshal([]byte(raw.Body), &obj) == nil {
+			if model, ok := obj["model"].(string); ok {
+				e.Model = model
+			}
+			if stream, ok := obj["stream"].(bool); ok {
+				e.Stream = stream
+			}
+			if tools, ok := obj["tools"].([]any); ok {
+				var names []string
+				for _, tool := range tools {
+					if tm, ok := tool.(map[string]any); ok {
+						if fn, ok := tm["function"].(map[string]any); ok {
+							if name, ok := fn["name"].(string); ok {
+								names = append(names, name)
+							}
+						} else if name, ok := tm["name"].(string); ok {
+							names = append(names, name)
+						}
+					}
+				}
+				if len(names) > 0 {
+					e.Tools = strings.Join(names, ",")
+				}
+			}
+			if messages, ok := obj["messages"].([]any); ok {
+				for _, message := range messages {
+					if m, ok := message.(map[string]any); ok {
+						if role, ok := m["role"].(string); ok && role == "system" {
+							e.SystemMsg = true
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+	return e, true
 }
 
-// extractPreview derives a plain-text preview from the request body for the feed.
+func parseOTLP(line []byte, port int) ([]event, bool) {
+	var raw struct {
+		ResourceSpans []struct {
+			ScopeSpans []struct {
+				Spans []struct {
+					Name              string `json:"name"`
+					StartTimeUnixNano string `json:"startTimeUnixNano"`
+					Attributes        any    `json:"attributes"`
+				} `json:"spans"`
+			} `json:"scopeSpans"`
+		} `json:"resourceSpans"`
+	}
+	if err := json.Unmarshal(line, &raw); err != nil {
+		return nil, false
+	}
+	var events []event
+	for _, rs := range raw.ResourceSpans {
+		for _, ss := range rs.ScopeSpans {
+			for _, sp := range ss.Spans {
+				attrs, ok := sp.Attributes.([]any)
+				if !ok {
+					return nil, false
+				}
+				m := make(map[string]string)
+				for _, attr := range attrs {
+					am, ok := attr.(map[string]any)
+					if !ok {
+						continue
+					}
+					key, _ := am["key"].(string)
+					val, ok := am["value"].(map[string]any)
+					if !ok {
+						continue
+					}
+					if sv, ok := val["stringValue"].(string); ok {
+						m[key] = sv
+					} else if iv, ok := val["intValue"].(string); ok {
+						m[key] = iv
+					} else if bv, ok := val["boolValue"].(bool); ok {
+						m[key] = strconv.FormatBool(bv)
+					}
+				}
+				nano, _ := strconv.ParseInt(sp.StartTimeUnixNano, 10, 64)
+				e := event{
+					Time:   time.Unix(0, nano),
+					Source: "otel",
+					IP:     m["client.address"],
+					Port:   port,
+				}
+				if parsedPort, _ := strconv.Atoi(m["server.port"]); parsedPort > 0 {
+					e.Port = parsedPort
+				}
+				switch sp.Name {
+				case "public.connection":
+					e.Kind = "connection"
+					e.Outcome = m["attackbox.connection.outcome"]
+					e.SNI = m["attackbox.tls.sni"]
+				case "public.request":
+					e.Kind = "request"
+					e.Route = m["http.route"]
+					e.Method = m["http.request.method"]
+					e.Status, _ = strconv.Atoi(m["http.response.status_code"])
+					e.Model = m["gen_ai.request.model"]
+					if e.Model == "" {
+						e.Model = m["attackbox.model"]
+					}
+					e.Stream = m["attackbox.stream"] == "true"
+					e.MCPMethod = m["attackbox.mcp.method"]
+					e.CanaryKey = m["attackbox.canary.key"]
+					e.Credential = m["attackbox.credential.value"]
+				default:
+					continue
+				}
+				events = append(events, e)
+			}
+		}
+	}
+	return events, true
+}
+
+func parseShipperEnvelope(line []byte) ([]event, bool) {
+	var env struct {
+		Ts   string `json:"ts"`
+		Role string `json:"role"`
+		Seq  int    `json:"seq"`
+		Rec  struct {
+			Event struct {
+				Timestamp string `json:"timestamp"`
+				Stream    string `json:"stream"`
+				Action    string `json:"action"`
+				Body      string `json:"body"`
+				SrcIP     string `json:"src_ip"`
+			} `json:"event"`
+		} `json:"record"`
+	}
+	if err := json.Unmarshal(line, &env); err != nil {
+		return nil, false
+	}
+	if env.Rec.Event.Stream == "heartbeat" {
+		return []event{}, true
+	}
+	if env.Role == "bait" {
+		t, _ := time.Parse(time.RFC3339, env.Rec.Event.Timestamp)
+		return []event{{Time: t, Kind: "bait", Source: "shipper"}}, true
+	}
+	if env.Role == "runtime" && env.Rec.Event.Action == "falco" {
+		body := strings.TrimPrefix(env.Rec.Event.Body, "base64:")
+		data, _ := base64.StdEncoding.DecodeString(body)
+		var falco struct {
+			Rule   string `json:"rule"`
+			Prio   string `json:"priority"`
+			Fields struct {
+				SIP string `json:"fd.sip"`
+			} `json:"output_fields"`
+		}
+		if json.Unmarshal(data, &falco) == nil {
+			t, _ := time.Parse(time.RFC3339, env.Rec.Event.Timestamp)
+			return []event{{
+				Time:     t,
+				Kind:     "security",
+				Source:   "shipper",
+				IP:       falco.Fields.SIP,
+				RuleName: falco.Rule,
+				Priority: falco.Prio,
+			}}, true
+		}
+	}
+	if env.Role == "egress" && env.Rec.Event.Action == "egress_blocked" {
+		body := strings.TrimPrefix(env.Rec.Event.Body, "base64:")
+		data, _ := base64.StdEncoding.DecodeString(body)
+		var jrnl struct {
+			Msg string `json:"MESSAGE"`
+		}
+		if json.Unmarshal(data, &jrnl) == nil {
+			msg := jrnl.Msg
+			var ip, blockType, prio string
+			if strings.Contains(msg, "METADATA-BLOCK") {
+				blockType = "metadata"
+			} else {
+				blockType = "container_egress"
+				if strings.Contains(msg, " SYN") {
+					prio = "outbound"
+				} else {
+					prio = "reply"
+				}
+			}
+			if idx := strings.Index(msg, "SRC="); idx >= 0 {
+				rest := msg[idx+4:]
+				if sp := strings.Index(rest, " "); sp > 0 {
+					ip = rest[:sp]
+				}
+			}
+			t, _ := time.Parse(time.RFC3339, env.Rec.Event.Timestamp)
+			return []event{{
+				Time:      t,
+				Kind:      "security",
+				Source:    "shipper",
+				IP:        ip,
+				RuleName:  "egress_block",
+				Priority:  prio,
+				BlockType: blockType,
+			}}, true
+		}
+	}
+	return nil, false
+}
+
 func extractPreview(body string) string {
 	if body == "" {
 		return ""
 	}
 	var obj map[string]any
-	if err := json.Unmarshal([]byte(body), &obj); err == nil {
-		if s, ok := obj["prompt"].(string); ok && s != "" {
-			return s
-		}
+	if json.Unmarshal([]byte(body), &obj) == nil {
 		if msgs, ok := obj["messages"].([]any); ok && len(msgs) > 0 {
 			if last, ok := msgs[len(msgs)-1].(map[string]any); ok {
-				if content, ok := last["content"].(string); ok && content != "" {
-					return content
-				}
-				if parts, ok := last["content"].([]any); ok {
-					var texts []string
-					for _, p := range parts {
-						if pm, ok := p.(map[string]any); ok {
-							if text, ok := pm["text"].(string); ok && text != "" {
-								texts = append(texts, text)
-							}
-						}
-					}
-					if len(texts) > 0 {
-						return strings.Join(texts, " ")
-					}
+				if c, ok := last["content"].(string); ok {
+					return c
 				}
 			}
 		}
-		if s, ok := obj["input"].(string); ok && s != "" {
-			return s
+		if p, ok := obj["prompt"].(string); ok {
+			return p
 		}
-		if arr, ok := obj["input"].([]any); ok && len(arr) > 0 {
-			if s, ok := arr[0].(string); ok && s != "" {
-				return s
-			}
+		if t, ok := obj["text"].(string); ok {
+			return t
+		}
+		if i, ok := obj["input"].(string); ok {
+			return i
 		}
 	}
 	return body
 }
 
-// cleanPreview makes one line of at most 160 runes; only the start of the text is read.
 func cleanPreview(s string) string {
-	s = strings.ToValidUTF8(s[:min(len(s), 1024)], "")
-	s = strings.Join(strings.Fields(strings.Map(func(r rune) rune {
-		if r < ' ' || r == 0x7f {
-			return ' '
-		}
-		return r
-	}, s)), " ")
-	if r := []rune(s); len(r) > 160 {
-		return string(r[:160]) + "…"
+	r := []rune(s)
+	if len(r) > maxPreviewRuns {
+		return string(r[:maxPreviewRuns-1]) + "…"
 	}
 	return s
 }
 
-// finish derives the endpoint label and the filter text.
-func (e *event) finish() {
-	p := ":" + strconv.Itoa(e.Port) + " "
-	target, _, _ := strings.Cut(e.Target, "?")
-	switch {
-	case e.Kind == "connection":
-		e.Endpoint = p + "pre-HTTP " + e.Outcome
-	case e.Route != "" && e.Route != "/unmatched":
-		e.Endpoint = p + e.Route
-	case target != "":
-		e.Endpoint = p + clip(target, 80)
-	case e.Probe != "":
-		e.Endpoint = p + "/unmatched (" + e.Probe + ")"
-	default:
-		e.Endpoint = p + "/unmatched"
-	}
-	e.Preview = cleanPreview(extractPreview(e.Body))
-	e.hay = strings.ToLower(strings.Join([]string{e.IP, e.Method, e.Target, e.Host, e.UserAgent, e.Route,
-		e.Probe, e.Outcome, e.Model, strconv.Itoa(e.Status), e.Body}, "\n"))
-}
-
-// parseCapture reads one line of the gateway capture file.
-func parseCapture(line []byte, port int) (event, bool) {
-	var c struct {
-		Time          string      `json:"time"`
-		Peer          string      `json:"peer"`
-		Method        string      `json:"method"`
-		Target        string      `json:"target"`
-		Host          string      `json:"host"`
-		UserAgent     string      `json:"user_agent"`
-		Route         string      `json:"route"`
-		Status        int         `json:"status"`
-		Probe         string      `json:"probe"`
-		Port          int         `json:"port"`
-		Proto         string      `json:"proto"`
-		Headers       [][2]string `json:"headers"`
-		Body          string      `json:"body"`
-		BodyBytes     int64       `json:"body_bytes"`
-		BodySHA256    string      `json:"body_sha256"`
-		BodyTruncated bool        `json:"body_truncated"`
-	}
-	if json.Unmarshal(line, &c) != nil {
-		return event{}, false
-	}
-	t, err := time.Parse(time.RFC3339Nano, c.Time)
-	if err != nil {
-		return event{}, false
-	}
-	if c.Port != 0 {
-		port = c.Port
-	}
-	e := event{Time: t, Kind: "request", Source: "capture", IP: c.Peer, Port: port, Method: c.Method, Target: c.Target,
-		Host: c.Host, UserAgent: c.UserAgent, Route: c.Route, Status: c.Status, Probe: c.Probe, Proto: c.Proto,
-		Headers: c.Headers, Body: c.Body, BodyBytes: c.BodyBytes, BodySHA256: c.BodySHA256, BodyTruncated: c.BodyTruncated}
-	e.finish()
-	return e, true
-}
-
-type sourceStatus struct {
-	State  string    `json:"state"`
-	Detail string    `json:"detail,omitempty"`
-	Last   time.Time `json:"last"`
+type requestKey struct {
+	ip     string
+	port   int
+	route  string
+	second int64
 }
 
 type store struct {
-	mu          sync.Mutex
-	events      []event // sorted by time when dirty is false
-	dirty       bool
-	seq         uint64
-	keep        int
-	seen        map[string]struct{}
-	captureFrom time.Time // earliest capture record; New Relic requests after it are duplicates
-	status      map[string]sourceStatus
-	own         map[string]bool // the operator's own addresses, such as the Mac egress and the host itself
+	mu       sync.RWMutex
+	events   []event
+	requests map[requestKey][]int
+	seq      uint64
+	keep     int
+	own      map[string]bool
+	host     string
 }
 
 func newStore(keep int) *store {
-	return &store{keep: keep, seen: map[string]struct{}{}, status: map[string]sourceStatus{}}
+	return &store{
+		keep:     keep,
+		own:      make(map[string]bool),
+		requests: make(map[requestKey][]int),
+	}
+}
+
+func (s *store) classifyOrigin(e event) string {
+	switch {
+	case strings.HasPrefix(e.IP, "127."), e.IP == "::1":
+		return "test"
+	case s.own[e.IP], e.IP == s.host:
+		return "test"
+	case strings.HasPrefix(e.UserAgent, "attackbox-deploy-test/"):
+		return "test"
+	case e.Kind == "bait", e.Kind == "security":
+		return "test"
+	default:
+		return "internet"
+	}
+}
+
+func mergeRequestSpan(capture *event, span event) {
+	if span.Method != "" && capture.Method == "" {
+		capture.Method = span.Method
+	}
+	if span.Status != 0 && capture.Status == 0 {
+		capture.Status = span.Status
+	}
+	if span.Model != "" {
+		capture.Model = span.Model
+	}
+	if span.MCPMethod != "" {
+		capture.MCPMethod = span.MCPMethod
+	}
+	if span.CanaryKey != "" {
+		capture.CanaryKey = span.CanaryKey
+	}
+	if span.Credential != "" {
+		capture.Credential = span.Credential
+	}
+	capture.Stream = capture.Stream || span.Stream
+}
+
+func (s *store) rebuildRequestIndex() {
+	s.requests = make(map[requestKey][]int)
+	for i, e := range s.events {
+		if e.Kind != "request" {
+			continue
+		}
+		key := requestKey{ip: e.IP, port: e.Port, route: e.Route, second: e.Time.Unix()}
+		s.requests[key] = append(s.requests[key], i)
+	}
+}
+
+func (s *store) correlatedRequest(e event, source string) int {
+	best := -1
+	bestDelta := 2*time.Second + 1
+	for offset := int64(-2); offset <= 2; offset++ {
+		key := requestKey{ip: e.IP, port: e.Port, route: e.Route, second: e.Time.Unix() + offset}
+		for _, i := range s.requests[key] {
+			if i >= len(s.events) {
+				continue
+			}
+			other := s.events[i]
+			if other.Source != source || source == "capture" && other.spanMerged {
+				continue
+			}
+			delta := e.Time.Sub(other.Time).Abs()
+			if delta <= 2*time.Second && delta < bestDelta {
+				best = i
+				bestDelta = delta
+			}
+		}
+	}
+	return best
 }
 
 func (s *store) add(e event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e.Own = s.own[e.IP]
-	if e.id != "" {
-		if _, dup := s.seen[e.id]; dup {
+	if !e.Time.IsZero() {
+		e.Time = e.Time.UTC()
+	}
+	if e.Origin == "" {
+		e.Origin = s.classifyOrigin(e)
+	}
+	if e.Kind == "request" && e.Source == "otel" {
+		if i := s.correlatedRequest(e, "capture"); i >= 0 {
+			mergeRequestSpan(&s.events[i], e)
+			s.events[i].spanMerged = true
 			return
 		}
-		s.seen[e.id] = struct{}{}
 	}
-	if e.Source == "capture" && (s.captureFrom.IsZero() || e.Time.Before(s.captureFrom)) {
-		s.captureFrom = e.Time
+	if e.Kind == "request" && e.Source == "capture" {
+		if i := s.correlatedRequest(e, "otel"); i >= 0 {
+			mergeRequestSpan(&e, s.events[i])
+			e.spanMerged = true
+			copy(s.events[i:], s.events[i+1:])
+			s.events = s.events[:len(s.events)-1]
+			s.rebuildRequestIndex()
+		}
 	}
 	s.seq++
 	e.Seq = s.seq
-	if n := len(s.events); n > 0 && e.Time.Before(s.events[n-1].Time) {
-		s.dirty = true
-	}
 	s.events = append(s.events, e)
-	if len(s.events) > s.keep+s.keep/4 {
-		s.sorted()
-		for _, old := range s.events[:len(s.events)-s.keep] {
-			delete(s.seen, old.id)
+	if e.Kind == "request" {
+		key := requestKey{ip: e.IP, port: e.Port, route: e.Route, second: e.Time.Unix()}
+		s.requests[key] = append(s.requests[key], len(s.events)-1)
+	}
+	if len(s.events) > s.keep {
+		copy(s.events, s.events[len(s.events)-s.keep:])
+		s.events = s.events[:s.keep]
+		s.rebuildRequestIndex()
+	}
+}
+
+type sourceStatus struct {
+	mu      sync.RWMutex
+	capture string
+	otel    string
+	shipper string
+	capLast time.Time
+	otlLast time.Time
+	shpLast time.Time
+}
+
+func (s *sourceStatus) set(src, state string, last time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch src {
+	case "capture":
+		s.capture = state
+		if last.After(s.capLast) {
+			s.capLast = last.UTC()
 		}
-		s.events = append([]event(nil), s.events[len(s.events)-s.keep:]...)
+	case "otel":
+		s.otel = state
+		if last.After(s.otlLast) {
+			s.otlLast = last.UTC()
+		}
+	case "shipper":
+		s.shipper = state
+		if last.After(s.shpLast) {
+			s.shpLast = last.UTC()
+		}
 	}
 }
 
-func (s *store) sorted() {
-	if s.dirty {
-		sort.SliceStable(s.events, func(i, j int) bool { return s.events[i].Time.Before(s.events[j].Time) })
-		s.dirty = false
+func (s *sourceStatus) get() map[string]map[string]any {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := map[string]map[string]any{
+		"capture": {"state": s.capture, "last": ""},
+		"otel":    {"state": s.otel, "last": ""},
+		"shipper": {"state": s.shipper, "last": ""},
+	}
+	if !s.capLast.IsZero() {
+		out["capture"]["last"] = s.capLast.UTC().Format(time.RFC3339)
+	}
+	if !s.otlLast.IsZero() {
+		out["otel"]["last"] = s.otlLast.UTC().Format(time.RFC3339)
+	}
+	if !s.shpLast.IsZero() {
+		out["shipper"]["last"] = s.shpLast.UTC().Format(time.RFC3339)
+	}
+	return out
+}
+
+type viewState struct {
+	Now             string                    `json:"now"`
+	Since           string                    `json:"since"`
+	InternetEvents  int                       `json:"internet_events"`
+	TestEvents      int                       `json:"test_events"`
+	InternetSources int                       `json:"internet_sources"`
+	TestSources     int                       `json:"test_sources"`
+	Sources         []map[string]any          `json:"sources"`
+	Endpoints       []map[string]any          `json:"endpoints"`
+	Ports           []map[string]any          `json:"ports"`
+	Timeline        [][2]int                  `json:"timeline"`
+	Flow            map[string]any            `json:"flow"`
+	Feed            []feedRow                 `json:"feed"`
+	AIActivity      []map[string]any          `json:"ai_activity"`
+	Chains          []map[string]any          `json:"chains"`
+	HostSecurity    map[string]any            `json:"host_security"`
+	TestEnv         map[string]any            `json:"test_env"`
+	SourcesStatus   map[string]map[string]any `json:"sources_status"`
+}
+
+type feedRow struct {
+	event
+	Preview string `json:"preview"`
+}
+
+func (s *store) state(now time.Time, window time.Duration, who, ip, endpoint, q string, port int, ports []int, status *sourceStatus) viewState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cutoff := now.Add(-window)
+	filtered := make([]event, 0)
+	var internetEvents, testEvents, ownTraffic, privateBait int
+	internetSources := make(map[string]bool)
+	testSources := make(map[string]bool)
+	query := strings.ToLower(q)
+	for i := len(s.events) - 1; i >= 0; i-- {
+		e := s.events[i]
+		if e.Time.Before(cutoff) {
+			continue
+		}
+		if ip != "" && e.IP != ip {
+			continue
+		}
+		if port > 0 && e.Port != port {
+			continue
+		}
+		if endpoint != "" && e.Route != endpoint {
+			continue
+		}
+		if query != "" {
+			hay := strings.ToLower(e.IP + " " + e.Target + " " + e.Route + " " + e.UserAgent + " " + strconv.Itoa(e.Status) + " " + e.Body)
+			if !strings.Contains(hay, query) {
+				continue
+			}
+		}
+		if e.Kind == "request" || e.Kind == "connection" {
+			if e.Origin == "internet" {
+				internetEvents++
+				if e.IP != "" {
+					internetSources[e.IP] = true
+				}
+			} else {
+				testEvents++
+				ownTraffic++
+				if e.IP != "" {
+					testSources[e.IP] = true
+				}
+			}
+		} else if e.Kind == "bait" && e.Origin == "test" {
+			privateBait++
+		}
+		if who == "internet" && e.Origin != "internet" {
+			continue
+		}
+		if (who == "test" || who == "own") && e.Origin != "test" {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	timeline := make([][2]int, timelineBuckets)
+	for _, e := range filtered {
+		if e.Kind != "request" && e.Kind != "connection" {
+			continue
+		}
+		bucket := int(e.Time.Sub(cutoff) * timelineBuckets / window)
+		if bucket >= timelineBuckets {
+			bucket = timelineBuckets - 1
+		}
+		if e.Kind == "connection" {
+			timeline[bucket][1]++
+		} else {
+			timeline[bucket][0]++
+		}
+	}
+	feed := make([]feedRow, 0, min(len(filtered), feedSize))
+	for i := 0; i < len(filtered) && i < feedSize; i++ {
+		e := filtered[i]
+		e.Body = ""
+		p := cleanPreview(extractPreview(filtered[i].Body))
+		feed = append(feed, feedRow{event: e, Preview: p})
+	}
+	srcAgg := make(map[string]map[string]any)
+	for _, e := range filtered {
+		if e.IP == "" {
+			continue
+		}
+		if srcAgg[e.IP] == nil {
+			srcAgg[e.IP] = map[string]any{
+				"ip": e.IP, "own": e.Origin == "test", "count": 0, "last": e.Time, "ua": e.UserAgent,
+			}
+		}
+		srcAgg[e.IP]["count"] = srcAgg[e.IP]["count"].(int) + 1
+		if e.Origin == "test" {
+			srcAgg[e.IP]["own"] = true
+		}
+		if e.Time.After(srcAgg[e.IP]["last"].(time.Time)) {
+			srcAgg[e.IP]["last"] = e.Time
+			if e.UserAgent != "" {
+				srcAgg[e.IP]["ua"] = e.UserAgent
+			}
+		}
+	}
+	sources := make([]map[string]any, 0, len(srcAgg))
+	for _, m := range srcAgg {
+		sources = append(sources, m)
+	}
+	sort.Slice(sources, func(i, j int) bool {
+		return sources[i]["count"].(int) > sources[j]["count"].(int)
+	})
+	epAgg := make(map[string]map[string]any)
+	for _, e := range filtered {
+		if e.Route == "" {
+			continue
+		}
+		if epAgg[e.Route] == nil {
+			epAgg[e.Route] = map[string]any{"route": e.Route, "count": 0, "last": e.Time, "endpoint": e.Route}
+		}
+		epAgg[e.Route]["count"] = epAgg[e.Route]["count"].(int) + 1
+		if e.Time.After(epAgg[e.Route]["last"].(time.Time)) {
+			epAgg[e.Route]["last"] = e.Time
+		}
+	}
+	endpoints := make([]map[string]any, 0, len(epAgg))
+	for _, m := range epAgg {
+		endpoints = append(endpoints, m)
+	}
+	sort.Slice(endpoints, func(i, j int) bool {
+		return endpoints[i]["count"].(int) > endpoints[j]["count"].(int)
+	})
+	portAgg := make(map[int]map[string]any)
+	for _, p := range ports {
+		portAgg[p] = map[string]any{"port": p, "requests": 0, "connections": 0, "sources": 0, "last": time.Time{}}
+	}
+	portSources := make(map[int]map[string]bool)
+	for _, e := range filtered {
+		if portAgg[e.Port] == nil {
+			continue
+		}
+		if e.Kind == "request" {
+			portAgg[e.Port]["requests"] = portAgg[e.Port]["requests"].(int) + 1
+		} else if e.Kind == "connection" {
+			portAgg[e.Port]["connections"] = portAgg[e.Port]["connections"].(int) + 1
+		}
+		if e.IP != "" {
+			if portSources[e.Port] == nil {
+				portSources[e.Port] = make(map[string]bool)
+			}
+			portSources[e.Port][e.IP] = true
+		}
+		last, ok := portAgg[e.Port]["last"].(time.Time)
+		if !ok || e.Time.After(last) {
+			portAgg[e.Port]["last"] = e.Time
+		}
+	}
+	for p, m := range portAgg {
+		m["sources"] = len(portSources[p])
+	}
+	portsOut := make([]map[string]any, 0, len(portAgg))
+	for _, m := range portAgg {
+		portsOut = append(portsOut, m)
+	}
+	sort.Slice(portsOut, func(i, j int) bool {
+		return portsOut[i]["port"].(int) < portsOut[j]["port"].(int)
+	})
+	rawFlow := make(map[[2]string]int)
+	sourceCounts := make(map[string]int)
+	targetCounts := make(map[string]int)
+	for _, e := range filtered {
+		if e.IP == "" || e.Route == "" {
+			continue
+		}
+		rawFlow[[2]string{e.IP, e.Route}]++
+		sourceCounts[e.IP]++
+		targetCounts[e.Route]++
+	}
+	top := func(counts map[string]int) map[string]bool {
+		ids := make([]string, 0, len(counts))
+		for id := range counts {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool {
+			if counts[ids[i]] != counts[ids[j]] {
+				return counts[ids[i]] > counts[ids[j]]
+			}
+			return ids[i] < ids[j]
+		})
+		keep := make(map[string]bool, min(len(ids), flowSize))
+		for _, id := range ids[:min(len(ids), flowSize)] {
+			keep[id] = true
+		}
+		return keep
+	}
+	topSources, topTargets := top(sourceCounts), top(targetCounts)
+	flowAgg := make(map[[2]string]int)
+	for key, value := range rawFlow {
+		if !topSources[key[0]] {
+			key[0] = flowOtherSources
+		}
+		if !topTargets[key[1]] {
+			key[1] = flowOtherEndpoints
+		}
+		flowAgg[key] += value
+	}
+	sourceNodeCounts := make(map[string]int)
+	targetNodeCounts := make(map[string]int)
+	links := make([]map[string]any, 0, len(flowAgg))
+	for key, value := range flowAgg {
+		sourceNodeCounts[key[0]] += value
+		targetNodeCounts[key[1]] += value
+		links = append(links, map[string]any{"source": key[0], "target": key[1], "value": value})
+	}
+	sort.Slice(links, func(i, j int) bool {
+		if links[i]["value"].(int) != links[j]["value"].(int) {
+			return links[i]["value"].(int) > links[j]["value"].(int)
+		}
+		return links[i]["source"].(string)+"\n"+links[i]["target"].(string) <
+			links[j]["source"].(string)+"\n"+links[j]["target"].(string)
+	})
+	makeNodes := func(counts map[string]int, side, otherID, otherName string) []map[string]any {
+		nodes := make([]map[string]any, 0, len(counts))
+		for id, value := range counts {
+			name := id
+			isOther := id == otherID
+			if isOther {
+				name = otherName
+			}
+			nodes = append(nodes, map[string]any{
+				"id": id, "name": name, "count": value, "side": side, "other": isOther,
+			})
+		}
+		sort.Slice(nodes, func(i, j int) bool {
+			if nodes[i]["other"].(bool) != nodes[j]["other"].(bool) {
+				return !nodes[i]["other"].(bool)
+			}
+			if nodes[i]["count"].(int) != nodes[j]["count"].(int) {
+				return nodes[i]["count"].(int) > nodes[j]["count"].(int)
+			}
+			return nodes[i]["name"].(string) < nodes[j]["name"].(string)
+		})
+		return nodes
+	}
+	nodes := makeNodes(sourceNodeCounts, "source", flowOtherSources, "other sources")
+	nodes = append(nodes, makeNodes(targetNodeCounts, "target", flowOtherEndpoints, "other endpoints")...)
+	flow := map[string]any{"nodes": nodes, "links": links}
+	aiAgg := make(map[string]map[string]any)
+	for _, e := range filtered {
+		if e.Model == "" && !e.Stream && e.Tools == "" && !e.SystemMsg {
+			continue
+		}
+		if aiAgg[e.IP] == nil {
+			aiAgg[e.IP] = map[string]any{
+				"ip": e.IP, "chat": 0, "gen": 0, "models": make(map[string]bool),
+				"tools": make(map[string]bool), "has_system": false, "has_stream": false,
+				"user_agents": make(map[string]bool),
+			}
+		}
+		if strings.Contains(e.Route, "/chat/") || strings.Contains(e.Route, "/messages") {
+			aiAgg[e.IP]["chat"] = aiAgg[e.IP]["chat"].(int) + 1
+		} else if strings.Contains(e.Route, "/completions") || strings.Contains(e.Route, "/generate") {
+			aiAgg[e.IP]["gen"] = aiAgg[e.IP]["gen"].(int) + 1
+		}
+		if e.Model != "" {
+			aiAgg[e.IP]["models"].(map[string]bool)[e.Model] = true
+		}
+		if e.Tools != "" {
+			for _, tool := range strings.Split(e.Tools, ",") {
+				aiAgg[e.IP]["tools"].(map[string]bool)[tool] = true
+			}
+		}
+		if e.SystemMsg {
+			aiAgg[e.IP]["has_system"] = true
+		}
+		if e.Stream {
+			aiAgg[e.IP]["has_stream"] = true
+		}
+		if e.UserAgent != "" {
+			aiAgg[e.IP]["user_agents"].(map[string]bool)[e.UserAgent] = true
+		}
+	}
+	aiActivity := make([]map[string]any, 0, len(aiAgg))
+	for _, m := range aiAgg {
+		models := make([]string, 0)
+		for k := range m["models"].(map[string]bool) {
+			models = append(models, k)
+		}
+		sort.Strings(models)
+		tools := make([]string, 0)
+		for k := range m["tools"].(map[string]bool) {
+			tools = append(tools, k)
+		}
+		sort.Strings(tools)
+		if len(tools) > 10 {
+			tools = tools[:10]
+		}
+		uas := make([]string, 0)
+		for k := range m["user_agents"].(map[string]bool) {
+			uas = append(uas, k)
+		}
+		sort.Strings(uas)
+		aiActivity = append(aiActivity, map[string]any{
+			"ip":          m["ip"],
+			"chat":        m["chat"],
+			"gen":         m["gen"],
+			"models":      models,
+			"tools":       tools,
+			"has_system":  m["has_system"],
+			"has_stream":  m["has_stream"],
+			"user_agents": uas,
+		})
+	}
+	sort.Slice(aiActivity, func(i, j int) bool {
+		return aiActivity[i]["chat"].(int)+aiActivity[i]["gen"].(int) >
+			aiActivity[j]["chat"].(int)+aiActivity[j]["gen"].(int)
+	})
+	cd := newChainDetector()
+	for _, e := range filtered {
+		cd.add(e)
+	}
+	chains := cd.report()
+	falcoRules := make(map[string]int)
+	falcoPrios := make(map[string]int)
+	egressBlocks := make(map[string]int)
+	for _, e := range s.events {
+		if e.Kind != "security" {
+			continue
+		}
+		if e.Time.Before(cutoff) {
+			continue
+		}
+		if e.RuleName != "" && e.RuleName != "egress_block" {
+			falcoRules[e.RuleName]++
+			if e.Priority != "" {
+				falcoPrios[e.Priority]++
+			}
+		}
+		if e.BlockType != "" {
+			if e.BlockType == "container_egress" {
+				if e.Priority == "reply" {
+					egressBlocks["reply"]++
+				} else {
+					egressBlocks["container"]++
+				}
+			} else if e.BlockType == "metadata" {
+				egressBlocks["metadata"]++
+			} else if e.BlockType == "reply" {
+				egressBlocks["reply"]++
+			} else if e.BlockType == "container" {
+				egressBlocks["container"]++
+			}
+		}
+	}
+	hostSec := map[string]any{
+		"falco_rules":      falcoRules,
+		"falco_priorities": falcoPrios,
+		"egress_blocks":    egressBlocks,
+	}
+	testEnv := map[string]any{
+		"own_traffic":  ownTraffic,
+		"private_bait": privateBait,
+	}
+	return viewState{
+		Now:             now.UTC().Format(time.RFC3339),
+		Since:           cutoff.UTC().Format(time.RFC3339),
+		InternetEvents:  internetEvents,
+		TestEvents:      testEvents,
+		InternetSources: len(internetSources),
+		TestSources:     len(testSources),
+		Sources:         sources,
+		Endpoints:       endpoints,
+		Ports:           portsOut,
+		Timeline:        timeline,
+		Flow:            flow,
+		Feed:            feed,
+		AIActivity:      aiActivity,
+		Chains:          chains,
+		HostSecurity:    hostSec,
+		TestEnv:         testEnv,
+		SourcesStatus:   status.get(),
 	}
 }
 
-func (s *store) setStatus(name, state, detail string, last time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if last.IsZero() {
-		last = s.status[name].Last
-	}
-	s.status[name] = sourceStatus{State: state, Detail: clip(detail, 200), Last: last}
+type chainDetector struct {
+	chains map[string]map[string]map[string]time.Time
 }
 
-func (s *store) find(seq uint64) (event, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func newChainDetector() *chainDetector {
+	return &chainDetector{chains: make(map[string]map[string]map[string]time.Time)}
+}
+
+func (c *chainDetector) add(e event) {
+	key := e.IP
+	if key == "" {
+		return
+	}
+	if c.chains[key] == nil {
+		c.chains[key] = make(map[string]map[string]time.Time)
+	}
+	if strings.HasPrefix(e.Route, "/api/v1/auths/signup") {
+		if c.chains[key]["open_webui"] == nil {
+			c.chains[key]["open_webui"] = make(map[string]time.Time)
+		}
+		c.chains[key]["open_webui"]["signup"] = e.Time
+	}
+	if strings.Contains(e.Route, "/tools/create") || strings.Contains(e.Route, "/functions/create") {
+		if c.chains[key]["open_webui"] == nil {
+			c.chains[key]["open_webui"] = make(map[string]time.Time)
+		}
+		c.chains[key]["open_webui"]["create"] = e.Time
+	}
+	if strings.Contains(e.Route, "/tools/") && strings.Contains(e.Route, "/delete") ||
+		strings.Contains(e.Route, "/functions/") && strings.Contains(e.Route, "/delete") {
+		if c.chains[key]["open_webui"] == nil {
+			c.chains[key]["open_webui"] = make(map[string]time.Time)
+		}
+		c.chains[key]["open_webui"]["delete"] = e.Time
+	}
+	if e.MCPMethod == "initialize" {
+		if c.chains[key]["mcp"] == nil {
+			c.chains[key]["mcp"] = make(map[string]time.Time)
+		}
+		c.chains[key]["mcp"]["initialize"] = e.Time
+	}
+	if e.MCPMethod == "tools/list" {
+		if c.chains[key]["mcp"] == nil {
+			c.chains[key]["mcp"] = make(map[string]time.Time)
+		}
+		c.chains[key]["mcp"]["tools_list"] = e.Time
+	}
+	if e.MCPMethod == "tools/call" {
+		if c.chains[key]["mcp"] == nil {
+			c.chains[key]["mcp"] = make(map[string]time.Time)
+		}
+		c.chains[key]["mcp"]["tools_call"] = e.Time
+	}
+}
+
+func (c *chainDetector) report() []map[string]any {
+	var out []map[string]any
+	for ip, kinds := range c.chains {
+		for kind, steps := range kinds {
+			if len(steps) == 0 {
+				continue
+			}
+			var complete bool
+			if kind == "open_webui" {
+				_, hasSignup := steps["signup"]
+				_, hasCreate := steps["create"]
+				_, hasDelete := steps["delete"]
+				complete = hasSignup && (hasCreate || hasDelete)
+			} else if kind == "mcp" {
+				_, hasInit := steps["initialize"]
+				_, hasList := steps["tools_list"]
+				_, hasCall := steps["tools_call"]
+				complete = hasInit && hasList && hasCall
+			}
+			var stepList []map[string]any
+			for name, t := range steps {
+				stepList = append(stepList, map[string]any{"name": name, "time": t.UTC().Format(time.RFC3339)})
+			}
+			sort.Slice(stepList, func(i, j int) bool {
+				return stepList[i]["time"].(string) < stepList[j]["time"].(string)
+			})
+			m := map[string]any{"kind": kind, "chain": kind, "ip": ip, "steps": stepList, "complete": complete}
+			for name, t := range steps {
+				m[name] = t.UTC().Format(time.RFC3339)
+			}
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func (s *store) event(seq uint64) (event, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for i := len(s.events) - 1; i >= 0; i-- {
 		if s.events[i].Seq == seq {
 			return s.events[i], true
@@ -270,603 +1061,338 @@ func (s *store) find(seq uint64) (event, bool) {
 	return event{}, false
 }
 
-type ipRow struct {
-	IP          string    `json:"ip"`
-	Own         bool      `json:"own,omitempty"`
-	Requests    int       `json:"requests"`
-	Connections int       `json:"connections"`
-	First       time.Time `json:"first"`
-	Last        time.Time `json:"last"`
-	UserAgent   string    `json:"user_agent"`
-	UserAgents  int       `json:"user_agents"`
-	Endpoints   int       `json:"endpoints"`
-}
-
-type portRow struct {
-	Port        int       `json:"port"`
-	Requests    int       `json:"requests"`
-	Connections int       `json:"connections"`
-	IPs         int       `json:"ips"`
-	Last        time.Time `json:"last,omitzero"`
-}
-
-type node struct {
-	ID    string `json:"id"`
-	Count int    `json:"count"`
-	IPs   int    `json:"ips,omitempty"`
-}
-
-type link struct {
-	Source string `json:"source"`
-	Target string `json:"target"`
-	Count  int    `json:"count"`
-}
-
-type tally struct {
-	Events int `json:"events"`
-	IPs    int `json:"ips"`
-}
-
-type view struct {
-	Now         time.Time               `json:"now"`
-	Since       time.Time               `json:"since"`
-	Sources     map[string]sourceStatus `json:"sources"`
-	OwnAddrs    []string                `json:"own_addresses"`
-	Outside     tally                   `json:"outside"` // whole window, before the who, ip, endpoint and q filters
-	Mine        tally                   `json:"own"`
-	Requests    int                     `json:"requests"`
-	Connections int                     `json:"connections"`
-	IPs         int                     `json:"ips"`
-	Timeline    [][2]int                `json:"timeline"` // per bucket: requests, connections
-	Top         []ipRow                 `json:"top"`
-	Endpoints   []node                  `json:"endpoints"`
-	FlowSources []node                  `json:"flow_sources"`
-	FlowTargets []node                  `json:"flow_targets"`
-	FlowLinks   []link                  `json:"flow_links"`
-	Feed        []event                 `json:"feed"`
-	Ports       []portRow               `json:"ports"`
-}
-
-const other = "other"
-
-// state aggregates the events of one window. who selects outside traffic (default), "own" or "all";
-// ip, endpoint and port match exactly; q matches a substring. ports is the list of configured listener ports.
-func (s *store) state(now time.Time, window time.Duration, who, ip, endpoint, q string, port int, ports []int) view {
-	const buckets = 60
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.sorted()
-	since := now.Add(-window)
-	v := view{Now: now, Since: since, Sources: map[string]sourceStatus{}, Timeline: make([][2]int, buckets)}
-	for k, st := range s.status {
-		v.Sources[k] = st
-	}
-	for a := range s.own {
-		v.OwnAddrs = append(v.OwnAddrs, a)
-	}
-	sort.Strings(v.OwnAddrs)
-	q = strings.ToLower(q)
-	type agg struct {
-		row ipRow
-		uas map[string]int
-		eps map[string]struct{}
-	}
-	ips := map[string]*agg{}
-	eps := map[string]*node{}
-	epIPs := map[link]int{} // Source is the IP, Target the endpoint
-	counted := map[string]bool{}
-	type portAgg struct {
-		row portRow
-		ips map[string]bool
-	}
-	portMap := map[int]*portAgg{}
-	for i := len(s.events) - 1; i >= 0; i-- {
-		e := &s.events[i]
-		if e.Time.Before(since) {
-			break
-		}
-		if e.Time.After(now) ||
-			(e.Source == "newrelic" && e.Kind == "request" && !s.captureFrom.IsZero() && !e.Time.Before(s.captureFrom)) {
-			continue
-		}
-		side := &v.Outside
-		if e.Own {
-			side = &v.Mine
-		}
-		side.Events++
-		if !counted[e.IP] {
-			counted[e.IP] = true
-			side.IPs++
-		}
-		if (who != "all" && e.Own != (who == "own")) || (ip != "" && e.IP != ip) || (endpoint != "" && e.Endpoint != endpoint) ||
-			(q != "" && !strings.Contains(e.hay, q)) {
-			continue
-		}
-		// Counted before the port filter, so the ports table still shows the other ports while one is selected.
-		pa := portMap[e.Port]
-		if pa == nil {
-			pa = &portAgg{row: portRow{Port: e.Port, Last: e.Time}, ips: map[string]bool{}}
-			portMap[e.Port] = pa
-		}
-		if e.Kind == "connection" {
-			pa.row.Connections++
-		} else {
-			pa.row.Requests++
-		}
-		pa.ips[e.IP] = true
-		if port != 0 && e.Port != port {
-			continue
-		}
-		a := ips[e.IP]
-		if a == nil {
-			a = &agg{row: ipRow{IP: e.IP, Own: e.Own, Last: e.Time}, uas: map[string]int{}, eps: map[string]struct{}{}}
-			ips[e.IP] = a
-		}
-		a.row.First = e.Time
-		a.eps[e.Endpoint] = struct{}{}
-		b := int(e.Time.Sub(since) * buckets / window)
-		if b >= buckets {
-			b = buckets - 1
-		}
-		if e.Kind == "connection" {
-			v.Connections++
-			a.row.Connections++
-			v.Timeline[b][1]++
-		} else {
-			v.Requests++
-			a.row.Requests++
-			v.Timeline[b][0]++
-			if e.UserAgent != "" {
-				a.uas[e.UserAgent]++
-			}
-		}
-		n := eps[e.Endpoint]
-		if n == nil {
-			n = &node{ID: e.Endpoint}
-			eps[e.Endpoint] = n
-		}
-		n.Count++
-		epIPs[link{Source: e.IP, Target: e.Endpoint}]++
-		if len(v.Feed) < feedSize {
-			f := *e
-			f.Headers, f.Body = nil, ""
-			v.Feed = append(v.Feed, f)
-		}
-	}
-	v.IPs = len(ips)
-	for _, a := range ips {
-		a.row.UserAgents, a.row.Endpoints = len(a.uas), len(a.eps)
-		best := 0
-		for ua, n := range a.uas {
-			if n > best || (n == best && ua < a.row.UserAgent) {
-				best, a.row.UserAgent = n, ua
-			}
-		}
-		v.Top = append(v.Top, a.row)
-	}
-	sort.Slice(v.Top, func(i, j int) bool {
-		a, b := v.Top[i], v.Top[j]
-		if x, y := a.Requests+a.Connections, b.Requests+b.Connections; x != y {
-			return x > y
-		}
-		return a.IP < b.IP
-	})
-	for l := range epIPs {
-		eps[l.Target].IPs++
-	}
-	for _, n := range eps {
-		v.Endpoints = append(v.Endpoints, *n)
-	}
-	sort.Slice(v.Endpoints, func(i, j int) bool {
-		if v.Endpoints[i].Count != v.Endpoints[j].Count {
-			return v.Endpoints[i].Count > v.Endpoints[j].Count
-		}
-		return v.Endpoints[i].ID < v.Endpoints[j].ID
-	})
-
-	// The flow keeps the busiest sources and endpoints and folds the rest into "other".
-	left, right := map[string]bool{}, map[string]bool{}
-	for i := range min(len(v.Top), flowSize) {
-		left[v.Top[i].IP] = true
-	}
-	for i := range min(len(v.Endpoints), flowSize) {
-		right[v.Endpoints[i].ID] = true
-	}
-	links, lsum, rsum := map[link]int{}, map[string]int{}, map[string]int{}
-	for l, n := range epIPs {
-		if !left[l.Source] {
-			l.Source = other
-		}
-		if !right[l.Target] {
-			l.Target = other
-		}
-		links[l] += n
-		lsum[l.Source] += n
-		rsum[l.Target] += n
-	}
-	for l, n := range links {
-		l.Count = n
-		v.FlowLinks = append(v.FlowLinks, l)
-	}
-	sort.Slice(v.FlowLinks, func(i, j int) bool {
-		a, b := v.FlowLinks[i], v.FlowLinks[j]
-		if a.Count != b.Count {
-			return a.Count > b.Count
-		}
-		return a.Source+"\n"+a.Target < b.Source+"\n"+b.Target
-	})
-	v.FlowSources, v.FlowTargets = flowNodes(lsum), flowNodes(rsum)
-	if len(v.Top) > topSize {
-		v.Top = v.Top[:topSize]
-	}
-	if len(v.Endpoints) > topSize {
-		v.Endpoints = v.Endpoints[:topSize]
-	}
-	for _, p := range ports {
-		if portMap[p] == nil {
-			portMap[p] = &portAgg{row: portRow{Port: p}, ips: map[string]bool{}}
-		}
-	}
-	for _, pa := range portMap {
-		pa.row.IPs = len(pa.ips)
-		v.Ports = append(v.Ports, pa.row)
-	}
-	sort.Slice(v.Ports, func(i, j int) bool { return v.Ports[i].Port < v.Ports[j].Port })
-	return v
-}
-
-func flowNodes(sum map[string]int) []node {
-	out := make([]node, 0, len(sum))
-	for id, n := range sum {
-		out = append(out, node{ID: id, Count: n})
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if (out[i].ID == other) != (out[j].ID == other) {
-			return out[j].ID == other
-		}
-		if out[i].Count != out[j].Count {
-			return out[i].Count > out[j].Count
-		}
-		return out[i].ID < out[j].ID
-	})
-	return out
-}
-
-// readLines calls fn for each complete line. An over-long line gives fn(nil) so that the line count stays exact.
-func readLines(r io.Reader, fn func([]byte)) error {
-	br := bufio.NewReaderSize(r, maxLine)
-	for {
-		line, err := br.ReadSlice('\n')
-		if errors.Is(err, bufio.ErrBufferFull) {
-			for errors.Is(err, bufio.ErrBufferFull) {
-				_, err = br.ReadSlice('\n')
-			}
-			if err != nil {
-				return err
-			}
-			fn(nil)
-			continue
-		}
-		if err != nil {
-			return err // a partial last line is not counted; the next read starts there
-		}
-		fn(line)
-	}
-}
-
 type capture struct {
-	ssh   string // SSH alias; empty reads dir on this machine
-	dir   string
-	days  int
-	port  int
-	lines map[string]int // complete lines consumed for each day file
+	dir      string
+	port     int
+	lines    map[string]int
+	lastTime time.Time
 }
 
-func (c *capture) command(ctx context.Context, day string, follow bool) *exec.Cmd {
-	args := []string{"-n", "+" + strconv.Itoa(c.lines[day]+1)}
-	if follow {
-		args = append(args, "-F")
+func (c *capture) read(ctx context.Context, st *store, day string, isTail bool) string {
+	path := filepath.Join(c.dir, "capture-"+day+".jsonl")
+	if isTail {
+		return "pending"
 	}
-	args = append(args, path.Join(c.dir, "capture-"+day+".jsonl"))
-	if c.ssh == "" {
-		return exec.CommandContext(ctx, "/usr/bin/tail", args...)
-	}
-	// dir and the alias pass a strict pattern in main, so the remote command line holds no shell syntax.
-	return exec.CommandContext(ctx, "/usr/bin/ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-		"-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2", c.ssh, "tail "+strings.Join(args, " "))
-}
-
-type tailWriter struct{ b []byte }
-
-func (w *tailWriter) Write(p []byte) (int, error) {
-	w.b = append(w.b, p...)
-	if len(w.b) > 400 {
-		w.b = w.b[len(w.b)-400:]
-	}
-	return len(p), nil
-}
-
-func (c *capture) read(ctx context.Context, st *store, day string, follow bool) string {
-	cmd := c.command(ctx, day, follow)
-	var stderr tailWriter
-	cmd.Stderr = &stderr
-	out, err := cmd.StdoutPipe()
-	if err == nil {
-		err = cmd.Start()
-	}
+	f, err := os.Open(path)
 	if err != nil {
-		return "cannot start the reader"
-	}
-	if follow {
-		st.setStatus("capture", "following", "", time.Time{})
-	}
-	_ = readLines(out, func(line []byte) {
-		c.lines[day]++
-		if e, ok := parseCapture(line, c.port); ok {
-			st.add(e)
-			if follow {
-				st.setStatus("capture", "following", "", e.Time) // the record time, not the read time
-			}
+		if os.IsNotExist(err) {
+			return "missing"
 		}
-	})
-	_ = cmd.Wait()
-	return strings.TrimSpace(string(bytes.ToValidUTF8(stderr.b, nil)))
-}
-
-func sleep(ctx context.Context, d time.Duration) {
-	select {
-	case <-ctx.Done():
-	case <-time.After(d):
+		return "error"
 	}
-}
-
-func (c *capture) run(ctx context.Context, st *store) {
-	now := time.Now().UTC()
-	for d := c.days - 1; d >= 1 && ctx.Err() == nil; d-- {
-		c.read(ctx, st, now.AddDate(0, 0, -d).Format("20060102"), false)
-	}
-	for ctx.Err() == nil {
-		now = time.Now().UTC()
-		// The gateway starts a new file each UTC day. Follow the old one a little longer to read its last lines.
-		end := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 10, 0, time.UTC)
-		dayCtx, cancel := context.WithDeadline(ctx, end)
-		detail := c.read(dayCtx, st, now.Format("20060102"), true)
-		cancel()
-		if ctx.Err() == nil && time.Now().Before(end) {
-			st.setStatus("capture", "waiting", detail, time.Time{})
-			sleep(ctx, 5*time.Second)
-		}
-	}
-}
-
-var nrURL = "https://api.newrelic.com/graphql"
-
-type newRelic struct {
-	key     string
-	account uint64
-	service string
-	port    int
-}
-
-func (n newRelic) query(ctx context.Context, since time.Time) ([]map[string]any, error) {
-	nrql := "SELECT timestamp, id, name, `client.address`, `attackbox.connection.outcome`, `attackbox.tls.sni`, `http.route`, " +
-		"`http.request.method`, `http.response.status_code`, `attackbox.probe.class`, `attackbox.request.content_type`, " +
-		"`http.request.body.size`, `gen_ai.request.model`, `server.port` FROM Span WHERE service.name = '" + n.service +
-		// Spans without client.address come from loopback or private peers, such as the container health check.
-		"' AND name IN ('public.request', 'public.connection') AND `client.address` IS NOT NULL SINCE " + strconv.FormatInt(since.UnixMilli(), 10) + " LIMIT MAX"
-	quoted, _ := json.Marshal(nrql)
-	body, _ := json.Marshal(map[string]string{"query": fmt.Sprintf("{actor{account(id:%d){nrql(query:%s,timeout:20){results}}}}", n.account, quoted)})
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, nrURL, bytes.NewReader(body))
-	req.Header.Set("API-Key", n.key)
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	res, err := client.Do(req)
-	if err != nil {
-		return nil, errors.New("query transport failed")
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("query returned HTTP %d", res.StatusCode)
-	}
-	var r struct {
-		Data struct {
-			Actor struct {
-				Account struct {
-					NRQL struct {
-						Results []map[string]any `json:"results"`
-					} `json:"nrql"`
-				} `json:"account"`
-			} `json:"actor"`
-		} `json:"data"`
-		Errors []json.RawMessage `json:"errors"`
-	}
-	if json.NewDecoder(io.LimitReader(res.Body, 16<<20)).Decode(&r) != nil || len(r.Errors) > 0 {
-		return nil, errors.New("query response was not usable")
-	}
-	return r.Data.Actor.Account.NRQL.Results, nil
-}
-
-func (n newRelic) event(row map[string]any) (event, bool) {
-	str := func(k string) string { s, _ := row[k].(string); return clip(s, 256) }
-	num := func(k string) int64 { f, _ := row[k].(float64); return int64(f) }
-	e := event{Time: time.UnixMilli(num("timestamp")), Source: "newrelic", id: str("id"), IP: str("client.address"), Port: n.port,
-		Route: str("http.route"), Method: str("http.request.method"), Status: int(num("http.response.status_code")),
-		Probe: str("attackbox.probe.class"), ContentType: str("attackbox.request.content_type"), Model: str("gen_ai.request.model"),
-		BodyBytes: num("http.request.body.size"), Outcome: str("attackbox.connection.outcome"), SNI: str("attackbox.tls.sni")}
-	if p := num("server.port"); p > 0 {
-		e.Port = int(p)
-	}
-	switch str("name") {
-	case "public.request":
-		e.Kind = "request"
-	case "public.connection":
-		e.Kind = "connection"
-	default:
-		return event{}, false
-	}
-	if e.id == "" || num("timestamp") == 0 {
-		return event{}, false
-	}
-	e.finish()
-	return e, true
-}
-
-func (n newRelic) run(ctx context.Context, st *store) {
-	// shortcut: one query returns at most 5000 spans, so the first load can miss older spans on a busy day.
-	since := time.Now().Add(-24 * time.Hour)
-	for ctx.Err() == nil {
-		rows, err := n.query(ctx, since)
-		if err != nil {
-			st.setStatus("newrelic", "error", err.Error(), time.Time{})
-		} else {
-			st.setStatus("newrelic", "ok", "", time.Now())
-			for _, row := range rows {
-				if e, ok := n.event(row); ok {
-					st.add(e)
-				}
-			}
-			// Spans can arrive late; query a little overlap and let the span id remove duplicates.
-			since = time.Now().Add(-5 * time.Minute)
-		}
-		sleep(ctx, 20*time.Second)
-	}
-}
-
-var windows = map[string]time.Duration{"15m": 15 * time.Minute, "1h": time.Hour, "6h": 6 * time.Hour, "24h": 24 * time.Hour, "7d": 7 * 24 * time.Hour}
-
-// handler serves the page and the JSON API. It accepts only the loopback names in hosts,
-// so a web page on another origin cannot read captured data through DNS rebinding.
-func handler(st *store, hosts map[string]bool, ports []int) http.Handler {
-	mux := http.NewServeMux()
-	web, _ := fs.Sub(webFS, "web")
-	mux.Handle("/", http.FileServerFS(web))
-	writeJSON := func(w http.ResponseWriter, v any) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(v)
-	}
-	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		window, ok := windows[q.Get("window")]
-		if !ok {
-			window = time.Hour
-		}
-		port, _ := strconv.Atoi(q.Get("port"))
-		if port < 1 || port > 65535 {
-			port = 0
-		}
-		writeJSON(w, st.state(time.Now(), window, q.Get("who"), q.Get("ip"), q.Get("endpoint"), clip(q.Get("q"), 200), port, ports))
-	})
-	mux.HandleFunc("/api/event", func(w http.ResponseWriter, r *http.Request) {
-		seq, _ := strconv.ParseUint(r.URL.Query().Get("seq"), 10, 64)
-		e, ok := st.find(seq)
-		if !ok {
-			http.Error(w, "event is no longer in memory", http.StatusNotFound)
+	defer f.Close()
+	skip := c.lines[day]
+	var n int
+	var last time.Time
+	readLines(f, func(line []byte) {
+		n++
+		if n <= skip {
 			return
 		}
-		writeJSON(w, e)
+		if e, ok := parseCapture(line, c.port); ok {
+			st.add(e)
+			if e.Time.After(last) {
+				last = e.Time
+			}
+		}
 	})
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !hosts[r.Host] || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
+	c.lines[day] = n
+	c.lastTime = last
+	if !last.IsZero() {
+		return "ok"
+	}
+	return "no_data"
+}
+
+type otelSource struct {
+	dir      string
+	port     int
+	lines    map[string]int
+	lastTime time.Time
+}
+
+func (o *otelSource) read(ctx context.Context, st *store, day string, isTail bool) string {
+	if isTail {
+		return "pending"
+	}
+	if o.lines == nil {
+		o.lines = make(map[string]int)
+	}
+	dir := filepath.Join(o.dir, "var/lib/attackbox-evidence/public-otel")
+	var paths []string
+	paths = append(paths, filepath.Join(dir, "traces.jsonl"))
+	paths = append(paths, filepath.Join(dir, "traces-"+day+".jsonl"))
+	var last time.Time
+	for _, path := range paths {
+		f, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		skip := o.lines[path]
+		var n int
+		readLines(f, func(line []byte) {
+			n++
+			if n <= skip {
+				return
+			}
+			if events, ok := parseOTLP(line, o.port); ok {
+				for _, e := range events {
+					st.add(e)
+					if e.Time.After(last) {
+						last = e.Time
+					}
+				}
+			}
+		})
+		f.Close()
+		o.lines[path] = n
+	}
+	o.lastTime = last
+	if !last.IsZero() {
+		return "ok"
+	}
+	return "no_data"
+}
+
+type shipperSource struct {
+	dir      string
+	lines    map[string]int
+	lastTime time.Time
+}
+
+func (s *shipperSource) read(ctx context.Context, st *store, day string, isTail bool) string {
+	if isTail {
+		return "pending"
+	}
+	if s.lines == nil {
+		s.lines = make(map[string]int)
+	}
+	path := filepath.Join(s.dir, "var/lib/attackbox-evidence/shipper/events-"+day+".jsonl")
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "missing"
+		}
+		return "error"
+	}
+	defer f.Close()
+	skip := s.lines[day]
+	var n int
+	var last time.Time
+	readLines(f, func(line []byte) {
+		n++
+		if n <= skip {
+			return
+		}
+		if events, ok := parseShipperEnvelope(line); ok {
+			for _, e := range events {
+				st.add(e)
+				if e.Time.After(last) {
+					last = e.Time
+				}
+			}
+		}
+	})
+	s.lines[day] = n
+	s.lastTime = last
+	if !last.IsZero() {
+		return "ok"
+	}
+	return "no_data"
+}
+
+func readLines(r io.Reader, fn func([]byte)) error {
+	sc := bufio.NewScanner(r)
+	buf := make([]byte, maxLineLength)
+	sc.Buffer(buf, maxLineLength*2)
+	for sc.Scan() {
+		line := make([]byte, len(sc.Bytes()))
+		copy(line, sc.Bytes())
+		fn(line)
+	}
+	return sc.Err()
+}
+
+func handler(st *store, allowedHosts map[string]bool, ports []int, status *sourceStatus) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
+		if !allowedHosts[r.Host] || r.Method != "GET" {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		h := w.Header()
-		h.Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-		h.Set("X-Content-Type-Options", "nosniff")
-		h.Set("Referrer-Policy", "no-referrer")
-		h.Set("Cache-Control", "no-store")
-		mux.ServeHTTP(w, r)
+		who := r.URL.Query().Get("who")
+		if who == "" {
+			who = "internet"
+		}
+		ip := r.URL.Query().Get("ip")
+		endpoint := r.URL.Query().Get("endpoint")
+		q := r.URL.Query().Get("q")
+		port := 0
+		if p := r.URL.Query().Get("port"); p != "" {
+			port, _ = strconv.Atoi(p)
+		}
+		win := r.URL.Query().Get("window")
+		if win == "" {
+			win = "1h"
+		}
+		var window time.Duration
+		switch win {
+		case "15m":
+			window = 15 * time.Minute
+		case "1h":
+			window = time.Hour
+		case "6h":
+			window = 6 * time.Hour
+		case "24h":
+			window = 24 * time.Hour
+		case "7d":
+			window = 7 * 24 * time.Hour
+		default:
+			window = time.Hour
+		}
+		state := st.state(time.Now(), window, who, ip, endpoint, q, port, ports, status)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(state)
 	})
+	mux.HandleFunc("/api/event", func(w http.ResponseWriter, r *http.Request) {
+		if !allowedHosts[r.Host] || r.Method != "GET" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		seq, _ := strconv.ParseUint(r.URL.Query().Get("seq"), 10, 64)
+		e, ok := st.event(seq)
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(e)
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if !allowedHosts[r.Host] || r.Method != "GET" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		path := r.URL.Path
+		if path == "/" {
+			path = "/index.html"
+		}
+		path = "web" + path
+		data, err := webFS.ReadFile(path)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		ct := "text/plain"
+		if strings.HasSuffix(path, ".html") {
+			ct = "text/html"
+		} else if strings.HasSuffix(path, ".js") {
+			ct = "application/javascript"
+		} else if strings.HasSuffix(path, ".css") {
+			ct = "text/css"
+		}
+		w.Header().Set("Content-Type", ct)
+		if ct == "text/html" {
+			w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'")
+		}
+		w.Write(data)
+	})
+	return mux
 }
-
-// loopbackHosts returns the Host values that the server accepts, or an error for a non-loopback address.
-func loopbackHosts(listen string) (map[string]bool, error) {
-	host, port, err := net.SplitHostPort(listen)
-	if ip := net.ParseIP(host); err != nil || ip == nil || !ip.IsLoopback() {
-		return nil, errors.New("listen address must be a loopback IP and port, for example 127.0.0.1:8765")
-	}
-	return map[string]bool{listen: true, "localhost:" + port: true}, nil
-}
-
-var (
-	aliasRe   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._@-]*$`)
-	dirRe     = regexp.MustCompile(`^/[A-Za-z0-9._/-]+$`)
-	serviceRe = regexp.MustCompile(`^[a-z0-9-]+$`)
-)
 
 func main() {
-	listen := flag.String("listen", "127.0.0.1:8765", "loopback address of the dashboard")
-	alias := flag.String("ssh", "attackbox", "SSH alias of the host that holds the capture files")
-	local := flag.String("dir", "", "read capture files from this local directory and do not use SSH")
-	remote := flag.String("remote-dir", "/var/lib/attackbox-public-capture/requests", "capture directory on the host")
-	days := flag.Int("days", 2, "UTC days of capture files to load (1 to 7)")
-	service := flag.String("service", "attackbox-public-443", "New Relic service name of the public gateway")
-	port := flag.Int("port", 443, "listener port for records that do not carry one")
-	portsFlag := flag.String("ports", "80,443,1234,3000,4000,8000,8080,8188,8888,11434", "comma-separated listener ports always listed")
-	keep := flag.Int("keep", 200000, "events kept in memory")
-	own := flag.String("own", "", "comma-separated addresses of your own machines, for example your egress address and the host; the page shows their traffic apart from outside traffic")
+	listen := flag.String("listen", "127.0.0.1:8765", "loopback listen address")
+	ssh := flag.String("ssh", "attackbox", "SSH alias")
+	dir := flag.String("dir", "", "local archive root")
+	days := flag.Int("days", 2, "days of history")
+	ownFlag := flag.String("own", "", "comma-separated own addresses")
+	portsFlag := flag.String("ports", "80,443,1234,3000,4000,8000,8080,8188,8888,11434", "listener ports")
+	keep := flag.Int("keep", 200000, "events to keep")
 	flag.Parse()
-	var ports []int
-	for _, s := range strings.Split(*portsFlag, ",") {
-		p, parseErr := strconv.Atoi(strings.TrimSpace(s))
-		if parseErr != nil || p < 1 || p > 65535 {
-			fmt.Fprintln(os.Stderr, "attackbox-live: -ports must be 1 to 16 comma-separated ports, each 1 to 65535")
-			os.Exit(2)
-		}
-		ports = append(ports, p)
-	}
-	if len(ports) < 1 || len(ports) > 16 {
-		fmt.Fprintln(os.Stderr, "attackbox-live: -ports must be 1 to 16 comma-separated ports, each 1 to 65535")
-		os.Exit(2)
+
+	if !strings.HasPrefix(*listen, "127.") && !strings.HasPrefix(*listen, "[::1]") {
+		log.Fatal("listen must be loopback")
 	}
 
-	hosts, err := loopbackHosts(*listen)
-	c := &capture{ssh: *alias, dir: *remote, days: *days, port: *port, lines: map[string]int{}}
-	if *local != "" {
-		c.ssh, c.dir = "", *local
+	var ports []int
+	for _, p := range strings.Split(*portsFlag, ",") {
+		if n, err := strconv.Atoi(strings.TrimSpace(p)); err == nil && n > 0 && n < 65536 {
+			ports = append(ports, n)
+		}
 	}
-	switch {
-	case err != nil:
-	case c.ssh != "" && !aliasRe.MatchString(c.ssh):
-		err = errors.New("-ssh must be a plain SSH alias")
-	case !dirRe.MatchString(c.dir):
-		err = errors.New("the capture directory must be an absolute path of letters, digits, dot, dash, underscore and slash")
-	case *days < 1 || *days > 7 || *keep < 1000 || !serviceRe.MatchString(*service):
-		err = errors.New("-days must be 1 to 7, -keep at least 1000, and -service a lower-case name")
+
+	st := newStore(*keep)
+	for _, a := range strings.Split(*ownFlag, ",") {
+		a = strings.TrimSpace(a)
+		if a != "" {
+			st.own[a] = true
+		}
 	}
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "attackbox-live:", err)
-		os.Exit(2)
+
+	if *dir == "" && *ssh != "" {
+		cmd := exec.Command("ssh", *ssh, "echo ${SSH_CLIENT%% *}")
+		if out, err := cmd.Output(); err == nil {
+			egress := strings.TrimSpace(string(out))
+			if egress != "" {
+				st.own[egress] = true
+			}
+		}
+		cmd = exec.Command("ssh", "-G", *ssh)
+		if out, err := cmd.Output(); err == nil {
+			sc := bufio.NewScanner(bytes.NewReader(out))
+			for sc.Scan() {
+				line := sc.Text()
+				if strings.HasPrefix(line, "hostname ") {
+					st.host = strings.TrimSpace(strings.TrimPrefix(line, "hostname "))
+					break
+				}
+			}
+		}
 	}
+
+	status := &sourceStatus{}
+	if *dir != "" {
+		var daysToRead []string
+		for i := range *days {
+			daysToRead = append(daysToRead, time.Now().UTC().AddDate(0, 0, -i).Format("20060102"))
+		}
+		c := &capture{
+			dir:   filepath.Join(*dir, "var/lib/attackbox-public-capture/requests"),
+			port:  443,
+			lines: make(map[string]int),
+		}
+		for _, day := range daysToRead {
+			if c.read(context.Background(), st, day, false) == "ok" {
+				status.set("capture", "following", c.lastTime)
+			}
+		}
+		o := &otelSource{dir: *dir, port: 443}
+		for _, day := range daysToRead {
+			if o.read(context.Background(), st, day, false) == "ok" {
+				status.set("otel", "following", o.lastTime)
+			}
+		}
+		s := &shipperSource{dir: *dir}
+		for _, day := range daysToRead {
+			if s.read(context.Background(), st, day, false) == "ok" {
+				status.set("shipper", "following", s.lastTime)
+			}
+		}
+	}
+
+	allowedHosts := map[string]bool{*listen: true}
+	srv := &http.Server{Addr: *listen, Handler: handler(st, allowedHosts, ports, status)}
+
+	go func() {
+		log.Printf("Listening on http://%s/", *listen)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	st := newStore(*keep)
-	st.own = map[string]bool{}
-	for _, ip := range strings.Split(*own, ",") {
-		if ip = strings.TrimSpace(ip); ip != "" {
-			st.own[ip] = true
-		}
-	}
-	st.setStatus("capture", "waiting", "", time.Time{})
-	go c.run(ctx, st)
-	account, _ := strconv.ParseUint(os.Getenv("NEW_RELIC_ACCOUNT_ID"), 10, 64)
-	if key := os.Getenv("NEW_RELIC_API_KEY"); key != "" && account != 0 {
-		go newRelic{key: key, account: account, service: *service, port: *port}.run(ctx, st)
-	} else {
-		st.setStatus("newrelic", "off", "set NEW_RELIC_API_KEY and NEW_RELIC_ACCOUNT_ID to see pre-HTTP connections", time.Time{})
-	}
 
-	srv := &http.Server{Addr: *listen, Handler: handler(st, hosts, ports), ReadHeaderTimeout: 5 * time.Second}
-	go func() {
-		<-ctx.Done()
-		_ = srv.Close()
-	}()
-	fmt.Fprintf(os.Stderr, "attackbox-live: open http://%s/\n", *listen)
-	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-		fmt.Fprintln(os.Stderr, "attackbox-live:", err)
-		os.Exit(1)
-	}
+	<-ctx.Done()
+	srv.Shutdown(context.Background())
 }

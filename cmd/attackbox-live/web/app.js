@@ -3,16 +3,16 @@
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, text) => {
-  const n = document.createElement(tag);
-  if (cls) n.className = cls;
-  if (text != null) n.textContent = text;
-  return n;
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text) e.textContent = text;
+  return e;
 };
 const svg = (tag, attrs, text) => {
-  const n = document.createElementNS('http://www.w3.org/2000/svg', tag);
-  for (const k in attrs) n.setAttribute(k, attrs[k]);
-  if (text != null) n.textContent = text;
-  return n;
+  const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+  if (text) e.textContent = text;
+  return e;
 };
 const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
 const count = (n) => n.toLocaleString('en-US');
@@ -21,7 +21,6 @@ const plural = (n, word) => `${count(n)} ${word}${n === 1 ? '' : 's'}`;
 const view = { window: '1h', who: '', q: '', ip: '', endpoint: '', port: 0, paused: false, feedKey: '', selected: 0, opener: null };
 const windows = [['15m', '15 min'], ['1h', '1 h'], ['6h', '6 h'], ['24h', '24 h'], ['7d', '7 d']];
 
-// Redraw a block only when its data changed, so keyboard focus and text selection survive the two-second refresh.
 const drawn = {};
 function changed(name, data) {
   const key = JSON.stringify(data);
@@ -32,256 +31,292 @@ function changed(name, data) {
 
 function clock(iso) {
   const d = new Date(iso);
-  const time = d.toLocaleTimeString('en-GB');
-  return d.toDateString() === new Date().toDateString() ? time : `${d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })} ${time}`;
+  return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 }
 
 function ago(iso, now) {
-  const s = Math.max(0, Math.round((new Date(now) - new Date(iso)) / 1000));
-  if (s < 90) return `${s} s ago`;
-  if (s < 5400) return `${Math.round(s / 60)} min ago`;
-  return `${Math.round(s / 3600)} h ago`;
+  const ms = new Date(now) - new Date(iso);
+  if (ms < 1000) return 'just now';
+  if (ms < 60000) return `${Math.floor(ms / 1000)}s ago`;
+  if (ms < 3600000) return `${Math.floor(ms / 60000)}m ago`;
+  if (ms < 86400000) return `${Math.floor(ms / 3600000)}h ago`;
+  return `${Math.floor(ms / 86400000)}d ago`;
 }
 
 const sourceName = (ip) => ip || 'unattributed';
 
 function pick(change) {
   Object.assign(view, change);
-  view.feedKey = '';
-  tick(true);
+  if ('paused' in change && !view.paused) tick(true);
 }
 
 function ipButton(ip, own) {
-  if (!ip) return el('span', 'mono', sourceName(ip));
-  const b = el('button', 'link', ip);
-  b.type = 'button';
-  b.title = 'Show only this source';
-  b.addEventListener('click', (ev) => { ev.stopPropagation(); pick({ ip, endpoint: '', port: 0 }); });
-  if (!own) return b;
-  const box = el('span');
-  box.append(b, el('span', 'tag', 'own'));
-  return box;
+  const btn = el('button', 'link ip', sourceName(ip));
+  btn.type = 'button';
+  btn.title = 'Filter to this source';
+  if (own) btn.classList.add('own');
+  btn.addEventListener('click', () => pick({ ip, endpoint: '', port: 0 }));
+  return btn;
 }
 
-// The split is counted over the whole window, so it also shows what the current selection hides.
 function renderWho(v) {
-  const own = v.own_addresses || [];
-  if (!changed('who', [v.outside, v.own, own, view.who])) return;
-  const box = $('who'), hadFocus = box.contains(document.activeElement);
-  const fact = (cls, label, t, more) => {
-    const p = el('p', cls);
-    p.append(el('strong', '', label), ` ${plural(t.events, 'event')} from ${plural(t.ips, 'source')}${more}`);
-    return p;
-  };
-  const seg = el('div', 'segment');
-  seg.setAttribute('role', 'group');
-  seg.setAttribute('aria-label', 'Traffic shown');
-  for (const [id, label] of [['', 'Outside world'], ['own', 'Own machines'], ['all', 'Both']]) {
+  const total = v.internet_events + v.test_events;
+  const totalSources = v.internet_sources + v.test_sources;
+  if (total === 0) {
+    $('who').replaceChildren(el('p', 'empty', 'No events in this window.'));
+    return;
+  }
+  const btn = (label, val, n, s) => {
     const b = el('button', '', label);
     b.type = 'button';
-    b.setAttribute('aria-pressed', String(view.who === id));
-    b.addEventListener('click', () => pick({ who: id, ip: '', endpoint: '', port: 0 }));
-    seg.append(b);
-  }
-  const parts = [fact('outside', 'Outside world:', v.outside, ''), fact('', 'Your own machines:', v.own, own.length ? ` (${own.join(', ')})` : ''), seg];
-  if (!own.length) parts.push(el('p', 'warn', 'No own address is set, so your tests count as outside traffic. Start attackbox-live with -own and your egress address and the host address.'));
-  box.replaceChildren(...parts);
-  if (hadFocus) seg.querySelector('[aria-pressed="true"]').focus();
+    b.disabled = view.who === val;
+    b.addEventListener('click', () => pick({ who: val, ip: '', endpoint: '', port: 0 }));
+    b.append(el('span', 'num', count(n)), el('span', 'dim', ` (${plural(s, 'source')})`));
+    return b;
+  };
+  $('who').replaceChildren(
+    btn('Internet', '', v.internet_events, v.internet_sources),
+    btn('Test', 'own', v.test_events, v.test_sources),
+    btn('Both', 'all', total, totalSources)
+  );
 }
 
 function table(target, heads, rows) {
-  const t = $(target);
-  const head = el('tr');
-  for (const [label, cls] of heads) {
-    const th = el('th', cls, label);
-    th.scope = 'col';
-    head.append(th);
-  }
   const thead = el('thead');
-  thead.append(head);
+  const tr = el('tr');
+  for (const h of heads) {
+    const th = el('th', typeof h === 'string' ? '' : h[1], typeof h === 'string' ? h : h[0]);
+    tr.append(th);
+  }
+  thead.append(tr);
   const tbody = el('tbody');
   tbody.append(...rows);
-  t.replaceChildren(thead, tbody);
+  $(target).replaceChildren(thead, tbody);
 }
 
 function row(cells) {
   const tr = el('tr');
-  for (const [content, cls] of cells) {
-    const td = el('td', cls);
-    td.append(content);
+  for (const c of cells) {
+    const td = el('td', typeof c[1] === 'string' ? c[1] : '');
+    if (typeof c[0] === 'string') td.textContent = c[0];
+    else td.append(c[0]);
     tr.append(td);
   }
   return tr;
 }
 
 function emptyRow(text, span) {
+  const tr = el('tr');
   const td = el('td', 'empty', text);
   td.colSpan = span;
-  const tr = el('tr');
   tr.append(td);
   return tr;
 }
 
 function renderSources(v) {
-  const c = v.sources.capture || {}, n = v.sources.newrelic || {};
+  const c = v.sources_status.capture || {}, o = v.sources_status.otel || {}, s = v.sources_status.shipper || {};
   const item = (tone, name, text, title) => {
     const li = el('li');
     li.append(el('span', `dot ${tone}`), el('strong', '', name), el('span', '', text));
     if (title) li.title = title;
     return li;
   };
-  const seen = c.last && !c.last.startsWith('0001');
+  const seenC = c.last && !c.last.startsWith('0001');
   let capture;
-  if (c.state === 'following') capture = item('good', 'Host capture', seen ? `live, last record ${ago(c.last, v.now)}` : 'connected, no new record yet');
-  else capture = item('wait', 'Host capture', c.detail ? `waiting: ${clip(c.detail, 90)}` : 'connecting', c.detail);
-  let relic;
-  if (n.state === 'ok') relic = item('good', 'New Relic', `polled ${ago(n.last, v.now)}`);
-  else if (n.state === 'error') relic = item('fail', 'New Relic', `error: ${n.detail}`);
-  else if (n.state === 'off') relic = item('', 'New Relic', 'off', n.detail);
-  else relic = item('wait', 'New Relic', 'first query');
-  $('sources').replaceChildren(capture, relic);
+  if (c.state === 'following') capture = item('good', 'Capture', seenC ? `live, last ${ago(c.last, v.now)}` : 'connected');
+  else capture = item('wait', 'Capture', c.detail ? `waiting: ${clip(c.detail, 90)}` : 'connecting', c.detail);
+  const seenO = o.last && !o.last.startsWith('0001');
+  let otel;
+  if (o.state === 'following') otel = item('good', 'OTLP traces', seenO ? `live, last ${ago(o.last, v.now)}` : 'connected');
+  else otel = item('wait', 'OTLP traces', o.detail ? `waiting: ${clip(o.detail, 90)}` : 'connecting', o.detail);
+  const seenS = s.last && !s.last.startsWith('0001');
+  let shipper;
+  if (s.state === 'following') shipper = item('good', 'Shipper events', seenS ? `live, last ${ago(s.last, v.now)}` : 'connected');
+  else shipper = item('wait', 'Shipper events', s.detail ? `waiting: ${clip(s.detail, 90)}` : 'connecting', s.detail);
+  $('sources').replaceChildren(capture, otel, shipper);
 }
 
 function renderScope(v) {
   const box = $('scope');
-  if (!view.ip && !view.endpoint && !view.port) { box.hidden = true; return; }
   const parts = [];
-  if (view.ip) {
-    const r = v.top.find((t) => t.ip === view.ip);
-    parts.push(el('span', 'subject', `Source ${sourceName(view.ip)}`));
-    parts.push(el('span', 'facts', r
-      ? `${plural(r.requests, 'request')}, ${plural(r.connections, 'pre-HTTP connection')}, ${plural(r.endpoints, 'endpoint')}, ${plural(r.user_agents, 'user-agent')}. First seen ${clock(r.first)}, last seen ${clock(r.last)}.`
-      : 'No event from this source in the window.'));
-  } else if (view.port) {
-    const r = v.ports.find((p) => p.port === view.port);
-    parts.push(el('span', 'subject', `Port ${view.port}`));
-    parts.push(el('span', 'facts', r
-      ? `${plural(r.requests, 'request')}, ${plural(r.connections, 'pre-HTTP connection')}, ${plural(r.ips, 'source')}.${r.last ? ` Last seen ${clock(r.last)}.` : ''}`
-      : 'No event on this port in the window.'));
+  if (view.ip) parts.push(`Source: ${view.ip}`);
+  if (view.endpoint) parts.push(`Endpoint: ${view.endpoint}`);
+  if (view.port) parts.push(`Port: ${view.port}`);
+  if (view.q) parts.push(`Text: ${view.q}`);
+  if (parts.length) {
+    const p = el('p');
+    p.append(el('strong', '', 'Filters: '), parts.join(' • '));
+    const clear = el('button', '', 'Clear');
+    clear.type = 'button';
+    clear.addEventListener('click', () => pick({ ip: '', endpoint: '', port: 0, q: '' }));
+    p.append(' ', clear);
+    box.replaceChildren(p);
   } else {
-    parts.push(el('span', 'subject', `Endpoint ${view.endpoint}`));
-    parts.push(el('span', 'facts', `${plural(v.requests + v.connections, 'event')} from ${plural(v.ips, 'source')}.`));
+    box.replaceChildren();
   }
-  const clear = el('button', '', 'Show all traffic');
-  clear.type = 'button';
-  clear.addEventListener('click', () => pick({ ip: '', endpoint: '', port: 0 }));
-  box.replaceChildren(...parts, clear);
-  box.hidden = false;
 }
 
 function renderTotals(v) {
-  const stat = (n, label) => {
-    const d = el('div');
-    d.append(el('dt', '', label), el('dd', '', count(n)));
-    return d;
-  };
-  $('totals').replaceChildren(stat(v.requests, 'HTTP requests'), stat(v.connections, 'Pre-HTTP connections'), stat(v.ips, 'Sources'));
+  let events = v.internet_events, sources = v.internet_sources;
+  if (view.who === 'own') {
+    events = v.test_events;
+    sources = v.test_sources;
+  } else if (view.who === 'all') {
+    events += v.test_events;
+    sources += v.test_sources;
+  }
+  $('totals').textContent = `${plural(events, 'event')} from ${plural(sources, 'source')}`;
 }
 
 function renderTimeline(v) {
+  if (!changed('timeline', [v.timeline, v.since, v.now])) return;
   const g = $('timeline'), n = v.timeline.length, h = 64;
-  const max = Math.max(1, ...v.timeline.map(([a, b]) => a + b));
+  const max = Math.max(1, ...v.timeline.map(([requests, connections]) => requests + connections));
   g.setAttribute('viewBox', `0 0 ${n * 10} ${h}`);
   const bars = [svg('rect', { x: 0, y: h - 1, width: n * 10, height: 1, class: 'fill-request', opacity: 0.25 })];
   const span = (new Date(v.now) - new Date(v.since)) / n;
-  v.timeline.forEach(([req, con], i) => {
+  v.timeline.forEach(([requests, connections], i) => {
     const at = clock(new Date(new Date(v.since).getTime() + i * span).toISOString());
-    const rh = (req / max) * (h - 2), ch = (con / max) * (h - 2);
-    if (req) bars.push(svg('rect', { x: i * 10 + 1, y: h - 1 - rh, width: 8, height: rh, class: 'fill-request' }));
-    if (con) bars.push(svg('rect', { x: i * 10 + 1, y: h - 1 - rh - ch, width: 8, height: ch, class: 'fill-connection' }));
-    if (req || con) {
+    const requestHeight = (requests / max) * (h - 2);
+    const connectionHeight = (connections / max) * (h - 2);
+    if (requests) {
+      bars.push(svg('rect', { x: i * 10 + 1, y: h - 1 - requestHeight, width: 8, height: requestHeight, class: 'fill-request' }));
+    }
+    if (connections) {
+      bars.push(svg('rect', {
+        x: i * 10 + 1,
+        y: h - 1 - requestHeight - connectionHeight,
+        width: 8,
+        height: connectionHeight,
+        class: 'fill-connection'
+      }));
+    }
+    if (requests || connections) {
       const hit = svg('rect', { x: i * 10, y: 0, width: 10, height: h, fill: 'transparent' });
-      hit.append(svg('title', {}, `${at}: ${plural(req, 'request')}, ${plural(con, 'pre-HTTP connection')}`));
+      hit.append(svg('title', {}, `${at}: ${plural(requests, 'request')}, ${plural(connections, 'pre-HTTP connection')}`));
       bars.push(hit);
     }
   });
   g.replaceChildren(...bars);
-  const key = (cls, text) => { const s = el('span', 'key'); s.append(el('i', cls), text); return s; };
-  const left = el('span');
-  left.append(key('fill-request', 'HTTP requests'), key('fill-connection', 'Pre-HTTP connections'));
-  $('timeline-caption').replaceChildren(left, el('span', '', `${clock(v.since)} to ${clock(v.now)}, peak ${count(max)} per bar`));
+  const key = (cls, text) => {
+    const item = el('span', 'key');
+    item.append(el('i', cls), text);
+    return item;
+  };
+  const legend = el('span');
+  legend.append(key('fill-request', 'HTTP requests'), key('fill-connection', 'Pre-HTTP connections'));
+  $('timeline-caption').replaceChildren(
+    legend,
+    el('span', '', `${clock(v.since)} to ${clock(v.now)}, peak ${count(max)} per bar`)
+  );
 }
 
 function renderFlow(v) {
   const box = $('flow');
-  if (!changed('flow', [v.flow_sources, v.flow_targets, v.flow_links, box.clientWidth])) return;
-  if (!v.flow_links) {
-    box.replaceChildren(el('p', 'empty', 'No traffic in this window. Select a longer window, or wait: the page reads new data every two seconds.'));
+  if (!changed('flow', [v.flow, box.clientWidth])) return;
+  const { nodes, links } = v.flow;
+  if (!links.length) {
+    box.replaceChildren(el('p', 'empty', 'No flow in this selection.'));
     return;
   }
-  const width = Math.max(720, box.clientWidth - 8), rowH = 26, padL = 190, padR = Math.min(430, width * 0.45);
-  const xl = padL, xr = width - padR;
-  const height = Math.max(v.flow_sources.length, v.flow_targets.length) * rowH + 6;
-  const g = svg('svg', { width, height, viewBox: `0 0 ${width} ${height}`, role: 'img', 'aria-label': 'Flow of events from source addresses to endpoints. The two tables below hold the same data.' });
-  const y = (i) => i * rowH + rowH / 2 + 3;
-  const ly = new Map(v.flow_sources.map((s, i) => [s.id, y(i)]));
-  const ry = new Map(v.flow_targets.map((t, i) => [t.id, y(i)]));
-  const max = Math.max(...v.flow_links.map((l) => l.count));
-  for (const l of v.flow_links) {
-    const a = ly.get(l.source), b = ry.get(l.target), mid = (xl + xr) / 2;
-    const p = svg('path', { d: `M${xl + 6},${a} C${mid},${a} ${mid},${b} ${xr},${b}`, 'stroke-width': 1 + 11 * Math.sqrt(l.count / max), class: l.target.includes(' pre-HTTP ') ? 'pre' : '' });
-    p.append(svg('title', {}, `${sourceName(l.source)} to ${l.target}: ${plural(l.count, 'event')}`));
-    g.append(p);
+  const sources = nodes.filter((node) => node.side === 'source');
+  const targets = nodes.filter((node) => node.side === 'target');
+  const width = Math.max(720, box.clientWidth - 8), rowHeight = 26;
+  const leftPadding = 190, rightPadding = Math.min(430, width * 0.45);
+  const leftX = leftPadding, rightX = width - rightPadding;
+  const height = Math.max(sources.length, targets.length) * rowHeight + 6;
+  const graph = svg('svg', {
+    width,
+    height,
+    viewBox: `0 0 ${width} ${height}`,
+    role: 'img',
+    'aria-label': 'Flow of events from source addresses to endpoints. The two tables below hold the same data.'
+  });
+  const y = (i) => i * rowHeight + rowHeight / 2 + 3;
+  const leftY = new Map(sources.map((node, i) => [node.id, y(i)]));
+  const rightY = new Map(targets.map((node, i) => [node.id, y(i)]));
+  const sourceByID = new Map(sources.map((node) => [node.id, node]));
+  const targetByID = new Map(targets.map((node) => [node.id, node]));
+  const max = Math.max(...links.map((link) => link.value));
+  for (const link of links) {
+    const sourceY = leftY.get(link.source), targetY = rightY.get(link.target);
+    const source = sourceByID.get(link.source), target = targetByID.get(link.target);
+    const middle = (leftX + rightX) / 2;
+    const path = svg('path', {
+      d: `M${leftX + 6},${sourceY} C${middle},${sourceY} ${middle},${targetY} ${rightX},${targetY}`,
+      'stroke-width': 1 + 11 * Math.sqrt(link.value / max),
+      class: target.name.includes(' pre-HTTP ') ? 'pre' : ''
+    });
+    path.append(svg('title', {}, `${sourceName(source.name)} to ${target.name}: ${plural(link.value, 'event')}`));
+    graph.append(path);
   }
-  const nodeGroup = (n, side) => {
-    const fixed = n.id === 'other';
-    const grp = svg('g', { class: fixed ? 'node fixed' : 'node' });
-    const yy = side === 'l' ? ly.get(n.id) : ry.get(n.id);
-    const label = fixed ? (side === 'l' ? 'other sources' : 'other endpoints') : (side === 'l' ? sourceName(n.id) : n.id);
-    if (side === 'l') {
-      grp.append(svg('rect', { x: xl, y: yy - 9, width: 6, height: 18, rx: 2 }));
-      grp.append(svg('text', { x: xl - 10, y: yy + 4, 'text-anchor': 'end' }, clip(label, 20)));
-      grp.append(svg('text', { x: 8, y: yy + 4, class: 'count' }, count(n.count)));
+  const nodeGroup = (node, side) => {
+    const fixed = node.other;
+    const group = svg('g', { class: fixed ? 'node fixed' : 'node' });
+    const yy = side === 'source' ? leftY.get(node.id) : rightY.get(node.id);
+    const label = node.name;
+    if (side === 'source') {
+      group.append(svg('rect', { x: leftX, y: yy - 9, width: 6, height: 18, rx: 2 }));
+      group.append(svg('text', { x: leftX - 10, y: yy + 4, 'text-anchor': 'end' }, clip(sourceName(label), 20)));
+      group.append(svg('text', { x: 8, y: yy + 4, class: 'count' }, count(node.count)));
     } else {
-      grp.append(svg('rect', { x: xr, y: yy - 9, width: 6, height: 18, rx: 2 }));
-      grp.append(svg('text', { x: xr + 14, y: yy + 4 }, clip(label, Math.floor((padR - 80) / 7.3))));
-      grp.append(svg('text', { x: width - 6, y: yy + 4, 'text-anchor': 'end', class: 'count' }, count(n.count)));
+      group.append(svg('rect', { x: rightX, y: yy - 9, width: 6, height: 18, rx: 2 }));
+      group.append(svg('text', { x: rightX + 14, y: yy + 4 }, clip(label, Math.floor((rightPadding - 80) / 7.3))));
+      group.append(svg('text', { x: width - 6, y: yy + 4, 'text-anchor': 'end', class: 'count' }, count(node.count)));
     }
-    grp.append(svg('title', {}, `${label}: ${plural(n.count, 'event')}`));
+    group.append(svg('title', {}, `${label}: ${plural(node.count, 'event')}`));
     if (!fixed) {
-      const go = () => pick(side === 'l' ? { ip: n.id, endpoint: '' } : { endpoint: n.id, ip: '' });
-      grp.setAttribute('tabindex', '0');
-      grp.setAttribute('role', 'button');
-      grp.setAttribute('aria-label', `Show only ${label}`);
-      grp.addEventListener('click', go);
-      grp.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); go(); } });
+      const go = () => pick(side === 'source'
+        ? { ip: node.name, endpoint: '' }
+        : { endpoint: node.name, ip: '' });
+      group.setAttribute('tabindex', '0');
+      group.setAttribute('role', 'button');
+      group.setAttribute('aria-label', `Show only ${label}`);
+      group.addEventListener('click', go);
+      group.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          go();
+        }
+      });
     }
-    return grp;
+    return group;
   };
-  for (const s of v.flow_sources) g.append(nodeGroup(s, 'l'));
-  for (const t of v.flow_targets) g.append(nodeGroup(t, 'r'));
-  box.replaceChildren(g);
+  for (const source of sources) graph.append(nodeGroup(source, 'source'));
+  for (const target of targets) graph.append(nodeGroup(target, 'target'));
+  box.replaceChildren(graph);
 }
 
 function renderTables(v) {
-  if (!changed('tables', [v.top, v.endpoints])) return;
-  table('ips', [['Source IP'], ['Requests', 'num'], ['Pre-HTTP', 'num'], ['Endpoints', 'num'], ['Last seen'], ['Most used user-agent']],
-    v.top.length ? v.top.map((r) => row([[ipButton(r.ip, r.own)], [count(r.requests), 'num'], [count(r.connections), 'num'], [count(r.endpoints), 'num'],
-      [clock(r.last)], [r.user_agent ? (r.user_agents > 1 ? `${r.user_agent} (+${r.user_agents - 1} more)` : r.user_agent) : 'not recorded', 'ua']]))
-      : [emptyRow('No source in this window.', 6)]);
-  table('endpoints', [['Port and endpoint'], ['Events', 'num'], ['Sources', 'num']],
-    v.endpoints.length ? v.endpoints.map((e) => {
-      const b = el('button', 'link', e.id);
-      b.type = 'button';
-      b.title = 'Show only this endpoint';
-      b.addEventListener('click', () => pick({ endpoint: e.id, ip: '', port: 0 }));
-      return row([[b, 'wide'], [count(e.count), 'num'], [count(e.ips), 'num']]);
-    }) : [emptyRow('No endpoint in this window.', 3)]);
+  if (changed('sources-table', v.sources)) {
+    const rows = v.sources.slice(0, 20).map((r) => {
+      const btn = ipButton(r.ip, r.own);
+      return row([[btn], [count(r.count), 'num'], [clock(r.last)], [clip(r.ua, 60)]]);
+    });
+    table('sources-table', [['Source IP'], ['Events', 'num'], ['Last seen'], ['User-agent']], rows.length ? rows : [emptyRow('No sources in this selection.', 4)]);
+  }
+  if (changed('endpoints-table', v.endpoints)) {
+    const rows = v.endpoints.slice(0, 20).map((r) => {
+      const btn = el('button', 'link', r.endpoint);
+      btn.type = 'button';
+      btn.addEventListener('click', () => pick({ endpoint: r.endpoint, ip: '', port: 0 }));
+      return row([[btn, 'wide'], [count(r.count), 'num']]);
+    });
+    table('endpoints-table', [['Endpoint', 'wide'], ['Events', 'num']], rows.length ? rows : [emptyRow('No endpoints in this selection.', 2)]);
+  }
 }
 
 function renderPorts(v) {
-  if (!changed('ports', [v.ports, view.port])) return;
-  table('ports', [['Port'], ['Requests', 'num'], ['Pre-HTTP', 'num'], ['Sources', 'num'], ['Last seen']],
-    v.ports.length ? v.ports.map((p) => {
-      const b = el('button', 'link', String(p.port));
-      b.type = 'button';
-      b.title = 'Show only this port';
-      b.setAttribute('aria-pressed', String(p.port === view.port));
-      b.addEventListener('click', () => pick({ port: p.port === view.port ? 0 : p.port, ip: '', endpoint: '' }));
-      const tr = row([[b], [count(p.requests), 'num'], [count(p.connections), 'num'], [count(p.ips), 'num'], [p.last ? clock(p.last) : '']]);
-      if (p.port === view.port) tr.className = 'selected';
-      return tr;
-    }) : [emptyRow('No port configured.', 5)]);
+  if (!changed('ports', v.ports)) return;
+  const rows = v.ports.map((r) => {
+    const btn = el('button', 'link', String(r.port));
+    btn.type = 'button';
+    btn.disabled = view.port === r.port;
+    btn.addEventListener('click', () => pick({ port: r.port, ip: '', endpoint: '' }));
+    const last = r.last && !r.last.startsWith('0001') ? clock(r.last) : '—';
+    return row([[btn], [count(r.requests), 'num'], [count(r.connections), 'num'], [count(r.sources), 'num'], [last]]);
+  });
+  table('ports', [['Port'], ['Requests', 'num'], ['Pre-HTTP', 'num'], ['Sources', 'num'], ['Last seen']], rows);
 }
 
 function renderFeed(v) {
@@ -291,10 +326,16 @@ function renderFeed(v) {
   const rows = (v.feed || []).map((e) => {
     const what = el('span');
     if (e.kind === 'connection') {
-      what.append(el('span', 'pre', `no HTTP request: ${e.outcome}`), e.sni ? ` (SNI ${e.sni})` : '');
+      what.append(el('span', 'pre', `no HTTP: ${e.outcome}`), e.sni ? ` (${e.sni})` : '');
+    } else if (e.kind === 'security') {
+      what.append(el('span', 'pre', e.rule_name || e.block_type), e.priority ? ` [${e.priority}]` : '');
+    } else if (e.kind === 'bait') {
+      const line = el('div');
+      line.append(el('span', 'method', e.method || '?'), el('span', 'mono', e.route));
+      what.append(line);
     } else {
       const line1 = el('div');
-      line1.append(el('span', 'method', e.method || '?'), el('span', 'mono', e.target || `${e.route} (path not exported)`));
+      line1.append(el('span', 'method', e.method || '?'), el('span', 'mono', e.target || e.route));
       what.append(line1);
       if (e.preview) {
         const line2 = el('div', 'preview', e.preview);
@@ -303,25 +344,23 @@ function renderFeed(v) {
     }
     const open = el('button', 'link', clock(e.time));
     open.type = 'button';
-    open.title = 'Open the full event';
-    const tr = row([[open], [ipButton(e.ip, e.own)], [what, 'wide'],
+    open.title = 'Open full event';
+    const tr = row([[open], [ipButton(e.ip, e.origin === 'test')], [what, 'wide'],
       [e.status ? String(e.status) : '', e.status ? `num s${Math.floor(e.status / 100)}` : 'num'],
-      [e.kind === 'connection' ? 'pre-HTTP' : (e.probe || e.route || '')],
+      [e.kind === 'connection' ? 'pre-HTTP' : (e.probe || e.route || e.kind)],
       [e.user_agent || '', 'ua'], [e.body_bytes ? count(e.body_bytes) : '', 'num']]);
     if (e.seq === view.selected) tr.className = 'selected';
     tr.addEventListener('click', () => openDetail(e.seq, open));
     return tr;
   });
-  table('feed', [['Time'], ['Source IP'], ['Request'], ['Status', 'num'], ['Route or probe class'], ['User-agent'], ['Body bytes', 'num']],
-    rows.length ? rows : [emptyRow('No event matches. Until the gateway release with host capture is live, New Relic gives only the route label, status and source address.', 7)]);
+  table('feed', [['Time'], ['Source IP'], ['Request'], ['Status', 'num'], ['Route'], ['User-agent'], ['Body', 'num']],
+    rows.length ? rows : [emptyRow('No events match.', 7)]);
 }
 
 function closeDetail() {
   $('detail').hidden = true;
   document.body.classList.remove('detail-open');
-  view.selected = 0;
-  for (const tr of document.querySelectorAll('tr.selected')) tr.className = '';
-  if (view.opener && view.opener.isConnected) view.opener.focus();
+  if (view.opener) view.opener.focus();
 }
 
 async function openDetail(seq, opener) {
@@ -333,7 +372,7 @@ async function openDetail(seq, opener) {
   view.feedKey = '';
   const box = $('detail');
   const head = el('header');
-  const title = el('h2', '', e.kind === 'connection' ? `Connection without an HTTP request: ${e.outcome}` : `${e.method} ${e.target || e.route}`);
+  const title = el('h2', '', e.kind === 'connection' ? `Connection: ${e.outcome}` : e.kind === 'security' ? `Security: ${e.rule_name || e.block_type}` : `${e.method} ${e.target || e.route}`);
   title.id = 'detail-title';
   title.tabIndex = -1;
   const close = el('button', '', 'Close');
@@ -345,20 +384,31 @@ async function openDetail(seq, opener) {
   const fact = (name, value) => { if (value !== '' && value != null) facts.append(el('dt', '', name), typeof value === 'string' ? el('dd', '', value) : value); };
   const d = new Date(e.time);
   const src = el('dd');
-  src.append(ipButton(e.ip, e.own));
+  src.append(ipButton(e.ip, e.origin === 'test'));
   fact('Time', `${d.toISOString()} (${clock(e.time)} local)`);
+  fact('Origin', e.origin === 'internet' ? 'Internet' : 'Test');
   fact('Source IP', src);
-  fact('Listener port', String(e.port));
+  fact('Port', String(e.port));
   fact('Protocol', e.proto);
-  fact('Host header', e.host);
+  fact('Host', e.host);
   fact('User-agent', e.user_agent);
   fact('Status', e.status ? String(e.status) : '');
   fact('Route', e.route);
-  fact('Probe class', e.probe);
-  fact('TLS server name', e.sni);
+  fact('Probe', e.probe);
+  fact('SNI', e.sni);
+  fact('Outcome', e.outcome);
   fact('Content type', e.content_type);
   fact('Model', e.model);
-  fact('Data source', e.source === 'capture' ? 'Host capture file' : 'New Relic span');
+  fact('Stream', e.stream ? 'yes' : '');
+  fact('Tools', e.tools);
+  fact('System message', e.system_msg ? 'yes' : '');
+  fact('MCP method', e.mcp_method);
+  fact('Canary key', e.canary_key);
+  fact('Credential', e.credential);
+  fact('Rule', e.rule_name);
+  fact('Priority', e.priority);
+  fact('Block type', e.block_type);
+  fact('Data source', e.source);
   const parts = [head, facts];
 
   const pairs = (heading, list) => {
@@ -383,10 +433,7 @@ async function openDetail(seq, opener) {
     parts.push(line, el('pre', '', e.body));
     if (e.body_sha256) parts.push(el('p', 'note mono', `SHA-256 ${e.body_sha256}`));
   } else if (e.body_bytes) {
-    parts.push(el('p', 'note', `The client sent a body of ${plural(e.body_bytes, 'byte')}. This record does not hold its content.`));
-  }
-  if (e.source === 'newrelic') {
-    parts.push(el('p', 'note', 'New Relic holds labels only. The path, query string, user-agent, headers and body stay in the host capture file and are shown when that source is connected.'));
+    parts.push(el('p', 'note', `The client sent ${plural(e.body_bytes, 'byte')}. This record does not hold its content.`));
   }
   box.replaceChildren(...parts);
   box.hidden = false;
@@ -395,54 +442,122 @@ async function openDetail(seq, opener) {
   tick(true);
 }
 
+function renderAIActivity(v) {
+  if (!changed('ai-activity', v.ai_activity)) return;
+  const rows = v.ai_activity.map((r) => {
+    const btn = ipButton(r.ip, false);
+    const models = r.models.join(', ') || '—';
+    const tools = r.tools.length ? r.tools.join(', ') : '—';
+    const flags = [];
+    if (r.has_system) flags.push('system');
+    if (r.has_stream) flags.push('stream');
+    const uas = r.user_agents.join(', ') || '—';
+    return row([[btn], [count(r.chat), 'num'], [count(r.gen), 'num'], [models, 'wide'], [tools, 'wide'], [flags.join(', ')], [uas, 'ua']]);
+  });
+  table('ai-activity', [['Source IP'], ['Chat', 'num'], ['Generation', 'num'], ['Models', 'wide'], ['Tools', 'wide'], ['Flags'], ['User-agents']],
+    rows.length ? rows : [emptyRow('No AI activity in this selection.', 7)]);
+}
+
+function renderChains(v) {
+  if (!changed('chains', v.chains)) return;
+  const rows = v.chains.map((c) => {
+    const btn = ipButton(c.ip, false);
+    const kind = c.chain.replace(/_/g, ' ');
+    const steps = [];
+    if (c.chain === 'open_webui') {
+      steps.push(`signup: ${clock(c.signup)}`, `create: ${clock(c.create)}`, `delete: ${clock(c.delete)}`);
+    } else if (c.chain === 'litellm') {
+      steps.push(`generate: ${clock(c.generate)}`);
+      if (c.use) steps.push(`use: ${clock(c.use)}`);
+    } else if (c.chain === 'canary_reuse') {
+      steps.push(`served: ${clock(c.served)}`, `reused: ${clock(c.reused)}`);
+    } else if (c.chain === 'mcp') {
+      steps.push(`initialize: ${clock(c.initialize)}`, `tools/list: ${clock(c.tools_list)}`, `tools/call: ${clock(c.tools_call)}`);
+    }
+    const complete = c.complete ? 'complete' : 'partial';
+    return row([[btn], [kind], [steps.join(', '), 'wide'], [complete]]);
+  });
+  table('chains', [['Source IP'], ['Chain'], ['Steps', 'wide'], ['Status']],
+    rows.length ? rows : [emptyRow('No exploit chains in this selection.', 4)]);
+}
+
+function renderHostSecurity(v) {
+  if (!changed('host-security', v.host_security)) return;
+  const hs = v.host_security;
+  const rows = [];
+  const sortedRules = Object.entries(hs.falco_rules).sort((a, b) => b[1] - a[1]);
+  for (const [rule, cnt] of sortedRules) {
+    rows.push(row([['Falco rule'], [rule, 'wide'], [count(cnt), 'num']]));
+  }
+  const sortedPriorities = Object.entries(hs.falco_priorities).sort((a, b) => b[1] - a[1]);
+  for (const [priority, cnt] of sortedPriorities) {
+    rows.push(row([['Falco priority'], [priority], [count(cnt), 'num']]));
+  }
+  const sortedBlocks = Object.entries(hs.egress_blocks).sort((a, b) => b[1] - a[1]);
+  for (const [blockType, cnt] of sortedBlocks) {
+    const label = blockType === 'reply' ? 'Egress reply noise' : 'Egress container-initiated';
+    rows.push(row([['Egress block'], [label], [count(cnt), 'num']]));
+  }
+  table('host-security', [['Type'], ['Detail', 'wide'], ['Count', 'num']],
+    rows.length ? rows : [emptyRow('No host security events in this selection.', 3)]);
+}
+
+function renderTestEnv(v) {
+  if (!changed('test-env', v.test_env)) return;
+  const te = v.test_env;
+  const rows = [
+    row([['Own/test traffic'], [count(te.own_traffic), 'num']]),
+    row([['Private bait events'], [count(te.private_bait), 'num']])
+  ];
+  table('test-env', [['Metric'], ['Count', 'num']], rows);
+}
+
 let timer = 0;
 async function tick(force) {
   clearTimeout(timer);
-  if (!view.paused || force) {
-    try {
-      const p = new URLSearchParams({ window: view.window, who: view.who, q: view.q, ip: view.ip, endpoint: view.endpoint, port: view.port || '' });
-      const res = await fetch(`api/state?${p}`);
-      if (!res.ok) throw new Error(String(res.status));
-      const v = await res.json();
-      v.top = v.top || [];
-      v.endpoints = v.endpoints || [];
-      v.ports = v.ports || [];
-      renderSources(v);
-      renderWho(v);
-      renderScope(v);
-      renderTotals(v);
-      renderTimeline(v);
-      renderFlow(v);
-      renderTables(v);
-      renderPorts(v);
-      renderFeed(v);
-      $('offline').hidden = true;
-    } catch (err) {
-      $('offline').hidden = false;
-    }
+  if (!force && view.paused) return;
+  try {
+    const params = new URLSearchParams({ window: view.window, who: view.who, q: view.q, ip: view.ip, endpoint: view.endpoint, port: view.port });
+    const res = await fetch(`api/state?${params}`);
+    if (!res.ok) return;
+    const v = await res.json();
+    try { renderSources(v); } catch (e) { console.error('renderSources:', e); }
+    try { renderWho(v); } catch (e) { console.error('renderWho:', e); }
+    try { renderScope(v); } catch (e) { console.error('renderScope:', e); }
+    try { renderTotals(v); } catch (e) { console.error('renderTotals:', e); }
+    try { renderTimeline(v); } catch (e) { console.error('renderTimeline:', e); }
+    try { renderFlow(v); } catch (e) { console.error('renderFlow:', e); }
+    try { renderPorts(v); } catch (e) { console.error('renderPorts:', e); }
+    try { renderTables(v); } catch (e) { console.error('renderTables:', e); }
+    try { renderAIActivity(v); } catch (e) { console.error('renderAIActivity:', e); }
+    try { renderChains(v); } catch (e) { console.error('renderChains:', e); }
+    try { renderHostSecurity(v); } catch (e) { console.error('renderHostSecurity:', e); }
+    try { renderTestEnv(v); } catch (e) { console.error('renderTestEnv:', e); }
+    try { renderFeed(v); } catch (e) { console.error('renderFeed:', e); }
+  } finally {
+    if (!view.paused) timer = setTimeout(() => tick(false), 2000);
   }
-  timer = setTimeout(tick, 2000);
 }
 
 for (const [id, label] of windows) {
-  const b = el('button', '', label);
-  b.type = 'button';
-  b.setAttribute('aria-pressed', String(id === view.window));
-  b.addEventListener('click', () => {
-    for (const other of $('windows').children) other.setAttribute('aria-pressed', String(other === b));
-    pick({ window: id });
+  const btn = el('button', '', label);
+  btn.type = 'button';
+  btn.addEventListener('click', () => {
+    view.window = id;
+    for (const b of $('windows').children) b.disabled = b === btn;
+    tick(true);
   });
-  $('windows').append(b);
+  btn.disabled = id === view.window;
+  $('windows').append(btn);
 }
 
 let typing = 0;
 $('q').addEventListener('input', (ev) => {
   clearTimeout(typing);
-  typing = setTimeout(() => pick({ q: ev.target.value.trim() }), 250);
+  typing = setTimeout(() => pick({ q: ev.target.value }), 300);
 });
 $('pause').addEventListener('click', () => {
   view.paused = !view.paused;
-  $('pause').setAttribute('aria-pressed', String(view.paused));
   $('pause').textContent = view.paused ? 'Resume' : 'Pause';
   if (!view.paused) tick(true);
 });
