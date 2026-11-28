@@ -1,0 +1,23 @@
+{
+  "case": "ollama-prompt-journey",
+  "field": "last user message or generation prompt",
+  "prompt_requests": 33,
+  "distinct_prompts": 14,
+  "published": [
+    {
+      "id": "P3",
+      "wording": "hi",
+      "redactions": 0,
+      "verification": "exact whole-string match",
+      "observed_utc": [
+        "2026-11-27T15:54:13Z",
+        "2026-11-27T16:11:43Z",
+        "2026-11-27T16:12:00Z",
+        "2026-11-27T16:12:17Z",
+        "2026-11-27T16:17:16Z"
+      ]
+    }
+  ],
+  "withheld": ["P1", "P2", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14"],
+  "withheld_reason": "No exact benign phrase match or privately reviewed wording cleared for publication."
+}

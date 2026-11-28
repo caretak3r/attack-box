@@ -29,6 +29,7 @@ flowchart TD
 Model names in the capture: `llama3.3:70b`, `deepseek-r1:70b`, and `qwen2.5-coder:32b`. Qwen appeared only in the generation burst. The table omits the ten requests without prompts.
 
 **Quoted wording:** Five requests had the exact final user message `hi` (P3). Wording is withheld for the other 13 distinct prompts across 28 requests. The descriptions in the table are not quotations.
+The [publication-ready prompt file](cleared-prompts.json) lists the cleared wording and the five UTC timestamps.
 
 ## Interpretation and limits
 
