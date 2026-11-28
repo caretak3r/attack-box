@@ -51,7 +51,9 @@ shellcheck -S error scripts/*.sh
 
 Use the [local setup in the README](README.md#local-setup) for an HTTP check. Read the [architecture guide](docs/architecture.md) before changing record or trust boundaries. Read the [operator guide](docs/operator.md) before changing runtime configuration.
 
-For docs changes, use Node.js 22 or later and pnpm 10. From `site/`, run `pnpm install --frozen-lockfile`, `pnpm build`, and `pnpm dev --hostname 127.0.0.1`. Request every content route. After a diagram change, open it in a browser and check the zoom dialog. Keep captured payloads, internal tracker references, and deployment state out of public content.
+For docs changes, use Node.js 22 or later and pnpm 10. From `site/`, run `pnpm install --frozen-lockfile`, `pnpm build`, and `pnpm dev --hostname 127.0.0.1`. Request every content route. After a diagram change, open it in a browser and check the zoom dialog. Keep raw captures, internal tracker references, and deployment state out of public content.
+
+Public prompt excerpts: publish only a verified exact match to a known benign phrase or text an operator reviewed privately and cleared for publication. Remove credentials, personal identifiers, private context, and sensitive operational details. Mark each removal as `[redacted]`; do not present a paraphrase as a quote. If a passage cannot be cleared, label its wording withheld. Render excerpts as inert text. Do not copy raw captures into Git, builds, or review tools. Pattern scans alone do not clear free text.
 
 ## Check for outside activity
 

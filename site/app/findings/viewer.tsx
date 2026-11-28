@@ -315,6 +315,7 @@ export function FindingsViewer({ days }: ViewerProps) {
         {!day && <p className={styles.hint}>{days.length} reports · {mapped.length} public maps · includes partial days. Written reports without a map do not contribute to totals.</p>}
         {(!day || day.date === '2026-11-26' || day.date === '2026-11-27') && <p className={styles.hint}>
           Case study · Nov 26–27: <a className={styles.link} href="https://github.com/caretak3r/attack-box/blob/main/findings/2026-11-27/ollama-prompt-journey.md">One Ollama client’s prompt journey</a> — 33 requests with prompts, from a three-model comparison to repeated chat turns.
+          {' '}Five requests ended with the exact user message <code>hi</code>. Wording withheld for the other 13 distinct prompts.
         </p>}
         {(filter.port >= 0 || filter.endpoint) && <p className={styles.hint}>Showing {filter.endpoint || `port ${filter.port || 'unknown'}`} · <button className={styles.link} onClick={() => setFilter(emptyFilter)}>Clear filter</button></p>}
         {(!day || day.hasMap) && (
