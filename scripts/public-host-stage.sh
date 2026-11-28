@@ -594,21 +594,21 @@ verify_public_bindings() {
   [[ $actual == "$expected" ]] || fail "public ports are not bound exactly to the ten published ports on $public_ip"
   mounts=$(docker inspect --type container --format '{{range .Mounts}}{{println .Type .Source .Destination .RW}}{{end}}' "$container" | sed '/^$/d' | sort) || fail 'cannot inspect public mounts'
   [[ $mounts == $'bind /etc/attackbox-public/tls /run/secrets false\nbind /run/attackbox-public-otel /run/attackbox-public-otel false\nbind /var/lib/attackbox-public-capture/requests /var/lib/attackbox-public-capture true' ]] || fail 'public mounts must contain only read-only public TLS and socket directories and the capture directory'
-  network=$(marker_value project.network_id)
+  network=$(docker network inspect --format '{{.Id}}' "$(marker_value project)_public") || fail 'cannot inspect public project network'
   isolation=$(docker inspect --type container --format \
     '{{.HostConfig.Runtime}} {{.HostConfig.LogConfig.Type}} {{.HostConfig.Privileged}} {{.HostConfig.ReadonlyRootfs}} {{.Config.User}} {{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.PidsLimit}} {{range .HostConfig.CapDrop}}{{.}}{{end}} {{if .HostConfig.CapAdd}}extra{{else}}none{{end}} {{range .HostConfig.SecurityOpt}}{{if or (eq . "no-new-privileges:true") (eq . "no-new-privileges")}}nnp{{end}}{{end}} {{range .NetworkSettings.Networks}}{{.NetworkID}}{{end}}' "$container") || fail 'cannot inspect live public isolation'
   [[ $isolation == "runsc none false true 65532:65532 2000000000 536870912 128 ALL none nnp $network" ]] || fail 'live public isolation differs from signed resource and network contract'
 }
 
-capture_project_inventory() {
-  local ids count network volumes
+# A restart of attackbox-public.service recreates the container and the network,
+# so their IDs are not an identity. The owned container is the only one with the
+# ledger project label, and it must run the ledger image.
+project_container() {
+  local project=$1 image=$2 ids
   ids=$(docker ps -a --no-trunc --filter "label=com.docker.compose.project=$project" --format '{{.ID}}') || return 1
-  count=$(printf '%s\n' "$ids" | awk 'NF {n++} END {print n+0}')
-  if [[ $count -eq 1 && $ids =~ ^[0-9a-f]{64}$ ]]; then mark project.container_id "$ids" || return 1; fi
-  network=$(docker network inspect --format '{{.Id}}' "${project}_public" 2>/dev/null || true)
-  if [[ $network =~ ^[0-9a-f]{64}$ ]]; then mark project.network_id "$network" || return 1; fi
-  volumes=$(docker volume ls --filter "label=com.docker.compose.project=$project" --format '{{.Name}}') || return 1
-  [[ $count -eq 1 && $ids =~ ^[0-9a-f]{64}$ && $network =~ ^[0-9a-f]{64}$ && -z $volumes ]]
+  [[ $ids =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ $(docker inspect --type container --format '{{.Image}}' "$ids") == "$image" ]] || return 1
+  printf '%s\n' "$ids"
 }
 
 cleanup_work() {
@@ -686,7 +686,7 @@ prevalidate_dir_state() {
 }
 
 prevalidate_project_state() {
-  local current expected project volumes count result
+  local current project volumes result
   has_marker public_start.intent || return 0
   project=$(marker_value project)
   if has_marker project.down; then
@@ -704,31 +704,14 @@ prevalidate_project_state() {
     return 0
   fi
   current=$(docker ps -a --no-trunc --filter "label=com.docker.compose.project=$project" --format '{{.ID}}') || return 1
-  if has_marker project.container_id; then
-    expected=$(marker_value project.container_id)
-    if has_marker project.removing; then
-      [[ -z $current || $current == "$expected" ]] || { printf 'public-host-stage: public project container identity changed\n' >&2; return 1; }
-    else
-      [[ $current == "$expected" ]] || { printf 'public-host-stage: public project container identity changed\n' >&2; return 1; }
-    fi
-  elif has_marker project.removing; then
-    count=$(printf '%s\n' "$current" | awk 'NF {n++} END {print n+0}')
-    [[ $count -le 1 ]] || return 1
+  if [[ -n $current ]]; then
+    project_container "$project" "$(marker_value image)" >/dev/null || { printf 'public-host-stage: public project container is not the single container with the ledger image\n' >&2; return 1; }
   fi
-  if has_marker project.network_id; then
-    expected=$(marker_value project.network_id)
-    if docker_network_present "${project}_public"; then
-      current=$(docker network inspect --format '{{.Id}}' "${project}_public") || return 1
-    else
-      result=$?
-      [[ $result == 1 ]] || return 1
-      current=
-    fi
-    if has_marker project.removing; then
-      [[ -z $current || $current == "$expected" ]] || { printf 'public-host-stage: public project network identity changed\n' >&2; return 1; }
-    else
-      [[ $current == "$expected" ]] || { printf 'public-host-stage: public project network identity changed\n' >&2; return 1; }
-    fi
+  if docker_network_present "${project}_public"; then
+    [[ $(docker network inspect --format '{{index .Labels "com.docker.compose.project"}}' "${project}_public") == "$project" ]] || { printf 'public-host-stage: public project network does not carry the project label\n' >&2; return 1; }
+  else
+    result=$?
+    [[ $result == 1 ]] || return 1
   fi
   volumes=$(docker volume ls --filter "label=com.docker.compose.project=$project" --format '{{.Name}}') || return 1
   [[ -z $volumes ]] || { printf 'public-host-stage: unexpected public project volume exists\n' >&2; return 1; }
@@ -1006,7 +989,7 @@ ledger_entry_known() {
 account.intent|account.uid|account.gid|account.removing|account.user_removed|account.group_removed|account.removed|\
 image.intent|image.loaded|image.removing|image.removed|collector_start.intent|collector_service.stopped|\
 collector_service.disabled|public_start.intent|public_service.stopped|public_service.disabled|\
-project.container_id|project.network_id|project.removing|project.down) return 0 ;;
+project.removing|project.down) return 0 ;;
   esac
   for key in "${file_keys[@]}"; do
     for suffix in sha uid gid mode installing installed removing removed; do [[ $name == "file.$key.$suffix" ]] && return 0; done
@@ -1114,7 +1097,7 @@ run_check() {
 }
 
 run_stage() {
-  local suffix index uid
+  local suffix index uid container
   [[ $approve == "$bundle_sha" ]] || fail 'stage requires --approve equal to the exact bundle SHA-256'
   verify_common_inputs
   verify_capture_dir yes
@@ -1186,14 +1169,15 @@ run_stage() {
   owned_unit_state attackbox-public-otel.service otel_unit >/dev/null || fail 'public Collector unit identity mismatch'
   mark collector_start.intent || fail 'cannot record dependency-owned Collector start intent'
   mark public_start.intent || fail 'cannot record public application start intent'
-  if ! systemctl enable --now attackbox-public.service; then capture_project_inventory || true; fail 'public service failed to start'; fi
+  systemctl enable --now attackbox-public.service || fail 'public service failed to start'
   systemctl is-active --quiet attackbox-public.service || fail 'public service is not active'
   systemctl is-active --quiet attackbox-public-otel.service || fail 'public Collector dependency is not active'
   uid=$(marker_value account.uid)
   nft get element inet attackbox collector_uids "{ $uid }" >/dev/null 2>&1 || fail 'public Collector UID was not installed in nft set'
-  capture_project_inventory || fail 'public Compose project inventory is incomplete'
-  [[ $(docker inspect --type container --format '{{.State.Status}} {{.State.Health.Status}} {{.Image}}' "$(marker_value project.container_id)") == "running healthy $verified_image" ]] || fail 'public container is not healthy with the verified image'
-  verify_public_bindings "$(marker_value project.container_id)"
+  container=$(project_container "$project" "$verified_image") || fail 'public Compose project does not own exactly one container with the verified image'
+  [[ -z $(docker volume ls --filter "label=com.docker.compose.project=$project" --format '{{.Name}}') ]] || fail 'public Compose project owns an unexpected volume'
+  [[ $(docker inspect --type container --format '{{.State.Status}} {{.State.Health.Status}} {{.Image}}' "$container") == "running healthy $verified_image" ]] || fail 'public container is not healthy with the verified image'
+  verify_public_bindings "$container"
   live_tls_matches "$(leaf_pin -in "$TLS_DIR/fullchain.pem")" || fail 'live public HTTPS failed system trust, SNI or exact leaf pin'
   verify_private_health
   replace_marker status staged
@@ -1240,7 +1224,8 @@ recover_renewal() {
     [[ $current == "$expected" && ( $expected == "$old" || $expected == "$new" ) ]] || return 1
   fi
   if $live; then
-    reload_and_check "$(marker_value project.container_id)" "$(leaf_pin -in "$TLS_DIR/fullchain.pem")" || return 1
+    current=$(project_container "$(marker_value project)" "$(marker_value image)") || return 1
+    reload_and_check "$current" "$(leaf_pin -in "$TLS_DIR/fullchain.pem")" || return 1
   fi
   rm -f -- "$RENEW_NEW" "$RENEW_OLD" && rm -- "$(marker renew.pending)"
 }
@@ -1266,8 +1251,7 @@ run_renew() {
   verify_host_identity
   verify_private_health
   verify_firewall
-  id=$(marker_value project.container_id)
-  [[ $id =~ ^[a-f0-9]{64}$ ]] || fail 'missing staged container identity'
+  id=$(project_container "$(marker_value project)" "$(marker_value image)") || fail 'renewal requires the single staged container with the ledger image'
   [[ $(docker inspect --type container --format '{{.State.Status}} {{.State.Health.Status}} {{.Image}}' "$id") == "running healthy $(marker_value image)" ]] || fail 'renewal requires the healthy staged image'
   verify_public_bindings "$id"
   recover_renewal true || fail 'interrupted renewal needs recovery'

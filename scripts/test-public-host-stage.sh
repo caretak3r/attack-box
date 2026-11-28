@@ -271,7 +271,7 @@ case "$1" in
           *'/etc/nginx/ssl/server.key'*) printf '/root/input/proxy.key\n' ;;
           *) printf 'running healthy runsc\n' ;;
         esac ;;
-      cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc)
+      "$(cat /tmp/mock/container 2>/dev/null || true)")
         if [[ $* == *'.Mounts'* ]]; then
           printf '%s\n' 'bind /run/attackbox-public-otel /run/attackbox-public-otel false' 'bind /etc/attackbox-public/tls /run/secrets false' \
             'bind /var/lib/attackbox-public-capture/requests /var/lib/attackbox-public-capture true'
@@ -280,6 +280,8 @@ case "$1" in
           if [[ -e /tmp/mock/wrong-isolation ]]; then printf 'runc journald\n'; else
             printf 'runsc none false true 65532:65532 2000000000 536870912 128 ALL none nnp %s\n' "$(cat /tmp/mock/network)"
           fi
+        elif [[ $* == *'--format {{.Image}} '* ]]; then
+          if [[ -e /tmp/mock/foreign-image ]]; then printf 'sha256:%064d\n' 0; else printf 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'; fi
         else
           printf 'running healthy sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'
         fi
@@ -363,7 +365,9 @@ case "$1" in
         ;;
       inspect)
         [[ $last == "$expected" && -e /tmp/mock/network ]] || exit 1
-        [[ $* != *'--format'* ]] || cat /tmp/mock/network
+        if [[ $* == *'.Labels'* ]]; then
+          [[ -e /tmp/mock/foreign-network-label ]] || printf '%s\n' "${expected%_public}"
+        elif [[ $* == *'--format'* ]]; then cat /tmp/mock/network; fi
         ;;
       *) exit 1 ;;
     esac
@@ -374,7 +378,7 @@ case "$1" in
       [[ ! -e /tmp/mock/docker-listener-port ]] || port=$(cat /tmp/mock/docker-listener-port)
       printf '9443/tcp -> 0.0.0.0:%s\n' "$port"
     else
-      [[ $last == cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc && -e /tmp/mock/container ]]
+      [[ -e /tmp/mock/container && $last == "$(cat /tmp/mock/container)" ]]
       if [[ -e /tmp/mock/partial-bindings ]]; then
         printf '8443/tcp -> 93.184.216.34:443\n'
       else
@@ -731,7 +735,19 @@ cmp "$cert" /root/input/cert.pem && cmp "$cert" /tmp/mock/served-cert || fail 'r
 "${renew[@]}" >/dev/null
 cmp "$cert" /root/input/renew.pem && cmp "$cert" /tmp/mock/served-cert || fail 'new chain was not served'
 [[ $(cat "$ledger/file.tls_cert.sha") == "$(sha256sum "$cert" | cut -d' ' -f1)" && ! -e $ledger/renew.pending ]] || fail 'successful renewal lost rollback ownership'
-cmp "$ledger/project.container_id" /tmp/mock/container && cmp "$ledger/project.network_id" /tmp/mock/network || fail 'renewal replaced owned Docker identities'
+[[ $(cat /tmp/mock/container) == "$container" && $(cat /tmp/mock/network) == "$(printf '%064d' 0 | tr 0 d)" ]] || fail 'renewal replaced the public container or network'
+# A restart of attackbox-public.service recreates the container and the network with new IDs.
+printf '%064d\n' 0 | tr 0 e >/tmp/mock/container
+printf '%064d\n' 0 | tr 0 f >/tmp/mock/network
+"${renew[@]}" >/dev/null || fail 'renewal refused the recreated public container'
+touch /tmp/mock/foreign-image
+expect_failure 'not the single container with the ledger image' "${renew[@]}"
+expect_failure 'not the single container with the ledger image' bash "$script" rollback --approve "$bundle_sha"
+rm /tmp/mock/foreign-image
+touch /tmp/mock/foreign-network-label
+expect_failure 'does not carry the project label' bash "$script" rollback --approve "$bundle_sha"
+rm /tmp/mock/foreign-network-label
+[[ -e /tmp/mock/container && -e /var/lib/attackbox-public ]] || fail 'ownership refusal mutated the staged project'
 printf 'taint' >>"$cert"
 expect_failure 'refuse changed owned file' "${renew[@]}"
 expect_failure 'refuse changed owned file' bash "$script" rollback --approve "$bundle_sha"
