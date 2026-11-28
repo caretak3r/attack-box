@@ -210,7 +210,7 @@ cat >/usr/local/bin/nft <<'MOCK'
 #!/bin/bash
 set -euo pipefail
 case "$1 $2 ${3:-} ${4:-} ${5:-}" in
-  'list set inet attackbox collector_uids'|'list set inet attackbox nr_otlp_ipv4'|'list set inet attackbox nr_otlp_ipv6')
+  'list set inet attackbox collector_uids')
     printf 'set %s { elements = { 192.0.2.1 } }\n' "$5"
     ;;
   'list chain inet attackbox output_policy')
@@ -220,12 +220,7 @@ case "$1 $2 ${3:-} ${4:-} ${5:-}" in
       printf 'type filter hook output priority filter; policy drop;\n'
     fi
     if [[ -e /tmp/mock/nft-policy-invalid ]]; then
-      printf 'meta skuid @collector_uids drop\n'
-      printf 'ip daddr @nr_otlp_ipv4 tcp dport 443 accept\n'
-      printf 'ip6 daddr @nr_otlp_ipv6 tcp dport 443 accept\n'
-    else
-      printf 'meta skuid @collector_uids ip daddr @nr_otlp_ipv4 tcp dport 443 accept\n'
-      printf 'meta skuid @collector_uids ip6 daddr @nr_otlp_ipv6 tcp dport 443 accept\n'
+      printf 'meta skuid @collector_uids ip daddr 192.0.2.9 tcp dport 443 accept\n'
     fi
     ;;
   'get element inet attackbox collector_uids')
@@ -536,10 +531,10 @@ expect_failure 'runsc host UDS support is not enabled' bash "$script" check "${c
 rm /tmp/mock/runsc-uds-missing
 mv /tmp/daemon.saved /etc/docker/daemon.json
 touch /tmp/mock/nft-policy-invalid
-expect_failure 'UID-scoped fixed OTLP egress rules or default-drop policy are missing' bash "$script" check "${common[@]}"
+expect_failure 'collector must have no egress; output_policy chain must be default-drop' bash "$script" check "${common[@]}"
 rm /tmp/mock/nft-policy-invalid
 touch /tmp/mock/nft-policy-accept
-expect_failure 'UID-scoped fixed OTLP egress rules or default-drop policy are missing' bash "$script" check "${common[@]}"
+expect_failure 'collector must have no egress; output_policy chain must be default-drop' bash "$script" check "${common[@]}"
 rm /tmp/mock/nft-policy-accept
 ln -s /tmp /etc/attackbox-public
 expect_failure 'public install path already exists' bash "$script" check "${common[@]}"

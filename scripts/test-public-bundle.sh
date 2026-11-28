@@ -26,7 +26,7 @@ printf 'incorrect archive\n' > /tmp/bad.tar.gz
 cat > /tmp/bin/git <<'MOCK'
 #!/bin/bash
 set -euo pipefail
-[[ -z ${VULTR_API_KEY:-}${NEW_RELIC_API_KEY:-}${ATTACKBOX_NR_LICENSE_KEY:-}${NEW_RELIC_LICENSE_KEY:-} ]] || exit 1
+[[ -z ${VULTR_API_KEY:-} ]] || exit 1
 case "$1 ${2:-}" in
   'rev-parse --verify'|'rev-parse HEAD') printf '%s\n' "$COMMIT" ;;
   '-c gpg.minTrustLevel=fully') [[ ${3:-} == verify-commit ]] ;;
@@ -39,7 +39,7 @@ MOCK
 cat > /tmp/bin/docker <<'MOCK'
 #!/bin/bash
 set -euo pipefail
-[[ -z ${VULTR_API_KEY:-}${NEW_RELIC_API_KEY:-}${ATTACKBOX_NR_LICENSE_KEY:-}${NEW_RELIC_LICENSE_KEY:-} ]] || exit 1
+[[ -z ${VULTR_API_KEY:-} ]] || exit 1
 case "$1 ${2:-}" in
   'image inspect') printf 'linux/amd64 65532:65532 ["/attackbox-public"] %s\n' "$TEST_IMAGE" ;;
   'image save') [[ ${3:-} == --output && ${5:-} == "$TEST_IMAGE" ]]; printf 'synthetic image\n' > "$4" ;;
@@ -60,7 +60,7 @@ fi
 MOCK
 chmod +x /tmp/bin/git /tmp/bin/docker /tmp/bin/shasum
 export PATH=/tmp/bin:$PATH COMMIT=$sha APPROVE=$sha PLATFORM=linux/amd64 TEST_IMAGE=$image
-export VULTR_API_KEY=synthetic NEW_RELIC_API_KEY=synthetic ATTACKBOX_NR_LICENSE_KEY=synthetic NEW_RELIC_LICENSE_KEY=synthetic
+export VULTR_API_KEY=synthetic
 printf '%s linux/amd64 %s\n' "$sha" "$image" > "$state/$sha-amd64.verified"
 script=/tmp/repo/scripts/public-release-check.sh
 expect_failure() {

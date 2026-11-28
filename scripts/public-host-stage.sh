@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
-unset VULTR_API_KEY NEW_RELIC_API_KEY ATTACKBOX_NR_LICENSE_KEY NEW_RELIC_LICENSE_KEY
+unset VULTR_API_KEY
 unset DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH
 export DOCKER_HOST=unix:///var/run/docker.sock LC_ALL=C
 unset COMPOSE_FILE COMPOSE_PROFILES COMPOSE_PROJECT_NAME
@@ -192,18 +192,15 @@ verify_runsc() {
 }
 
 verify_firewall() {
-  local set_name chain
-  for set_name in collector_uids nr_otlp_ipv4 nr_otlp_ipv6; do
-    nft list set inet attackbox "$set_name" >/dev/null || fail "required nft set is missing: $set_name"
-  done
+  nft list set inet attackbox collector_uids >/dev/null || fail 'required nft set is missing: collector_uids'
+  local chain
   chain=$(nft list chain inet attackbox output_policy) || fail 'required nft output chain is unavailable'
   printf '%s\n' "$chain" | awk '
     {$1=$1}
     /^type filter hook output priority [^;]+; policy drop;$/ {policy=1}
-    /^(meta )?skuid @collector_uids ip daddr @nr_otlp_ipv4 tcp dport 443 accept$/ {ipv4=1}
-    /^(meta )?skuid @collector_uids ip6 daddr @nr_otlp_ipv6 tcp dport 443 accept$/ {ipv6=1}
-    END {exit !(policy && ipv4 && ipv6)}
-  ' || fail 'UID-scoped fixed OTLP egress rules or default-drop policy are missing'
+    /skuid @collector_uids.*accept$/ {collector_egress=1}
+    END {exit !(policy && !collector_egress)}
+  ' || fail 'collector must have no egress; output_policy chain must be default-drop'
 }
 
 verify_ports_free() {
@@ -1093,7 +1090,7 @@ run_check() {
   rmdir -- "$tmp"
   trap - EXIT
   note 'check passed: signed release, bundle snapshot, host identity, TLS pair, private health, runsc UDS, required nft rules, collisions and public-only paths'
-  note 'not checked: complete host egress policy, provider firewall, live TLS, public ingress or New Relic ingestion'
+  note 'not checked: complete host egress policy, provider firewall, live TLS or public ingress'
 }
 
 run_stage() {
@@ -1185,7 +1182,7 @@ run_stage() {
   stage_in_progress=false
   trap - EXIT
   note "staged public project $project on $public_ip ports 443 (TLS), 80, 1234, 3000, 4000, 8000, 8080, 8188, 8888, 11434 (plain HTTP); verified local TLS trust, hostname and leaf pin"
-  note 'not claimed: provider firewall state, public ingress or New Relic ingestion'
+  note 'not claimed: provider firewall state or public ingress'
 }
 
 reload_and_check() {

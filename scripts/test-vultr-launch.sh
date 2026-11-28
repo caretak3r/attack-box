@@ -7,7 +7,6 @@ set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SRC=$HERE/vultr-launch.sh
 FAKE_KEY=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
-NR_KEY=0123456789abcdef0123456789abcdef01234567
 K="VULTR_API_KEY=$FAKE_KEY"
 SANDBOXES=$(mktemp -d)
 trap 'rm -rf "$SANDBOXES"' EXIT
@@ -33,17 +32,14 @@ new_sandbox() { # sets T (sandbox repo) and M (mock state dir)
   for f in Dockerfile .dockerignore compose.yaml compose.gvisor.yaml scripts/deploy-ubuntu.sh cmd/x/main.go internal/y/y.go deploy/a docker/b; do
     echo "$f" >"$T/$f"
   done
-  mkdir -p "$T/deploy/newrelic" "$T/.fixture-cli"
-  cp "$HERE/bootstrap-infrastructure.sh" "$T/scripts/bootstrap-infrastructure.sh"
-  printf '#!/bin/sh\nexit 0\n' >"$T/.fixture-cli/newrelic"
-  tar -czf "$T/.fixture-cli/archive.tar.gz" -C "$T/.fixture-cli" newrelic
-  printf 'NRCLI_VERSION=0.117.0\nNRCLI_LINUX_AMD64_SHA256=%s\n' "$(shasum -a 256 "$T/.fixture-cli/archive.tar.gz" | cut -d' ' -f1)" >"$T/deploy/newrelic/version.env"
+  mkdir -p "$T/cmd/attackbox-scenarios"
+  printf 'package main\n\nimport "os"\n\nfunc main() { os.Exit(0) }\n' >"$T/cmd/attackbox-scenarios/main.go"
   mkdir -p "$T/internal/vendor-fixture"
   printf 'module fixture.test/decoy\n\ngo 1.25.0\n\nrequire fixture.test/dependency v0.0.0\nreplace fixture.test/dependency => ./internal/vendor-fixture\n' >"$T/go.mod"
   printf 'module fixture.test/dependency\n\ngo 1.25.0\n' >"$T/internal/vendor-fixture/go.mod"
   printf 'package dependency\n\nconst Value = "committed dependency"\n' >"$T/internal/vendor-fixture/dependency.go"
   printf 'package main\n\nimport _ "fixture.test/dependency"\n\nfunc main() {}\n' >"$T/cmd/x/main.go"
-  printf 'package y\n' >"$T/internal/y/y.go"
+  printf '      ATTACKBOX_MODELS: "gpt-4o,gpt-4o-mini"\n' >>"$T/compose.yaml"
   (cd "$T" && export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
     && git init -q && git add -A && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -m init)
   local commit state
@@ -69,10 +65,6 @@ while [ $# -gt 0 ]; do
     *) shift ;;
   esac
 done
-if [[ $url == https://download.newrelic.com/install/newrelic-cli/* ]]; then
-  cp "$MOCK_DIR/../.fixture-cli/archive.tar.gz" "$output"
-  exit 0
-fi
 path=${url#"$MOCK_API"}
 jq -cn --arg m "$m" --arg p "$path" --arg b "$body" --argjson k "$k" '{m:$m,p:$p,b:$b,k:($k==1)}' >>"$MOCK_DIR/calls.jsonl"
 code=200 out=
@@ -109,6 +101,9 @@ EOF
 #!/usr/bin/env bash
 n=$(( $(cat "$MOCK_DIR/ssh.n" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$MOCK_DIR/ssh.n"
 printf '%s\n' "$*" >"$MOCK_DIR/ssh.$n.argv"
+case "$*" in
+  *"-N"*"-L"*) exec sleep 600 </dev/null >"$MOCK_DIR/forward.log" 2>&1 ;;
+esac
 cat >"$MOCK_DIR/ssh.$n.stdin"
 case "$*" in
   *"ss -ltnH"*) printf 'LISTEN 0 4096 %s 0.0.0.0:*\n' ${MOCK_LISTEN:-127.0.0.1:8443} ;;
@@ -118,15 +113,42 @@ exit 0
 EOF
   cat >"$T/bin/nc" <<'EOF'
 #!/usr/bin/env bash
-[ -e "$MOCK_DIR/ssh.down" ] && exit 1
-exit 0
+case "$*" in
+  *"-z"*"127.0.0.1"*"18443"*) exit 0 ;;
+  *"-z"*) [ -e "$MOCK_DIR/ssh.down" ] && exit 1; exit 0 ;;
+  *) [ -e "$MOCK_DIR/ssh.down" ] && exit 1; exit 0 ;;
+esac
 EOF
-  chmod +x "$T/bin/curl" "$T/bin/ssh" "$T/bin/nc"
+  cat >"$T/bin/go" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" == "run ./cmd/attackbox-scenarios"* ]]; then
+  printf '%s\n' "$*" >>"$MOCK_DIR/go-scenarios.argv"
+  if [ -n "${MOCK_SCENARIO_FAILS:-}" ]; then
+    echo "scenario failed" >&2
+    exit 1
+  fi
+  output=
+  for a in "$@"; do
+    case $a in -output) shift; output=$1; break ;; esac
+    shift
+  done
+  if [ -n "$output" ]; then
+    echo '{"scenario":"test","response_verified":true}' >"$output"
+  fi
+  exit 0
+fi
+# Hand every other go command to the real toolchain; this mock is first on PATH, so skip its own dir.
+self=$(cd "$(dirname "$0")" && pwd)
+IFS=: read -r -a dirs <<<"$PATH"
+for d in "${dirs[@]}"; do [ "$d" != "$self" ] && [ -x "$d/go" ] && exec "$d/go" "$@"; done
+exit 127
+EOF
+  chmod +x "$T/bin/curl" "$T/bin/ssh" "$T/bin/nc" "$T/bin/go"
 }
 
 # run [VAR=value ...] -- ARGS...: run the sandbox copy of the script with a clean environment; sets OUT and RC.
 run() {
-  local envs=(APPROVE="$(git -C "$T" rev-parse HEAD)" NEW_RELIC_ACCOUNT_ID=1)
+  local envs=(APPROVE="$(git -C "$T" rev-parse HEAD)")
   while [ "$1" != -- ]; do envs+=("$1"); shift; done
   shift
   OUT=$(cd "$T" && env -i HOME="$T/home" PATH="$T/bin:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" \
@@ -146,7 +168,7 @@ do_create() { # new sandbox holding a created decoy; extra args are env assignme
 
 do_bootstrap() {
   do_create "$@" || return 1
-  run "$K" ATTACKBOX_NR_LICENSE_KEY="$NR_KEY" NEW_RELIC_API_KEY=NRAK-$(printf '%024d' 0) -- bootstrap
+  run "$K" -- bootstrap
   [ "$RC" = 0 ] || { echo "$OUT"; return 1; }
 }
 
@@ -233,48 +255,45 @@ t_bootstrap_refuses_bad_inputs() {
   run "$K" -- bootstrap
   mv "$record.saved" "$record"
   [ "$RC" != 0 ] && has "$OUT" 'no successful release-check' || { echo "missing release record accepted: $OUT"; return 1; }
-  run "$K" -- bootstrap; [ "$RC" != 0 ] || { echo "ran without a New Relic key"; return 1; }
-  run "$K" ATTACKBOX_NR_LICENSE_KEY=NRAK-$(printf '%036d' 0) -- bootstrap; [ "$RC" != 0 ] || { echo "User key accepted"; return 1; }
-  run "$K" ATTACKBOX_NR_LICENSE_KEY=abc123 -- bootstrap; [ "$RC" != 0 ] || { echo "short key accepted"; return 1; }
-  run "$K" ATTACKBOX_NR_LICENSE_KEY="${NR_KEY%?}G" -- bootstrap; [ "$RC" != 0 ] || { echo "non-hex key accepted"; return 1; }
-  run "$K" ATTACKBOX_NR_LICENSE_KEY="$NR_KEY" NR_REGION=eu -- bootstrap; [ "$RC" != 0 ] && has "$OUT" 'US New Relic' || { echo "EU accepted"; return 1; }
   echo '# local edit' >>"$T/compose.yaml"
-  run "$K" ATTACKBOX_NR_LICENSE_KEY="$NR_KEY" -- bootstrap; [ "$RC" != 0 ] && has "$OUT" 'checkout has tracked changes' || { echo "dirty bundle accepted"; return 1; }
+  run "$K" -- bootstrap; [ "$RC" != 0 ] && has "$OUT" 'checkout has tracked changes' || { echo "dirty bundle accepted"; return 1; }
   [ "$(cat "$M/ssh.n")" = "$n" ] || { echo "ssh was used despite a refused bootstrap"; return 1; }
 }
 
-t_bootstrap_ships_a_clean_bundle_and_key_on_stdin() {
+t_bootstrap_scenario_gate_failure_blocks() {
+  do_create MOCK_SCENARIO_FAILS=1 || return 1
+  local n; n=$(cat "$M/ssh.n")
+  run "$K" MOCK_SCENARIO_FAILS=1 -- bootstrap
+  [ "$RC" != 0 ] && has "$OUT" 'deployment test gate failed' || { echo "failed gate was ignored: $OUT"; return 1; }
+  [ "$(jq -r .bootstrapped "$T/.vultr/state.json")" = null ] || { echo "bootstrap marked complete despite failed gate"; return 1; }
+  [ -f "$M/go-scenarios.argv" ] || { echo "scenario command was not run"; return 1; }
+}
+
+
+t_bootstrap_ships_a_clean_bundle_and_runs_scenario_gate() {
   do_bootstrap || return 1
   local i
   i=$(ssh_idx 'tar -x -C /root/attackbox-src') || { echo "no bundle upload"; return 1; }
   local listing; listing=$(tar -tf "$M/ssh.$i.stdin")
-  for f in go.mod cmd/x/main.go internal/y/y.go Dockerfile .dockerignore compose.yaml compose.gvisor.yaml scripts/deploy-ubuntu.sh scripts/bootstrap-infrastructure.sh deploy/newrelic/version.env bootstrap/newrelic-cli-linux-amd64.tar.gz deploy/a docker/b; do
+  for f in go.mod cmd/x/main.go cmd/attackbox-scenarios/main.go internal/y/y.go Dockerfile .dockerignore compose.yaml compose.gvisor.yaml scripts/deploy-ubuntu.sh deploy/a docker/b; do
     has "$listing" "$f" || { echo "bundle lacks $f"; return 1; }
   done
   tar -xOf "$M/ssh.$i.stdin" vendor/fixture.test/dependency/dependency.go | grep -Fq 'committed dependency' \
     || { echo "bundle lacks generated Go dependency"; return 1; }
   if grep -Eq '^\.env$|^\.vultr/|^\.mock/|^go\.sum$|^compose\.monitoring\.yaml$|install-monitoring\.sh|vultr-launch' <<<"$listing"; then echo "bundle contains files outside the allowlist"; return 1; fi
-  i=$(ssh_idx '/etc/attackbox/shipper.env') || { echo "no shipper.env write"; return 1; }
-  [ "$(cat "$M/ssh.$i.stdin")" = "ATTACKBOX_NR_LICENSE_KEY=$NR_KEY
-ATTACKBOX_SPOOL_SOCKET=/run/attackbox/spool.sock
-ATTACKBOX_RUNTIME_SOCKET=/run/attackbox/runtime.sock
-ATTACKBOX_EGRESS_SOCKET=/run/attackbox/egress.sock" ] || { echo "shipper.env content is wrong"; return 1; }
-  has "$(cat "$M/ssh.$i.argv")" 'test -e /etc/attackbox/shipper.env' || { echo 'operator config preservation missing'; return 1; }
-  has "$(cat "$M/ssh.$i.argv")" 'umask 077' || { echo "shipper.env is not written with umask 077"; return 1; }
-  grep -Fq -- "$NR_KEY" "$M"/ssh.*.argv && { echo "New Relic key found in ssh argv"; return 1; }
-  has "$OUT" "$NR_KEY" && { echo "New Relic key printed"; return 1; }
-  local a b c
-  a=$(ssh_idx 'deploy-ubuntu.sh --dry-run') && b=$(ssh_idx 'deploy-ubuntu.sh --apply') && c=$(ssh_idx 'deploy-ubuntu.sh --verify') || { echo "a deploy step is missing"; return 1; }
-  [ "$(cat "$M/ssh.$b.stdin")" = NRAK-$(printf '%024d' 0) ] || { echo "native User key missing from apply stdin"; return 1; }
-  ! grep -Fq "NRAK-$(printf '%024d' 0)" "$M"/ssh.*.argv || { echo "native User key leaked into argv"; return 1; }
-  [ "$a" -lt "$b" ] && [ "$b" -lt "$c" ] || { echo "deploy steps out of order"; return 1; }
+  [ -f "$M/go-scenarios.argv" ] || { echo "no scenario gate"; return 1; }
+  local go_cmd; go_cmd=$(cat "$M/go-scenarios.argv")
+  has "$go_cmd" '-target https://127.0.0.1:18443' || { echo "wrong target: $go_cmd"; return 1; }
+  has "$go_cmd" '-self-signed' || { echo "missing -self-signed: $go_cmd"; return 1; }
+  has "$go_cmd" '-model gpt-4o' || { echo "wrong model: $go_cmd"; return 1; }
+  has "$go_cmd" "-run-id bootstrap-$(git -C "$T" rev-parse HEAD)" || { echo "wrong run-id: $go_cmd"; return 1; }
   [ "$(jq -r .bootstrapped "$T/.vultr/state.json")" = "$(git -C "$T" rev-parse HEAD)" ] || { echo "verified commit not recorded"; return 1; }
 }
 
 t_lockdown_gates() {
   do_create || return 1
   run "$K" -- lockdown --console-confirmed; [ "$RC" != 0 ] && has "$OUT" 'bootstrap has not finished' || { echo "lockdown before bootstrap"; return 1; }
-  run "$K" ATTACKBOX_NR_LICENSE_KEY="$NR_KEY" -- bootstrap; [ "$RC" = 0 ] || { echo "$OUT"; return 1; }
+  run "$K" -- bootstrap; [ "$RC" = 0 ] || { echo "$OUT"; return 1; }
   run "$K" -- lockdown; [ "$RC" != 0 ] && has "$OUT" '--console-confirmed' || { echo "lockdown without console confirmation"; return 1; }
   run "$K" -- lockdown --console-confirmed; [ "$RC" != 0 ] && has "$OUT" 'nothing listens on a public address for port 443' || { echo "$OUT"; return 1; }
   ssh_idx systemd-run >/dev/null && { echo "sshd was touched despite the missing listener"; return 1; }
@@ -351,9 +370,11 @@ run_test() {
   if "$1"; then printf '✓ PASS: %s\n' "$1"; else TESTS_FAILED=$((TESTS_FAILED + 1)); printf '✗ FAIL: %s\n' "$1"; fi
 }
 
+
+
 for t in t_plan_is_read_only_and_leaks_nothing t_plan_rejects_unknown_plan_and_region t_ports_are_allowlisted \
   t_create_needs_flag_and_exact_token t_create_builds_the_expected_requests t_bootstrap_refuses_bad_inputs \
-  t_bootstrap_ships_a_clean_bundle_and_key_on_stdin t_lockdown_gates t_lockdown_closes_ssh_then_deletes_the_ssh_rule_and_key \
+  t_bootstrap_scenario_gate_failure_blocks t_bootstrap_ships_a_clean_bundle_and_runs_scenario_gate t_lockdown_gates t_lockdown_closes_ssh_then_deletes_the_ssh_rule_and_key \
   t_open_needs_lockdown_and_yes t_closed_ingress_build_cannot_open t_status_and_kill t_destroy_deletes_only_recorded_ids t_key_loading; do
   case $t in *"${ONLY:-}"*) run_test "$t" ;; esac
 done

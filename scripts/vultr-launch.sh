@@ -16,7 +16,7 @@ POLL=${VULTR_POLL_SECS:-10}
 OS_NAME='Ubuntu 24.04 LTS x64'
 API_CODE=
 # Source ships from a commit. Go dependencies are generated from that source.
-BUNDLE=(go.mod cmd internal Dockerfile .dockerignore compose.yaml compose.gvisor.yaml docker deploy scripts/deploy-ubuntu.sh scripts/bootstrap-infrastructure.sh)
+BUNDLE=(go.mod cmd internal Dockerfile .dockerignore compose.yaml compose.gvisor.yaml docker deploy scripts/deploy-ubuntu.sh)
 
 log()  { printf '● %s\n' "$*" >&2; }
 ok()   { printf '✓ %s\n' "$*" >&2; }
@@ -43,12 +43,11 @@ Changes Vultr or the decoy:
 
 Environment:
   VULTR_PLAN (vc2-2c-4gb)  VULTR_REGION (ewr)  VULTR_PORTS (443; list from 80,443,8000,11434; none = closed ingress)
-  ADMIN_CIDR (one IPv4 /32; default: detected)  ATTACKBOX_NR_LICENSE_KEY (or in .env)  NR_REGION (us)
-  NEW_RELIC_API_KEY (User API key, transient bootstrap only; never stored)
-  NEW_RELIC_ACCOUNT_ID (required for bootstrap)
+  ADMIN_CIDR (one IPv4 /32; default: detected)
   VULTR_API_KEY (or in .env)
 EOF
 }
+
 
 # ---- key, API, state -------------------------------------------------------------------------
 
@@ -145,21 +144,7 @@ admin_cidr() {
   printf '%s' "$c"
 }
 
-# Prints the New Relic key. Status 1 (with a message) when it is missing or is not an Ingest-License key.
-nr_key() {
-  local k=${ATTACKBOX_NR_LICENSE_KEY:-} any='^[A-Za-z0-9]{40}$' hex='^[a-f0-9]{40}$'
-  if [ -z "$k" ] && [ -f "$ROOT/.env" ]; then
-    k=$(sed -n -E 's/^(export[[:space:]]+)?ATTACKBOX_NR_LICENSE_KEY=//p' "$ROOT/.env" | tail -n 1 | tr -d "\"' \r")
-  fi
-  [ -n "$k" ] || { warn "ATTACKBOX_NR_LICENSE_KEY is not set (environment or .env)"; return 1; }
-  case $k in
-    NRAK-*|NRAA-*|NRII-*|NRIQ-*|NRJS-*|NRBR-*)
-      warn "that is a User, admin, insert, query or browser key; only an Ingest-License key may go on the decoy"; return 1 ;;
-  esac
-  if [[ $k =~ $any ]] && { [[ $k =~ $hex ]] || [[ $k == *NRAL ]]; }; then printf '%s' "$k"; return 0; fi
-  warn "the New Relic key must be 40 letters or digits: lowercase hex, or ending in NRAL"
-  return 1
-}
+
 
 # 0 when compose publishes port $1 on a non-loopback address.
 published() {
@@ -252,10 +237,6 @@ cmd_plan() {
     printf '✗ the key lacks the provisioning or firewall permission: create will fail\n'
   fi
   [ -z "$cur" ] || printf '○ the state file already records instance %s: create will refuse until destroy --yes\n' "$cur"
-  if nr_key >/dev/null; then printf '✓ New Relic Ingest-License key found and well formed (bootstrap needs it)\n'
-  else printf '○ New Relic key not ready: bootstrap cannot run yet\n'; fi
-  if [ "${NR_REGION:-us}" = us ]; then printf '✓ New Relic region us\n'
-  else printf '✗ NR_REGION=%s: deploy-ubuntu.sh allowlists only the US endpoints\n' "$NR_REGION"; fi
   if [ "$PORTS" != none ]; then
     for p in ${PORTS//,/ }; do
       published "$p" || printf '○ port %s: compose publishes loopback only (IMPROVE.md I01). Today this is a closed-ingress build; lockdown refuses while port %s is approved.\n' "$p" "$p"
@@ -326,22 +307,15 @@ cmd_create() {
 }
 
 cmd_bootstrap() (
-  local nrk native_key commit stage account run
+  local commit stage run
   [ $# -eq 0 ] || die 'bootstrap does not accept arguments; use COMMIT and APPROVE'
   [[ ${PLATFORM:-linux/amd64} == linux/amd64 ]] || die 'the Vultr bootstrap requires PLATFORM=linux/amd64'
   commit=$(cd "$ROOT" && PLATFORM=linux/amd64 bash scripts/local-ci.sh authorize-deploy)
-  account=${NEW_RELIC_ACCOUNT_ID:-0}
-  [[ $account =~ ^[1-9][0-9]{0,11}$ ]] || die 'invalid NEW_RELIC_ACCOUNT_ID'
-  run="cd /root/attackbox-src && NEW_RELIC_ACCOUNT_ID=$account ATTACKBOX_RELEASE_VERSION=$commit ./scripts/deploy-ubuntu.sh"
+  run="cd /root/attackbox-src && ATTACKBOX_RELEASE_VERSION=$commit ./scripts/deploy-ubuntu.sh"
   local files=("${BUNDLE[@]}")
   need jq; need git; need go; need tar; need ssh
   [ -n "$(st instance_id)" ] && [ -n "$(st main_ip)" ] || die "no instance recorded; run create first"
   [ "$(st locked)" != yes ] || die "the decoy is locked down: destroy it and create a new one to change it"
-  [ "${NR_REGION:-us}" = us ] || die "deploy-ubuntu.sh allowlists only the US New Relic endpoints; NR_REGION=$NR_REGION needs a deploy-script change first"
-  native_key=${NEW_RELIC_API_KEY:-}
-  [[ -z $native_key || $native_key =~ ^NRAK-[A-Za-z0-9_-]{20,200}$ ]] || die "NEW_RELIC_API_KEY must be a User API key for native Infrastructure provisioning"
-  unset NEW_RELIC_API_KEY
-  nrk=$(nr_key) || die "no usable New Relic Ingest-License key: set ATTACKBOX_NR_LICENSE_KEY (environment or .env)"
   if git -C "$ROOT" cat-file -e "$commit:go.sum" 2>/dev/null; then files+=(go.sum); fi
 
   stage=$(mktemp -d "$STATE_DIR/bundle.XXXXXX")
@@ -351,29 +325,64 @@ cmd_bootstrap() (
   (cd "$stage" && GOWORK=off GOFLAGS= GOTOOLCHAIN=local go mod vendor)
   if [ -d "$stage/vendor" ]; then files+=(vendor); fi
 
-  log "staging the pinned New Relic CLI before host egress lockdown"
-  mkdir "$stage/bootstrap"
-  bash "$stage/scripts/bootstrap-infrastructure.sh" --stage "$stage/bootstrap"
-  files+=(bootstrap)
-
   log "shipping the bundle from commit $commit"
   tar -cf - -C "$stage" "${files[@]}" \
     | sshq 'rm -rf /root/attackbox-src && install -d -m 0700 /root/attackbox-src && tar -x -C /root/attackbox-src'
-  log "writing /etc/attackbox/shipper.env (the key travels on stdin only)"
-  printf 'ATTACKBOX_NR_LICENSE_KEY=%s\nATTACKBOX_SPOOL_SOCKET=/run/attackbox/spool.sock\nATTACKBOX_RUNTIME_SOCKET=/run/attackbox/runtime.sock\nATTACKBOX_EGRESS_SOCKET=/run/attackbox/egress.sock\n' "$nrk" \
-    | sshq 'set -eu; install -d -m 0750 /etc/attackbox; umask 077; if test -e /etc/attackbox/shipper.env || test -L /etc/attackbox/shipper.env; then cat >/dev/null; else cat >/etc/attackbox/shipper.env; fi'
 
   log "preflight (no changes)"
   sshq "$run --dry-run"
   log "apply: Docker, gVisor, Falco, firewall, bait image (10 to 20 minutes)"
-  printf '%s\n' "$native_key" | sshq "$run --apply --native-key-stdin"
-  unset native_key
+  sshq "$run --apply"
   log "verify from inside gVisor"
   sshq "$run --verify"
+
+  log "deployment test gate: running synthetic scenario check through SSH local forward"
+  local model local_port forward_pid scenario_output gate_rc wait_secs
+  model=$(grep -Eo 'ATTACKBOX_MODELS:[[:space:]]*"[^"]+' "$stage/compose.yaml" | sed 's/.*"\([^,]*\).*/\1/' | head -n1)
+  [[ -n $model ]] || die 'could not detect model from compose.yaml'
+  local_port=18443
+  scenario_output=$STATE_DIR/scenario-$commit.jsonl
+  rm -f -- "$scenario_output"
+  ssh -N -L "127.0.0.1:$local_port:127.0.0.1:8443" \
+    -F /dev/null -i "$STATE_DIR/bootstrap" -o IdentitiesOnly=yes -o BatchMode=yes \
+    -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$STATE_DIR/known_hosts" -o GlobalKnownHostsFile=/dev/null \
+    -o HostKeyAlgorithms=ssh-ed25519 -o ConnectTimeout=10 -o ServerAliveInterval=10 \
+    -o ControlPath=none -o ForwardAgent=no -o ExitOnForwardFailure=yes \
+    "root@$(st main_ip)" </dev/null >"$STATE_DIR/forward.log" 2>&1 &
+  forward_pid=$!
+  trap 'kill "$forward_pid" 2>/dev/null || true; wait "$forward_pid" 2>/dev/null || true; rm -rf -- "$stage"' EXIT
+  wait_secs=0
+  while [ "$wait_secs" -lt 15 ]; do
+    if ! kill -0 "$forward_pid" 2>/dev/null; then
+      wait "$forward_pid" 2>/dev/null || true
+      die "deployment test gate failed: SSH forward exited before local port was ready"
+    fi
+    if nc -z 127.0.0.1 "$local_port" 2>/dev/null; then break; fi
+    sleep 1
+    wait_secs=$((wait_secs + 1))
+  done
+  if [ "$wait_secs" -ge 15 ]; then
+    kill "$forward_pid" 2>/dev/null || true
+    wait "$forward_pid" 2>/dev/null || true
+    die "deployment test gate failed: local port $local_port did not become ready within 15 seconds"
+  fi
+  gate_rc=0
+  (cd "$ROOT" && go run ./cmd/attackbox-scenarios -target "https://127.0.0.1:$local_port" -self-signed \
+    -model "$model" -run-id "bootstrap-$commit" -output "$scenario_output") || gate_rc=$?
+  kill "$forward_pid" 2>/dev/null || true
+  wait "$forward_pid" 2>/dev/null || true
+  if [ "$gate_rc" != 0 ]; then
+    die "deployment test gate failed: scenario check exit $gate_rc; see $scenario_output or stderr above"
+  fi
+  [ -f "$scenario_output" ] || die "deployment test gate: scenario output file was not created"
+  chmod 0600 "$scenario_output"
+  ok "deployment test gate passed: all scenarios verified; manifest at $scenario_output"
+
   canaries
   st_set bootstrapped "$commit"
-  ok "bootstrap finished. Check New Relic for the six streams and the heartbeat, then: lockdown --console-confirmed"
+  ok "bootstrap finished. Check evidence streams and the heartbeat, then: lockdown --console-confirmed"
 )
+
 
 cmd_lockdown() {
   local ports ip fw p listeners
@@ -404,7 +413,7 @@ cmd_lockdown() {
   rm -f "$STATE_DIR/bootstrap" "$STATE_DIR/bootstrap.pub" "$STATE_DIR/hostkey" "$STATE_DIR/hostkey.pub" "$STATE_DIR/known_hosts"
   st_set locked yes
   ok "locked down: sshd off, SSH firewall rule and account SSH key deleted, local keys removed"
-  warn "next: confirm the heartbeat reaches New Relic from the sealed box, then: scripts/vultr-launch.sh open --yes"
+  warn "next: confirm the heartbeat and evidence streams are healthy, then: scripts/vultr-launch.sh open --yes"
 }
 
 cmd_open() {
@@ -454,7 +463,7 @@ cmd_kill() {
     api POST /snapshots "$(jq -n --arg i "$id" --arg d "forensic $(st label)" '{instance_id:$i,description:$d}')" >/dev/null
     ok "forensic snapshot requested. Do not download it"
   fi
-  warn "if telemetry looks malicious, also deactivate the New Relic ingest key"
+  warn "if telemetry looks malicious, also lock the decoy to prevent further evidence egress"
 }
 
 cmd_destroy() {

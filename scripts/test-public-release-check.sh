@@ -18,7 +18,7 @@ cp -- "$root/scripts/public-release-check.sh" "$tmp/scripts/"
 cat > "$tmp/bin/git" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-[[ -z ${VULTR_API_KEY:-}${NEW_RELIC_API_KEY:-}${ATTACKBOX_NR_LICENSE_KEY:-}${NEW_RELIC_LICENSE_KEY:-} ]] || { echo 'credentials leaked to child' >&2; exit 1; }
+[[ -z ${VULTR_API_KEY:-} ]] || { echo 'credentials leaked to child' >&2; exit 1; }
 case "$1 ${2:-}" in
   'rev-parse --verify') printf '%s\n' "$FAKE_SHA" ;;
   'rev-parse HEAD') printf '%s\n' "$FAKE_HEAD" ;;
@@ -31,7 +31,7 @@ EOF
 cat > "$tmp/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-[[ -z ${VULTR_API_KEY:-}${NEW_RELIC_API_KEY:-}${ATTACKBOX_NR_LICENSE_KEY:-}${NEW_RELIC_LICENSE_KEY:-} ]] || { echo 'credentials leaked to child' >&2; exit 1; }
+[[ -z ${VULTR_API_KEY:-} ]] || { echo 'credentials leaked to child' >&2; exit 1; }
 [[ ${1:-} == image && ${2:-} == inspect ]] || { printf 'unexpected docker call\n' >&2; exit 1; }
 printf '%s\n' "$FAKE_METADATA"
 EOF
@@ -39,7 +39,7 @@ chmod +x "$tmp/bin/git" "$tmp/bin/docker"
 export PATH="$tmp/bin:$PATH" FAKE_SHA=$sha FAKE_HEAD=$sha FAKE_GIT_DIR=$tmp/state
 export FAKE_METADATA="linux/amd64 65532:65532 [\"/attackbox-public\"] $image"
 export COMMIT=$sha PLATFORM=linux/amd64 APPROVE=$sha
-export VULTR_API_KEY=synthetic NEW_RELIC_API_KEY=synthetic ATTACKBOX_NR_LICENSE_KEY=synthetic NEW_RELIC_LICENSE_KEY=synthetic
+export VULTR_API_KEY=synthetic
 script=$tmp/scripts/public-release-check.sh
 checks=0
 expect_failure() {

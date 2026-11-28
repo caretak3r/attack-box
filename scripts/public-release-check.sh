@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
-unset VULTR_API_KEY NEW_RELIC_API_KEY ATTACKBOX_NR_LICENSE_KEY NEW_RELIC_LICENSE_KEY
+unset VULTR_API_KEY
 
 fail() { printf 'public-release: %s\n' "$*" >&2; exit 1; }
 hash_file() { shasum -a 256 "$1" | cut -d' ' -f1; }
