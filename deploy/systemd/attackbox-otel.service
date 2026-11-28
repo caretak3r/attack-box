@@ -8,8 +8,9 @@ Type=simple
 User=abx-otel
 Group=abx-otel
 EnvironmentFile=/etc/attackbox/monitoring.env
-LoadCredential=newrelic_license_key:/etc/attackbox/otel-license.key
 ExecStartPre=+/usr/local/libexec/attackbox-otel-sockets prepare
+StateDirectory=attackbox-evidence/otel
+StateDirectoryMode=0700
 ExecStart=/usr/local/bin/attackbox-otel --config=/etc/attackbox-otel/config.yaml
 ExecStartPost=+/usr/local/libexec/attackbox-otel-sockets ready
 UMask=0077
@@ -36,8 +37,9 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-# Full /proc and /sys read access is required for hostmetrics. No process scraper.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+IPAddressDeny=any
+IPAddressAllow=localhost
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 StandardOutput=journal

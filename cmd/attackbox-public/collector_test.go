@@ -68,17 +68,29 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer mock.Close()
-	if err := os.WriteFile(filepath.Join(dir, "newrelic_license_key"), []byte("validation-only"), 0600); err != nil {
-		t.Fatal(err)
-	}
 	original, err := os.ReadFile("../../deploy/public-otel/config.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	collectorConfig := strings.ReplaceAll(string(original), "/run/attackbox-public-otel/otlp.sock", cfg.socket)
-	collectorConfig = strings.ReplaceAll(collectorConfig, "https://otlp.nr-data.net:443", mock.URL)
 	collectorConfig = strings.ReplaceAll(collectorConfig, "127.0.0.1:13134", "127.0.0.1:0")
 	collectorConfig = strings.ReplaceAll(collectorConfig, "port: 8889", "port: 0")
+	// Replace file exporter with HTTP exporter for testing
+	collectorConfig = strings.ReplaceAll(collectorConfig, `exporters:
+  file/traces:
+    path: ${env:STATE_DIRECTORY}/traces.jsonl
+    format: json
+    flush_interval: 1s
+    rotation:
+      max_megabytes: 64
+      max_days: 30
+      max_backups: 60`, `exporters:
+  otlphttp:
+    endpoint: `+mock.URL+`
+    headers:
+      api-key: test-key
+    compression: gzip`)
+	collectorConfig = strings.ReplaceAll(collectorConfig, "exporters: [file/traces]", "exporters: [otlphttp]")
 	path := filepath.Join(dir, "public-config.yaml")
 	if err := os.WriteFile(path, []byte(collectorConfig), 0600); err != nil {
 		t.Fatal(err)
@@ -86,7 +98,7 @@ func TestGatewayThroughPublicCollector(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, binary, "--config="+path)
-	cmd.Env = append(os.Environ(), "CREDENTIALS_DIRECTORY="+dir, "ATTACKBOX_HOST_ID=test-host", "ATTACKBOX_HOST_NAME=test-name", "ATTACKBOX_CAMPAIGN_ID=test-campaign", "ATTACKBOX_PUBLIC_RELEASE_VERSION=test-release")
+	cmd.Env = append(os.Environ(), "STATE_DIRECTORY="+dir, "ATTACKBOX_HOST_ID=test-host", "ATTACKBOX_HOST_NAME=test-name", "ATTACKBOX_CAMPAIGN_ID=test-campaign", "ATTACKBOX_PUBLIC_RELEASE_VERSION=test-release")
 	var logs bytes.Buffer
 	cmd.Stdout = &logs
 	cmd.Stderr = &logs

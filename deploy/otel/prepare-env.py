@@ -47,19 +47,14 @@ def shipper_environment(values):
     return "".join(f"{name}={value}\n" for name, value in rows.items())
 
 
-def validate_license(text):
-    if not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", text):
-        raise ValueError("invalid license key format: use exact key bytes with no trailing newline")
 
 
 def main(args):
-    identities, license_key, output = map(pathlib.Path, args)
-    for path in (identities, license_key):
-        st = path.lstat()
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o600:
-            raise ValueError(f"{path}: requires root-owned regular file, mode 0600")
+    identities, output = map(pathlib.Path, args)
+    st = identities.lstat()
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or stat.S_IMODE(st.st_mode) != 0o600:
+        raise ValueError(f"{identities}: requires root-owned regular file, mode 0600")
     values = parse_identities(identities.read_text())
-    validate_license(license_key.read_text())
     with output.open("x") as target:
         target.write(shipper_environment(values))
 

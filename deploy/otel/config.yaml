@@ -133,28 +133,22 @@ processors:
       - {key: service.instance.id, value: '${env:ATTACKBOX_OTEL_INSTANCE_ID}', action: upsert}
 
 exporters:
-  otlp_http/newrelic:
-    endpoint: https://otlp.nr-data.net:443
-    headers:
-      api-key: ${file:${env:CREDENTIALS_DIRECTORY}/newrelic_license_key}
-    compression: gzip
-    timeout: 10s
-    retry_on_failure:
-      enabled: true
-      initial_interval: 1s
-      max_interval: 30s
-      max_elapsed_time: 300s
-    sending_queue:
-      enabled: true
-      num_consumers: 2
-      sizer: bytes
-      queue_size: 16777216
-      block_on_overflow: false
-      batch:
-        flush_timeout: 1s
-        min_size: 65536
-        max_size: 900000
-        sizer: bytes
+  file/traces:
+    path: ${env:STATE_DIRECTORY}/traces.jsonl
+    format: json
+    flush_interval: 1s
+    rotation:
+      max_megabytes: 64
+      max_days: 30
+      max_backups: 60
+  file/metrics:
+    path: ${env:STATE_DIRECTORY}/metrics.jsonl
+    format: json
+    flush_interval: 1s
+    rotation:
+      max_megabytes: 64
+      max_days: 30
+      max_backups: 60
 
 extensions:
   # Process health only. It does not prove export or New Relic ingestion.
@@ -179,16 +173,16 @@ service:
     traces/bait:
       receivers: [otlp/bait]
       processors: [memory_limiter, filter/bait, filter/traces, transform/bait, transform/traces]
-      exporters: [otlp_http/newrelic]
+      exporters: [file/traces]
     traces/shipper:
       receivers: [otlp/shipper]
       processors: [memory_limiter, filter/shipper, filter/traces, transform/shipper, transform/traces]
-      exporters: [otlp_http/newrelic]
+      exporters: [file/traces]
     metrics/coverage:
       receivers: [prometheus/coverage]
       processors: [memory_limiter, transform/host, resource/coverage]
-      exporters: [otlp_http/newrelic]
+      exporters: [file/metrics]
     metrics/collector:
       receivers: [prometheus/collector]
       processors: [memory_limiter, transform/host, resource/collector]
-      exporters: [otlp_http/newrelic]
+      exporters: [file/metrics]

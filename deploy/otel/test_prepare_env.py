@@ -38,11 +38,6 @@ class IdentityContract(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 module.parse_identities(self.text(ATTACKBOX_BAIT_INSTANCE_ID=value))
 
-    def test_license_exact_bytes(self):
-        module.validate_license("a" * 16)
-        for text in ("a" * 16 + "\n", "a" * 16 + "\r\n", " " + "a" * 16, "short"):
-            with self.subTest(text=text), self.assertRaises(ValueError):
-                module.validate_license(text)
 
     def test_optional_container(self):
         module.parse_identities(self.text(ATTACKBOX_BAIT_CONTAINER_ID=""))

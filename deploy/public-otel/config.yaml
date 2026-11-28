@@ -92,22 +92,14 @@ processors:
       - set(span.trace_state, "")
 
 exporters:
-  otlp_http/newrelic:
-    endpoint: https://otlp.nr-data.net:443
-    headers:
-      api-key: ${file:${env:CREDENTIALS_DIRECTORY}/newrelic_license_key}
-    compression: gzip
-    timeout: 10s
-    retry_on_failure:
-      enabled: true
-      initial_interval: 1s
-      max_interval: 30s
-      max_elapsed_time: 300s
-    sending_queue:
-      enabled: true
-      num_consumers: 2
-      sizer: bytes
-      queue_size: 16777216
+  file/traces:
+    path: ${env:STATE_DIRECTORY}/traces.jsonl
+    format: json
+    flush_interval: 1s
+    rotation:
+      max_megabytes: 64
+      max_days: 30
+      max_backups: 60
 
 extensions:
   health_check:
@@ -130,4 +122,4 @@ service:
     traces/public:
       receivers: [otlp/public]
       processors: [memory_limiter, filter/public, transform/public]
-      exporters: [otlp_http/newrelic]
+      exporters: [file/traces]

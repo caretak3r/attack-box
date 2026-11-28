@@ -1,13 +1,12 @@
 package publicotel_test
 
 import (
+	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
-	"io"
+	"encoding/base64"
+	"encoding/hex"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +20,7 @@ import (
 	trace "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -34,46 +34,11 @@ func TestPublicCollectorSanitizesAndBindsIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	got := make(chan *collector.ExportTraceServiceRequest, 8)
-	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body io.Reader = r.Body
-		if r.Header.Get("Content-Encoding") == "gzip" {
-			z, err := gzip.NewReader(r.Body)
-			if err != nil {
-				t.Error(err)
-				w.WriteHeader(400)
-				return
-			}
-			defer z.Close()
-			body = z
-		}
-		data, err := io.ReadAll(io.LimitReader(body, 1000001))
-		if err != nil || len(data) >= 1000000 {
-			t.Error("invalid export body")
-			w.WriteHeader(400)
-			return
-		}
-		if r.URL.Path == "/v1/traces" {
-			msg := new(collector.ExportTraceServiceRequest)
-			if err := proto.Unmarshal(data, msg); err != nil {
-				t.Error(err)
-				w.WriteHeader(400)
-				return
-			}
-			got <- msg
-		}
-		w.Header().Set("Content-Type", "application/x-protobuf")
-	}))
-	defer mock.Close()
-	if err := os.WriteFile(filepath.Join(dir, "newrelic_license_key"), []byte("validation-only"), 0600); err != nil {
-		t.Fatal(err)
-	}
 	original, err := os.ReadFile("config.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg := strings.ReplaceAll(string(original), "/run/attackbox-public-otel", dir)
-	cfg = strings.ReplaceAll(cfg, "https://otlp.nr-data.net:443", mock.URL)
 	cfg = strings.ReplaceAll(cfg, "127.0.0.1:13134", "127.0.0.1:0")
 	cfg = strings.ReplaceAll(cfg, "port: 8889", "port: 0")
 	path := filepath.Join(dir, "config.yaml")
@@ -83,7 +48,7 @@ func TestPublicCollectorSanitizesAndBindsIdentity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, binary, "--config="+path)
-	cmd.Env = append(os.Environ(), "CREDENTIALS_DIRECTORY="+dir, "ATTACKBOX_HOST_ID=trusted-host", "ATTACKBOX_HOST_NAME=trusted-name", "ATTACKBOX_CAMPAIGN_ID=trusted-campaign", "ATTACKBOX_PUBLIC_RELEASE_VERSION=test-release")
+	cmd.Env = append(os.Environ(), "STATE_DIRECTORY="+dir, "ATTACKBOX_HOST_ID=trusted-host", "ATTACKBOX_HOST_NAME=trusted-name", "ATTACKBOX_CAMPAIGN_ID=trusted-campaign", "ATTACKBOX_PUBLIC_RELEASE_VERSION=test-release")
 	var logs bytes.Buffer
 	cmd.Stdout = &logs
 	cmd.Stderr = &logs
@@ -98,7 +63,7 @@ func TestPublicCollectorSanitizesAndBindsIdentity(t *testing.T) {
 		}
 	}()
 	socket := filepath.Join(dir, "otlp.sock")
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		if st, err := os.Stat(socket); err == nil && st.Mode()&os.ModeSocket != 0 {
 			break
 		}
@@ -171,74 +136,118 @@ func TestPublicCollectorSanitizesAndBindsIdentity(t *testing.T) {
 	if _, err := collector.NewTraceServiceClient(conn).Export(ctx, input); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case result := <-got:
-		wire, err := proto.Marshal(result)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if bytes.Contains(wire, []byte("private-marker")) || bytes.Contains(wire, []byte("198.51.100.2")) || bytes.Contains(wire, []byte("2001:db8::1")) {
-			t.Fatal("unapproved request or health data reached the exporter")
-		}
-		seen := make(map[byte]bool)
-		for _, rs := range result.ResourceSpans {
-			attrs := make(map[string]string)
-			for _, a := range rs.Resource.Attributes {
-				attrs[a.Key] = a.Value.GetStringValue()
+	tracesFile := filepath.Join(dir, "traces.jsonl")
+	var result *collector.ExportTraceServiceRequest
+	for range 200 {
+		if st, err := os.Stat(tracesFile); err == nil && st.Size() > 0 {
+			data, err := os.ReadFile(tracesFile)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if attrs["host.id"] != "trusted-host" || attrs["service.instance.id"] != attrs["service.name"] || attrs["service.version"] != "test-release" {
-				t.Fatalf("invalid trusted identity: %v", attrs)
+			scanner := bufio.NewScanner(bytes.NewReader(data))
+			for scanner.Scan() {
+				line := scanner.Bytes()
+				if len(line) == 0 {
+					continue
+				}
+				// OTLP/JSON encodes trace/span IDs as hex; protojson expects base64
+				line = bytes.ReplaceAll(line, []byte(`"traceId":"`), []byte(`"traceId":"__HEX__`))
+				line = bytes.ReplaceAll(line, []byte(`"spanId":"`), []byte(`"spanId":"__HEX__`))
+				line = bytes.ReplaceAll(line, []byte(`"parentSpanId":"`), []byte(`"parentSpanId":"__HEX__`))
+				hexPrefix := []byte(`"__HEX__`)
+				for {
+					idx := bytes.Index(line, hexPrefix)
+					if idx < 0 {
+						break
+					}
+					start := idx + len(hexPrefix)
+					end := start
+					for end < len(line) && line[end] != '"' {
+						end++
+					}
+					hexStr := line[start:end]
+					decoded, _ := hex.DecodeString(string(hexStr))
+					b64 := base64.StdEncoding.EncodeToString(decoded)
+					line = append(line[:idx], append([]byte(`"`+b64), line[end:]...)...)
+				}
+				result = &collector.ExportTraceServiceRequest{}
+				if err := protojson.Unmarshal(line, result); err != nil {
+					t.Fatalf("invalid OTLP JSON: %v", err)
+				}
+				break
 			}
-			for _, ss := range rs.ScopeSpans {
-				for _, s := range ss.Spans {
-					if len(s.SpanId) != 8 || len(s.Events) != 0 || len(s.Links) != 0 || s.TraceState != "" || s.Status.GetMessage() != "" {
-						t.Fatal("untrusted trace metadata survived")
-					}
-					seen[s.SpanId[0]] = true
-					if s.Name == "public.request" {
-						var peer string
-						for _, field := range s.Attributes {
-							if field.Key == "client.address" {
-								peer = field.Value.GetStringValue()
-							}
-						}
-						if peer != "192.0.2.1" {
-							t.Error("exporter lost the approved request peer")
-						}
-					}
-					if s.Name == "public.health" {
-						for _, field := range s.Attributes {
-							switch field.Key {
-							case "server.port", "attackbox.accepted_requests", "attackbox.rate_limited_requests", "attackbox.pre_http_connections", "attackbox.rejected_connections", "attackbox.captured_requests", "attackbox.capture_dropped", "attackbox.otel_dropped_spans_total", "attackbox.otel_export_failed_spans_total":
-							default:
-								t.Errorf("request data on health span: %s", field.Key)
-							}
-						}
-					}
-					if s.Name == "public.connection" {
-						fields := make(map[string]string)
-						for _, field := range s.Attributes {
-							switch field.Key {
-							case "server.port", "client.address", "attackbox.connection.outcome", "attackbox.tls.sni":
-								fields[field.Key] = field.Value.GetStringValue()
-							default:
-								t.Errorf("unapproved field on connection span: %s", field.Key)
-							}
-						}
-						if fields["client.address"] != "192.0.2.7" || fields["attackbox.connection.outcome"] != "tls_failed" || fields["attackbox.tls.sni"] != "other" {
-							t.Errorf("exporter lost approved connection fields: %v", fields)
+			if result != nil {
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if result == nil {
+		t.Fatal("no OTLP export before timeout")
+	}
+	wire, err := proto.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(wire, []byte("private-marker")) || bytes.Contains(wire, []byte("198.51.100.2")) || bytes.Contains(wire, []byte("2001:db8::1")) {
+		t.Fatal("unapproved request or health data reached the exporter")
+	}
+	seen := make(map[byte]bool)
+	for _, rs := range result.ResourceSpans {
+		attrs := make(map[string]string)
+		for _, a := range rs.Resource.Attributes {
+			attrs[a.Key] = a.Value.GetStringValue()
+		}
+		if attrs["host.id"] != "trusted-host" || attrs["service.instance.id"] != attrs["service.name"] || attrs["service.version"] != "test-release" {
+			t.Fatalf("invalid trusted identity: %v", attrs)
+		}
+		for _, ss := range rs.ScopeSpans {
+			for _, s := range ss.Spans {
+				if len(s.SpanId) != 8 || len(s.Events) != 0 || len(s.Links) != 0 || s.TraceState != "" || s.Status.GetMessage() != "" {
+					t.Fatal("untrusted trace metadata survived")
+				}
+				seen[s.SpanId[0]] = true
+				if s.Name == "public.request" {
+					var peer string
+					for _, field := range s.Attributes {
+						if field.Key == "client.address" {
+							peer = field.Value.GetStringValue()
 						}
 					}
-					if (s.Name == "public.request" || s.Name == "public.rpc") && s.Kind != trace.Span_SPAN_KIND_SERVER {
-						t.Fatal("server span kind not normalized")
+					if peer != "192.0.2.1" {
+						t.Error("exporter lost the approved request peer")
 					}
+				}
+				if s.Name == "public.health" {
+					for _, field := range s.Attributes {
+						switch field.Key {
+						case "server.port", "attackbox.accepted_requests", "attackbox.rate_limited_requests", "attackbox.pre_http_connections", "attackbox.rejected_connections", "attackbox.captured_requests", "attackbox.capture_dropped", "attackbox.otel_dropped_spans_total", "attackbox.otel_export_failed_spans_total":
+						default:
+							t.Errorf("request data on health span: %s", field.Key)
+						}
+					}
+				}
+				if s.Name == "public.connection" {
+					fields := make(map[string]string)
+					for _, field := range s.Attributes {
+						switch field.Key {
+						case "server.port", "client.address", "attackbox.connection.outcome", "attackbox.tls.sni":
+							fields[field.Key] = field.Value.GetStringValue()
+						default:
+							t.Errorf("unapproved field on connection span: %s", field.Key)
+						}
+					}
+					if fields["client.address"] != "192.0.2.7" || fields["attackbox.connection.outcome"] != "tls_failed" || fields["attackbox.tls.sni"] != "other" {
+						t.Errorf("exporter lost approved connection fields: %v", fields)
+					}
+				}
+				if (s.Name == "public.request" || s.Name == "public.rpc") && s.Kind != trace.Span_SPAN_KIND_SERVER {
+					t.Fatal("server span kind not normalized")
 				}
 			}
 		}
-		if len(seen) != 5 || !seen[1] || !seen[5] || !seen[30] || !seen[40] || !seen[41] {
-			t.Fatalf("wrong accepted spans: %v", seen)
-		}
-	case <-ctx.Done():
-		t.Fatal("no sanitized export before timeout")
+	}
+	if len(seen) != 5 || !seen[1] || !seen[5] || !seen[30] || !seen[40] || !seen[41] {
+		t.Fatalf("wrong accepted spans: %v", seen)
 	}
 }
