@@ -70,9 +70,12 @@ answers:
 			return gatewayIdentity(model)
 		}
 	}
+	if detectIntent(p) == "prompt_extract" {
+		return intentAnswer(model, p, "prompt_extract")
+	}
 	if m := gatewaySayRE.FindStringSubmatch(p); m != nil {
 		text := strings.Trim(gatewaySayEndRE.ReplaceAllString(strings.TrimRight(m[1], " ."), ""), punctuation)
-		if gatewaySayTextRE.MatchString(text) && !gatewaySayOpenRE.MatchString(text) {
+		if gatewaySayTextRE.MatchString(text) && !gatewaySayOpenRE.MatchString(text) && !credentialLike(text) {
 			return text
 		}
 	}
@@ -98,7 +101,26 @@ answers:
 		}
 		return fmt.Sprintf("%d %s %d = %d", a, m[2], b, sum)
 	}
+	if intent := detectIntent(p); intent != "" && intent != "prompt_extract" {
+		if reply := intentAnswer(model, p, intent); reply != "" {
+			return reply
+		}
+	}
 	return gatewayFallback
+}
+
+func credentialLike(s string) bool {
+	if strings.HasPrefix(s, "sk-") || strings.HasPrefix(s, "AKIA") || strings.HasPrefix(s, "ghp_") {
+		return true
+	}
+	if strings.HasPrefix(strings.ToLower(s), "xox") && len(s) > 10 {
+		return true
+	}
+	parts := strings.Split(s, ".")
+	if len(parts) == 3 && len(parts[0]) > 10 && len(parts[1]) > 10 && len(parts[2]) > 10 {
+		return true
+	}
+	return false
 }
 
 // gatewayIdentity is how the model family of a name usually describes itself.
