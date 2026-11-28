@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Local live-server smoke test. Builds the release binary, starts all three
-# personas on loopback with New Relic disabled, and checks each persona and
-# its streaming format. It makes no request to any non-loopback host.
+# personas on loopback, and checks each persona and its streaming format.
+# It makes no request to any non-loopback host.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -30,8 +30,7 @@ fail() {
 echo "smoke: building release binary"
 (cd "$root" && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w -X main.version=smoke' -o "$work/attackbox" ./cmd/attackbox)
 
-ATTACKBOX_NR_DISABLED=true \
-	ATTACKBOX_OPENAI_ADDR="127.0.0.1:$openai_port" \
+ATTACKBOX_OPENAI_ADDR="127.0.0.1:$openai_port" \
 	ATTACKBOX_VLLM_ADDR="127.0.0.1:$vllm_port" \
 	ATTACKBOX_OLLAMA_ADDR="127.0.0.1:$ollama_port" \
 	ATTACKBOX_HOLD_SILENT=1s ATTACKBOX_IDLE_INTERVAL=200ms ATTACKBOX_MAX_STREAM=5s \

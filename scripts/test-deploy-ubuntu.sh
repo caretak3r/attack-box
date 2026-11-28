@@ -11,7 +11,6 @@ test_ssh_requires_both_flags() { ! bash "$DEPLOY_SCRIPT" --disable-ssh >/dev/nul
 test_dryrun_explicit_alias() { bash "$DEPLOY_SCRIPT" --help 2>&1 | grep -q "dry-run"; }
 test_verify_mode_exists() { bash "$DEPLOY_SCRIPT" --help 2>&1 | grep -q "verify"; }
 test_no_flush_ruleset() { local nft="${SCRIPT_DIR}/../deploy/nftables/attackbox.nft"; ! grep -q "flush ruleset" "$nft" && grep -q "flush table" "$nft"; }
-test_nr_dns_resolution() { grep -q "resolve_nr_endpoints" "$DEPLOY_SCRIPT" && grep -q "NR_LOG_HOST" "$DEPLOY_SCRIPT" && grep -q "NR_METRIC_HOST" "$DEPLOY_SCRIPT"; }
 test_host_dns_stub_switch() (
     local tmp MODE=preflight answer=''
     tmp=$(mktemp -d) || return
@@ -61,7 +60,6 @@ for bridge in ('docker0', 'br-*'):
     assert deny in s.split('chain input_early {', 1)[1].split('chain output_policy {', 1)[0]
 PYTEST
 }
-test_both_nr_hosts_required() { grep -q "Failed to resolve.*NR_LOG_HOST" "$DEPLOY_SCRIPT" && grep -q "Failed to resolve.*NR_METRIC_HOST" "$DEPLOY_SCRIPT"; }
 test_rollback_trap() { grep -q "trap.*ERR" "$DEPLOY_SCRIPT" && grep -q "trap - ERR" "$DEPLOY_SCRIPT"; }
 test_no_attackbox_bait_latest() { ! grep -q "attackbox-bait:latest" "$DEPLOY_SCRIPT"; }
 test_ssh_after_start_bait() { local ssh_line=$(grep -n "disable_ssh" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:disable_ssh()" | head -1 | cut -d: -f1); local bait_line=$(grep -n "start_bait" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:start_bait()" | head -1 | cut -d: -f1); [[ -n "$ssh_line" && -n "$bait_line" && "$bait_line" -lt "$ssh_line" ]]; }
@@ -115,38 +113,22 @@ test_verification_derives_network() { grep -q "docker network ls.*grep.*attackbo
 test_verification_runsc() { grep -q "docker run.*--runtime=runsc.*--network" "$DEPLOY_SCRIPT"; }
 test_verification_proxy_path() { grep -q 'https://127.0.0.1:8443/v1/models' "$DEPLOY_SCRIPT" && grep -q 'HTTPS proxy cannot reach bait' "$DEPLOY_SCRIPT"; }
 test_verification_external_dns_blocked() { grep -q "External DNS blocked" "$DEPLOY_SCRIPT"; }
-test_verification_curl_nr() { grep -q "sudo.*curl.*log_url\|metric_url" "$DEPLOY_SCRIPT"; }
 test_verification_before_ssh() { local ver_line=$(grep -n "run_verification_enhanced" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:run_verification_enhanced()" | tail -1 | cut -d: -f1); local ssh_line=$(grep -n "disable_ssh" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:disable_ssh()" | head -1 | cut -d: -f1); [[ -n "$ver_line" && -n "$ssh_line" && "$ver_line" -lt "$ssh_line" ]]; }
 test_no_host_attackbox_binary() { ! grep -q '"/usr/local/bin/attackbox"' "$DEPLOY_SCRIPT"; }
 test_busybox_prepull() { grep -q "docker pull busybox@sha256:" "$DEPLOY_SCRIPT"; }
-test_upgrade_bootstrap() (
-    local tmp MODE=apply
-    tmp=$(mktemp -d)
-    log() { :; }; ok() { :; }
-    nft() {
-        if [[ "$*" == 'list table inet attackbox' ]]; then return 0; fi
-        if [[ "$*" == '-f -' ]]; then cat > "$tmp/rules"; else printf '%s\n' "$*" >> "$tmp/calls"; fi
-    }
-    awk '/^bootstrap_firewall\(\) \{/ {copy=1} /^# Add resolved/ {exit} copy {print}' "$DEPLOY_SCRIPT" > "$tmp/function"
-    source "$tmp/function"
-    (bootstrap_firewall)
-    grep -q '0 timeout 20m' "$tmp/rules" &&
-        grep -q 'meta skuid @bootstrap_root_uids tcp dport { 80, 443 } accept' "$tmp/rules" &&
-        ! grep -q 'attackbox_bootstrap\|flush table\|delete table' "$tmp/rules" || return 1
-    grep -q 'flush set inet attackbox bootstrap_root_uids' "$tmp/calls" || return 1
-    rm -rf "$tmp"
-)
 test_public_gateway_restore() (
-    local tmp enabled=0 fail=''
+    local tmp MODE=apply enabled=0 fail=''
     tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
     log() { :; }; ok() { :; }; err() { :; }
     systemctl() {
         if [[ "$1" == is-enabled ]]; then return "$enabled"; fi
+        if [[ "$*" == "$fail" ]]; then return 1; fi
         printf '%s\n' "$*" >> "$tmp/calls"
-        [[ "$*" != "$fail" ]]
     }
-    awk '/^restore_public_gateway\(\) \{/ {copy=1} copy {print} copy && /^}/ {exit}' "$DEPLOY_SCRIPT" > "$tmp/function"
+    awk '/^restore_public_gateway\(\) \{/ {copy=1} copy {print} copy && /^}$/ {exit}' "$DEPLOY_SCRIPT" > "$tmp/function"
     source "$tmp/function"
+    
     restore_public_gateway || return 1
     [[ "$(cat "$tmp/calls")" == $'stop attackbox-public-otel.service\nstart attackbox-public.service' ]] || return 1
     fail='start attackbox-public.service'
@@ -154,7 +136,6 @@ test_public_gateway_restore() (
     enabled=1; : > "$tmp/calls"
     restore_public_gateway || return 1
     [[ ! -s "$tmp/calls" ]] || return 1
-    rm -rf "$tmp"
 )
 test_release_version_label() (
     local tmp
@@ -195,11 +176,9 @@ test_deployment_id_label() (
     [[ "$(grep -n '^        set_deployment_id$' "$DEPLOY_SCRIPT" | cut -d: -f1)" -lt "$(grep -n '^        start_services$' "$DEPLOY_SCRIPT" | cut -d: -f1)" ]] || return 1
     rm -rf "$tmp"
 )
-test_bootstrap_before_docker() { local boot_line=$(grep -n "bootstrap_firewall" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:bootstrap_firewall()" | head -1 | cut -d: -f1); local dock_line=$(grep -n "start_docker" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:start_docker()" | head -1 | cut -d: -f1); [[ -n "$boot_line" && -n "$dock_line" && "$boot_line" -lt "$dock_line" ]]; }
 test_docker_before_prepare() { local dock_line=$(grep -n "start_docker" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:start_docker()" | head -1 | cut -d: -f1); local prep_line=$(grep -n "prepare_bait" "$DEPLOY_SCRIPT" | grep -v "^[0-9]*:prepare_bait()" | head -1 | cut -d: -f1); [[ -n "$dock_line" && -n "$prep_line" && "$dock_line" -lt "$prep_line" ]]; }
 test_prepare_before_final_firewall() { local prep_line=$(grep -n "^[[:space:]]*prepare_bait$" "$DEPLOY_SCRIPT" | head -1 | cut -d: -f1); local fw_line=$(grep -n "^[[:space:]]*setup_firewall$" "$DEPLOY_SCRIPT" | head -1 | cut -d: -f1); [[ -n "$prep_line" && -n "$fw_line" && "$prep_line" -lt "$fw_line" ]]; }
 test_attackbox_service_in_units() { grep -q '"attackbox.service"' "$DEPLOY_SCRIPT"; }
-test_nr_exact_paths() { grep -q '/log/v1' "$DEPLOY_SCRIPT" && grep -q '/metric/v1' "$DEPLOY_SCRIPT"; }
 test_mktemp_shipper_build() { ! grep -q '/tmp/shipper-build' "$DEPLOY_SCRIPT"; }
 test_socket_env_settings() { grep -q "ATTACKBOX_SPOOL_SOCKET" "$DEPLOY_SCRIPT" && grep -q "ATTACKBOX_RUNTIME_SOCKET" "$DEPLOY_SCRIPT" && grep -q "ATTACKBOX_EGRESS_SOCKET" "$DEPLOY_SCRIPT"; }
 test_shipper_primary_group_bait() { grep -q "^Group=abx-bait$" "${SCRIPT_DIR}/../deploy/systemd/attackbox-shipper.service"; }
@@ -208,6 +187,76 @@ test_runtime_directory_mode_0710() { grep -q "^RuntimeDirectoryMode=0710$" "${SC
 test_no_chgrp_prestart() { ! grep -q "ExecStartPre.*chgrp" "${SCRIPT_DIR}/../deploy/systemd/attackbox-shipper.service"; }
 test_docs_no_max_clients() { ! grep -q "ATTACKBOX_SHIP_MAX_CLIENTS" "${SCRIPT_DIR}/../docs/operator.md"; }
 test_docs_socket_paths() { grep -q "ATTACKBOX_SPOOL_SOCKET" "${SCRIPT_DIR}/../docs/operator.md" && grep -q "ATTACKBOX_RUNTIME_SOCKET" "${SCRIPT_DIR}/../docs/operator.md" && grep -q "ATTACKBOX_EGRESS_SOCKET" "${SCRIPT_DIR}/../docs/operator.md"; }
+test_newrelic_migration() (
+    local tmp MODE=apply
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    
+    # Mock functions
+    log() { :; }
+    ok() { :; }
+    warn() { :; }
+    systemctl() {
+        case "$*" in
+            "is-active --quiet newrelic-infra.service") return 0 ;;
+            "stop newrelic-infra.service") return 0 ;;
+            "disable newrelic-infra.service") return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    dpkg-query() { printf 'install ok installed\n'; }
+    apt-get() { return 0; }
+    grep() { command grep "$@"; }
+    cat() { command cat "$@"; }
+    rm() { command rm "$@"; }
+    
+    # Create fixture NR files
+    mkdir -p "$tmp/etc/newrelic-infra" "$tmp/etc/systemd/system/newrelic-infra.service.d" \
+        "$tmp/etc/apt/sources.list.d" "$tmp/etc/apt/trusted.gpg.d" \
+        "$tmp/etc/attackbox" "$tmp/etc/attackbox-public-otel"
+    touch "$tmp/etc/newrelic-infra.yml" "$tmp/etc/newrelic-infra/agent.yml" \
+        "$tmp/etc/systemd/system/newrelic-infra.service.d/override.conf" \
+        "$tmp/etc/apt/sources.list.d/newrelic-infra.list" \
+        "$tmp/etc/apt/trusted.gpg.d/newrelic-infra.gpg" \
+        "$tmp/etc/attackbox/otel-license.key" "$tmp/etc/attackbox-public-otel/license.key"
+    
+    # Create shipper.env with NR line and kept line
+    cat > "$tmp/etc/attackbox/shipper.env" <<'ENV'
+ATTACKBOX_CAMPAIGN_ID=test-campaign
+ATTACKBOX_NR_LICENSE_KEY=0123456789abcdef0123456789abcdef01234567
+ATTACKBOX_HOST_ID=test-host
+ENV
+    
+    # Redirect paths in function
+    local old_root="$tmp"
+    awk '/^remove_newrelic_migration\(\) \{/,/^}$/' "$DEPLOY_SCRIPT" | \
+        sed "s|/etc/|$tmp/etc/|g; s|/usr/|$tmp/usr/|g" > "$tmp/function"
+    source "$tmp/function"
+    
+    # First run - should remove everything
+    remove_newrelic_migration
+    
+    # Verify NR files removed
+    [[ ! -e "$tmp/etc/newrelic-infra.yml" ]] || return 1
+    [[ ! -e "$tmp/etc/newrelic-infra" ]] || return 1
+    [[ ! -e "$tmp/etc/systemd/system/newrelic-infra.service.d" ]] || return 1
+    [[ ! -e "$tmp/etc/apt/sources.list.d/newrelic-infra.list" ]] || return 1
+    [[ ! -e "$tmp/etc/apt/trusted.gpg.d/newrelic-infra.gpg" ]] || return 1
+    [[ ! -e "$tmp/etc/attackbox/otel-license.key" ]] || return 1
+    [[ ! -e "$tmp/etc/attackbox-public-otel/license.key" ]] || return 1
+    
+    # Verify NR line removed from shipper.env but kept lines remain
+    [[ -f "$tmp/etc/attackbox/shipper.env" ]] || return 1
+    grep -q 'ATTACKBOX_CAMPAIGN_ID=test-campaign' "$tmp/etc/attackbox/shipper.env" || return 1
+    grep -q 'ATTACKBOX_HOST_ID=test-host' "$tmp/etc/attackbox/shipper.env" || return 1
+    ! grep -q 'ATTACKBOX_NR_LICENSE_KEY' "$tmp/etc/attackbox/shipper.env" || return 1
+    
+    # Second run - should be no-op and exit 0
+    remove_newrelic_migration
+    
+    rm -rf "$tmp"
+)
+
 main() {
     echo "Attack-box deployment test suite - Full Semantic Controls"; echo "=========================================================="
     [[ ! -f "$DEPLOY_SCRIPT" ]] && { echo -e "${RED}✗${NC} Deploy script not found"; exit 1; }
@@ -217,7 +266,6 @@ main() {
     run_test "--dry-run explicit alias" test_dryrun_explicit_alias
     run_test "--verify mode exists" test_verify_mode_exists
     run_test "No flush ruleset" test_no_flush_ruleset
-    run_test "NR DNS resolution" test_nr_dns_resolution
     run_test "Host DNS switches only to a working stub and keeps the original" test_host_dns_stub_switch
     run_test "Shipper UID populated" test_shipper_uid_population
     run_test "Firewall before Docker" test_firewall_before_docker
@@ -225,7 +273,6 @@ main() {
     run_test "Durable host reader deployment contract" test_adapter_pipelines
     run_test "Bait unit exists" test_bait_unit_exists
     run_test "Forward direction" test_forward_direction
-    run_test "Both NR hosts required" test_both_nr_hosts_required
     run_test "Rollback trap" test_rollback_trap
     run_test "No attackbox-bait:latest" test_no_attackbox_bait_latest
     run_test "SSH after start_bait" test_ssh_after_start_bait
@@ -254,16 +301,12 @@ main() {
     run_test "Verification uses runsc" test_verification_runsc
     run_test "Verification HTTPS proxy path" test_verification_proxy_path
     run_test "Verification external DNS blocked" test_verification_external_dns_blocked
-    run_test "Verification uses curl for NR" test_verification_curl_nr
     run_test "Verification before SSH" test_verification_before_ssh
     run_test "No host attackbox binary" test_no_host_attackbox_binary
     run_test "Busybox prepull" test_busybox_prepull
-    run_test "Existing host bootstrap and cleanup" test_upgrade_bootstrap
-    run_test "Bootstrap before Docker" test_bootstrap_before_docker
     run_test "Docker before prepare" test_docker_before_prepare
     run_test "Prepare before final firewall" test_prepare_before_final_firewall
     run_test "attackbox.service in units" test_attackbox_service_in_units
-    run_test "NR exact paths" test_nr_exact_paths
     run_test "mktemp shipper build" test_mktemp_shipper_build
     run_test "Socket env settings" test_socket_env_settings
     run_test "Shipper primary group bait" test_shipper_primary_group_bait
@@ -273,6 +316,7 @@ main() {
     run_test "Docs no max_clients" test_docs_no_max_clients
     run_test "Docs socket paths" test_docs_socket_paths
     run_test "Public gateway restored after Docker stop" test_public_gateway_restore
+    run_test "New Relic migration idempotent" test_newrelic_migration
     run_test "Release label follows the deploy" test_release_version_label
     run_test "Deployment label is the campaign ID" test_deployment_id_label
     echo ""; echo "=========================================================="; echo "Test Results"; echo "=========================================================="

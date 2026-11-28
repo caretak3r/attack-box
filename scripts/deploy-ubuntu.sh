@@ -17,14 +17,11 @@ readonly SPOOL_SOCKET="/run/attackbox/spool.sock"
 readonly SECRETS_DIR="/opt/attackbox/secrets"
 readonly REFRESH_BIN="/usr/local/sbin/attackbox-deploy"
 readonly QUEUE_DIR="/var/lib/attackbox-shipper/queue"
-readonly NR_LOG_HOST="log-api.newrelic.com"
-readonly NR_METRIC_HOST="metric-api.newrelic.com"
 
 # Flags
 MODE="preflight"
 DISABLE_SSH=false
 CONSOLE_CONFIRMED=false
-NATIVE_KEY_STDIN=false
 
 # Colors for output
 readonly RED='\033[0;31m'
@@ -43,11 +40,9 @@ Default: non-destructive preflight (no mutations).
 Options:
     --apply                  Apply changes (mutations)
     --dry-run                Explicit preflight (same as default, no mutations)
-    --verify                 Real validation: proxy/bait metadata, DNS/NTP, NR endpoints
+    --verify                 Real validation: proxy/bait metadata, DNS/NTP, evidence directories
                              (requires Linux with Docker + gVisor; reports prerequisites)
-    --refresh-install-sets   Populate expiring official New Relic installation destinations
-    --native-key-stdin       Read the provisioning User API key from stdin (apply only)
-    --refresh-sets           Re-resolve NR/Ubuntu endpoints into the nftables sets
+    --refresh-sets           Re-resolve Ubuntu endpoints into the nftables sets
                              (run by attackbox-nft-refresh.timer; needs the table loaded)
     --disable-ssh            Mark SSH for disablement (needs --console-confirmed)
     --console-confirmed      Confirm console access verified (needs --disable-ssh)
@@ -82,8 +77,6 @@ while [[ $# -gt 0 ]]; do
         --apply) MODE="apply"; shift ;;
         --dry-run) MODE="preflight"; shift ;;
         --verify) MODE="verify"; shift ;;
-        --native-key-stdin) NATIVE_KEY_STDIN=true; shift ;;
-        --refresh-install-sets) MODE="refresh-install"; shift ;;
         --refresh-sets) MODE="refresh"; shift ;;
         --disable-ssh) DISABLE_SSH=true; shift ;;
         --console-confirmed) CONSOLE_CONFIRMED=true; shift ;;
@@ -257,6 +250,7 @@ setup_directories() {
     local dirs=(
         "/run/attackbox:2710:$SHIP_USER:$BAIT_USER"
         "$QUEUE_DIR:0700:$SHIP_USER:$SHIP_GROUP"
+        "/var/lib/attackbox-evidence:0755:root:root"
     )
 
     for entry in "${dirs[@]}"; do
@@ -491,54 +485,6 @@ EOF
     fi
 }
 
-# Resolve New Relic endpoints via DNS
-resolve_nr_endpoints() {
-    # stdout is captured by the caller as the tmpdir path: log to stderr
-    log "Resolving New Relic endpoints..." >&2
-
-    local log_ips_v4=()
-    local log_ips_v6=()
-    local metric_ips_v4=()
-    local metric_ips_v6=()
-
-    # Resolve log API - separate A and AAAA
-    while IFS= read -r ip; do
-        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && log_ips_v4+=("$ip")
-    done < <(dig +short "$NR_LOG_HOST" A | grep -v '\.$')
-
-    while IFS= read -r ip; do
-        [[ "$ip" =~ : ]] && log_ips_v6+=("$ip")
-    done < <(dig +short "$NR_LOG_HOST" AAAA | grep -v '\.$')
-
-    # Resolve metric API - separate A and AAAA
-    while IFS= read -r ip; do
-        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && metric_ips_v4+=("$ip")
-    done < <(dig +short "$NR_METRIC_HOST" A | grep -v '\.$')
-
-    while IFS= read -r ip; do
-        [[ "$ip" =~ : ]] && metric_ips_v6+=("$ip")
-    done < <(dig +short "$NR_METRIC_HOST" AAAA | grep -v '\.$')
-
-    # Require BOTH hosts to resolve
-    if [[ ${#log_ips_v4[@]} -eq 0 ]]; then
-        err "Failed to resolve $NR_LOG_HOST A records"
-        return 1
-    fi
-    if [[ ${#metric_ips_v4[@]} -eq 0 ]]; then
-        err "Failed to resolve $NR_METRIC_HOST A records"
-        return 1
-    fi
-
-    # Use mktemp for temp files
-    # Return tmpdir path for setup_firewall
-    local tmpdir
-    tmpdir=$(mktemp -d)
-    echo "${log_ips_v4[@]}" > "$tmpdir/nr-log-ipv4.txt"
-    echo "${log_ips_v6[@]}" > "$tmpdir/nr-log-ipv6.txt"
-    echo "${metric_ips_v4[@]}" > "$tmpdir/nr-metric-ipv4.txt"
-    echo "${metric_ips_v6[@]}" > "$tmpdir/nr-metric-ipv6.txt"
-    echo "$tmpdir"  # Return tmpdir path
-}
 
 # Host DNS/NTP must match what the nftables output policy allows (Cloudflare
 # only). Install before any firewall loads, or host lookups time out.
@@ -688,94 +634,72 @@ EOF
     ok "Loaded bootstrap firewall (metadata blocking + root registry)"
 }
 
-# Add resolved New Relic IPs (files written by resolve_nr_endpoints) and the
-# shipper UID to the attackbox sets.
-populate_nr_sets() {
-    local tmpdir="$1"
-    local entry set_name file ip
-    local ips=()
 
-    for entry in nr_log_ipv4:nr-log-ipv4 nr_log_ipv6:nr-log-ipv6 \
-                 nr_metric_ipv4:nr-metric-ipv4 nr_metric_ipv6:nr-metric-ipv6; do
-        set_name="${entry%%:*}"
-        file="$tmpdir/${entry##*:}.txt"
-        [[ -f "$file" ]] || continue
-        ips=()
-        read -ra ips < "$file" || true
-        for ip in "${ips[@]}"; do
-            nft add element inet attackbox "$set_name" { "$ip" }
-        done
-    done
+remove_newrelic_migration() {
+	log "Checking for existing New Relic installation..."
+	local removed=()
+	local found=false
 
-    # Populate shipper UID
-    local ship_uid
-    ship_uid=$(id -u "$SHIP_USER")
-    nft add element inet attackbox shipper_uids { "$ship_uid" }
+	if systemctl is-active --quiet newrelic-infra.service 2>/dev/null; then
+		found=true
+		if [[ "$MODE" == "apply" ]]; then
+			systemctl stop newrelic-infra.service || true
+			systemctl disable newrelic-infra.service || true
+			removed+=("stopped and disabled newrelic-infra.service")
+		fi
+	fi
 
-    populate_otlp_sets
-    populate_native_sets runtime
-}
+	if dpkg-query -W -f='${Status}
+' newrelic-infra 2>/dev/null | grep -q 'install ok installed'; then
+		found=true
+		if [[ "$MODE" == "apply" ]]; then
+			apt-get purge -y newrelic-infra || true
+			removed+=("purged newrelic-infra package")
+		fi
+	fi
 
-# Fixed DNS names only; never accept an endpoint or address from a request.
-# Resolve every required host before mutation. An empty/invalid answer fails closed.
-populate_native_sets() {
-    local phase="$1" prefix host family address
-    local hosts=() v4=() v6=()
-    if [[ "$phase" == runtime ]]; then
-        prefix=nr_infra
-        hosts=(infra-api.newrelic.com identity-api.newrelic.com infrastructure-command-api.newrelic.com metric-api.newrelic.com log-api.newrelic.com)
-    elif [[ "$phase" == install ]]; then
-        prefix=nr_install
-        hosts=(download.newrelic.com api.newrelic.com insights-collector.newrelic.com urly.service.newrelic.com d20hasrqv82i0q.cloudfront.net github.com api.github.com raw.githubusercontent.com objects.githubusercontent.com release-assets.githubusercontent.com download.docker.com download.falco.org storage.googleapis.com archive.ubuntu.com security.ubuntu.com)
-    else
-        return 1
-    fi
-    for host in "${hosts[@]}"; do
-        local resolved=0
-        while IFS= read -r address; do
-            [[ "$address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
-            v4+=("$address"); resolved=1
-        done < <(dig +short +time=3 +tries=1 "$host" A)
-        while IFS= read -r address; do
-            [[ "$address" =~ ^[a-fA-F0-9:]+$ && "$address" == *:* ]] || continue
-            v6+=("$address"); resolved=1
-        done < <(dig +short +time=3 +tries=1 "$host" AAAA)
-        [[ $resolved == 1 ]] || { err "Cannot resolve native New Relic endpoint $host"; return 1; }
-    done
-    [[ ${#v4[@]} -le 128 && ${#v6[@]} -le 128 ]] || return 1
-    for family in ipv4 ipv6; do
-        local entries=()
-        if [[ $family == ipv4 ]]; then entries=("${v4[@]}"); else entries=("${v6[@]}"); fi
-        for address in "${entries[@]}"; do
-            nft add element inet attackbox "${prefix}_${family}" "{" "$address" "}"
-        done
-    done
-}
+	local nr_paths=(
+		/etc/newrelic-infra.yml
+		/etc/newrelic-infra
+		/etc/systemd/system/newrelic-infra.service.d
+		/etc/apt/sources.list.d/newrelic-infra.list
+		/etc/apt/trusted.gpg.d/newrelic-infra.gpg
+		/usr/share/keyrings/newrelic-infra.gpg
+		/etc/attackbox/otel-license.key
+		/etc/attackbox-public-otel/license.key
+	)
 
-# Optional profile: leave the collector sets empty until its user exists.
-# No new egress permission is granted to root, bait, or the evidence shipper.
-populate_otlp_sets() {
-    local collector_uid ip
-    local v4=() v6=()
-    collector_uid=$(id -u abx-otel 2>/dev/null) || return 0
-    [[ "$collector_uid" =~ ^[0-9]+$ && "$collector_uid" != 0 ]] || return 1
-    while IFS= read -r ip; do
-        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && v4+=("$ip")
-    done < <(dig +short otlp.nr-data.net A | grep -v '\.$')
-    while IFS= read -r ip; do
-        [[ "$ip" =~ : ]] && v6+=("$ip")
-    done < <(dig +short otlp.nr-data.net AAAA | grep -v '\.$')
-    if [[ ${#v4[@]} -eq 0 || ${#v4[@]} -gt 32 || ${#v6[@]} -gt 32 ]]; then
-        err "OTLP DNS returned no IPv4 addresses or too many addresses"
-        return 1
-    fi
-    for ip in "${v4[@]}"; do
-        nft add element inet attackbox nr_otlp_ipv4 "{" "$ip" "}"
-    done
-    for ip in "${v6[@]}"; do
-        nft add element inet attackbox nr_otlp_ipv6 "{" "$ip" "}"
-    done
-    nft add element inet attackbox collector_uids "{" "$collector_uid" "}"
+	for path in "${nr_paths[@]}"; do
+		if [[ -e "$path" || -L "$path" ]]; then
+			found=true
+			if [[ "$MODE" == "apply" ]]; then
+				rm -rf "$path"
+				removed+=("removed $path")
+			fi
+		fi
+	done
+
+	if [[ -f /etc/attackbox/shipper.env ]]; then
+		if grep -qE '^(export[[:space:]]+)?ATTACKBOX_NR_LICENSE_KEY=' /etc/attackbox/shipper.env; then
+			found=true
+			if [[ "$MODE" == "apply" ]]; then
+				local tmp
+				tmp=$(mktemp)
+				grep -vE '^(export[[:space:]]+)?ATTACKBOX_NR_LICENSE_KEY=' /etc/attackbox/shipper.env > "$tmp"
+				cat "$tmp" > /etc/attackbox/shipper.env
+				rm "$tmp"
+				removed+=("removed ATTACKBOX_NR_LICENSE_KEY from /etc/attackbox/shipper.env")
+			fi
+		fi
+	fi
+
+	if [[ "$found" == true ]]; then
+		if [[ "$MODE" == "apply" ]]; then
+			ok "Removed New Relic: ${removed[*]}"
+		else
+			warn "Would remove New Relic installation"
+		fi
+	fi
 }
 
 setup_firewall() {
@@ -789,10 +713,6 @@ setup_firewall() {
     fi
 
     if [[ "$MODE" == "apply" ]]; then
-        # Resolve NR endpoints first and capture tmpdir
-        local tmpdir
-        tmpdir=$(resolve_nr_endpoints)
-
         # Save current ruleset for ERR trap. "nft list ruleset" output only
         # adds, so the restore must flush first or it collides with live rules.
         local backup
@@ -817,8 +737,10 @@ setup_firewall() {
         resolve_ubuntu_mirrors
 
 
-        # Populate NR endpoint sets and shipper UID
-        populate_nr_sets "$tmpdir"
+        # Populate shipper UID
+        local ship_uid
+        ship_uid=$(id -u "$SHIP_USER")
+        nft add element inet attackbox shipper_uids { "$ship_uid" }
 
         # Persist across reboot: nftables.service loads /etc/nftables.conf. The
         # sets come back empty, attackbox-nft-refresh.timer repopulates them.
@@ -831,8 +753,7 @@ setup_firewall() {
 
         # Clear trap and cleanup on success
         trap - ERR
-        rm -f "$backup" "$tmpdir"/*.txt
-        rmdir "$tmpdir"
+        rm -f "$backup"
 
         systemctl enable nftables
 
@@ -1078,7 +999,7 @@ check_shipper_env() {
 
     if [[ ! -f "$env_file" ]]; then
         err "Missing $env_file"
-        err "Create with root:root 0600 containing ATTACKBOX_NR_* variables"
+        err "Create with root:root 0600 containing campaign/host/instance IDs"
         return 1
     fi
 
@@ -1175,7 +1096,7 @@ start_services() {
     systemctl restart attackbox-egress-adapter
     ok "Started attackbox-egress-adapter"
 
-    # Keep nftables NR/Ubuntu sets fresh (they are empty after a reboot)
+    # Keep nftables Ubuntu mirror sets fresh (they are empty after a reboot)
     systemctl enable --now attackbox-nft-refresh.timer
     ok "Enabled attackbox-nft-refresh.timer"
 }
@@ -1276,21 +1197,19 @@ resolve_ubuntu_mirrors() {
 # Re-resolve endpoints into the live sets (timer entry point). Sets are
 # additive: stale IPs stay until the next boot or reload of /etc/nftables.conf.
 refresh_endpoint_sets() {
-    log "Refreshing nftables endpoint sets..."
+	log "Refreshing nftables endpoint sets..."
 
-    if ! nft list table inet attackbox >/dev/null 2>&1; then
-        err "nftables table inet attackbox not loaded"
-        return 1
-    fi
+	if ! nft list table inet attackbox >/dev/null 2>&1; then
+		err "nftables table inet attackbox not loaded"
+		return 1
+	fi
 
-    local tmpdir
-    tmpdir=$(resolve_nr_endpoints)
-    populate_nr_sets "$tmpdir"
-    rm -f "$tmpdir"/*.txt
-    rmdir "$tmpdir"
+	local ship_uid
+	ship_uid=$(id -u "$SHIP_USER")
+	nft add element inet attackbox shipper_uids { "$ship_uid" }
 
-    resolve_ubuntu_mirrors
-    ok "Endpoint sets refreshed"
+	resolve_ubuntu_mirrors
+	ok "Endpoint sets refreshed"
 }
 
 # Build and pre-pull bait before firewall
@@ -1463,56 +1382,15 @@ run_verification_enhanced() {
         return 1
     fi
 
-    # Test Internet blocked
-    log "Testing Internet blocking from container..."
-    if ! docker run --rm --runtime=runsc --network "$network" "$test_img" timeout 2 wget -O- https://example.com >/dev/null 2>&1; then
-        ok "Internet blocked from container"
-    else
-        err "Internet NOT blocked - required check failed"
-        return 1
-    fi
-
-    # Test exact NR HTTPS endpoints as shipper UID with curl
-    log "Testing New Relic HTTPS endpoints as shipper UID..."
-    local nr_ok=0
-
-    # Test log-api.newrelic.com/log/v1
-    local log_url="https://${NR_LOG_HOST}/log/v1"
-    if sudo -u "$SHIP_USER" timeout 5 curl -s -o /dev/null -w "%{http_code}" "$log_url" 2>/dev/null | grep -qE '^[0-9]{3}$'; then
-        ok "NR log endpoint reachable"
-        nr_ok=$((nr_ok + 1))
-    fi
-
-    # Test metric-api.newrelic.com/metric/v1
-    local metric_url="https://${NR_METRIC_HOST}/metric/v1"
-    if sudo -u "$SHIP_USER" timeout 5 curl -s -o /dev/null -w "%{http_code}" "$metric_url" 2>/dev/null | grep -qE '^[0-9]{3}$'; then
-        ok "NR metric endpoint reachable"
-        nr_ok=$((nr_ok + 1))
-    fi
-
-    if [[ $nr_ok -eq 2 ]]; then
-        ok "Both NR endpoints reachable"
-    else
-        err "Not all NR endpoints reachable - required check failed"
-        return 1
-    fi
-
-    ok "All verification checks passed"
 }
 # Main execution
 main() {
     log "Attack-box Ubuntu deployment"
-    log "Mode: $MODE"
 
     check_root
 
     if [[ "$MODE" == "refresh" ]]; then
         refresh_endpoint_sets
-        exit $?
-    fi
-
-    if [[ "$MODE" == "refresh-install" ]]; then
-        populate_native_sets install
         exit $?
     fi
 
@@ -1522,16 +1400,6 @@ main() {
     if [[ "$MODE" == "verify" ]]; then
         run_verification_enhanced
         exit $?
-    fi
-
-    local native_api_key="${NEW_RELIC_API_KEY:-}"
-    unset NEW_RELIC_API_KEY
-    if [[ "$NATIVE_KEY_STDIN" == true ]]; then
-        [[ "$MODE" == apply ]] || { err "--native-key-stdin requires --apply"; exit 1; }
-        IFS= read -r native_api_key || { err "Missing native provisioning API key on stdin"; exit 1; }
-    fi
-    if [[ "$MODE" == apply ]] && ! systemctl is-active --quiet newrelic-infra.service; then
-        [[ "$native_api_key" =~ ^NRAK-[A-Za-z0-9_-]{20,200}$ ]] || { err "Native Infrastructure bootstrap requires a User API key; use --native-key-stdin"; exit 1; }
     fi
 
     setup_users
@@ -1544,7 +1412,7 @@ main() {
     bootstrap_firewall
     start_docker
     prepare_bait
-    if [[ "$MODE" != apply ]]; then bash "${SCRIPT_DIR}/bootstrap-infrastructure.sh" --dry-run; fi
+    remove_newrelic_migration
     setup_firewall
     disable_cloud_init
     setup_sysctl
@@ -1561,8 +1429,6 @@ main() {
         # Report a failure after the private checks; do not stop them.
         local public_gateway=ok
         restore_public_gateway || public_gateway=failed
-        printf '%s\n' "$native_api_key" | bash "${SCRIPT_DIR}/bootstrap-infrastructure.sh" --apply
-        unset native_api_key
         run_verification_enhanced
         [[ "$public_gateway" == ok ]] || { err "Private stack verified, but the public gateway is down: systemctl start attackbox-public.service"; exit 1; }
         disable_ssh
@@ -1570,7 +1436,6 @@ main() {
         echo ""
         ok "Deployment complete"
         warn "Services started:"
-        warn "  - Native New Relic Infrastructure"
         warn "  - Docker (with gVisor runtime)"
         warn "  - attackbox-shipper (with socket)"
         warn "  - attackbox-bait (with proxy)"
@@ -1578,7 +1443,7 @@ main() {
         warn "  - attackbox-falco-adapter"
         warn "  - attackbox-egress-adapter"
         warn ""
-        warn "Run with --verify to test metadata blocking, DNS, and NR endpoints"
+        warn "Run with --verify to test metadata blocking and DNS"
     else
         echo ""
         ok "Preflight check complete (no changes made)"

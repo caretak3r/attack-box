@@ -1,8 +1,0 @@
-{
-  "accountId": 0,
-  "rules": [
-    {"targetDataPartition": "Log_AttackEvidence", "description": "AttackBox request, response, transcript and probe evidence; trusted shipper envelope", "nrql": "sensor_id = 'srv-000000' AND `service.name` = 'attackbox' AND source = 'bait' AND stream IN ('edge', 'transcript', 'probe')", "retentionPolicy": "STANDARD", "enabled": false},
-    {"targetDataPartition": "Log_Security", "description": "AttackBox runtime and egress evidence plus native Linux audit records", "nrql": "sensor_id = 'srv-000000' AND ((`service.name` = 'attackbox' AND stream IN ('runtime', 'egress')) OR logtype = 'linux_audit')", "retentionPolicy": "STANDARD", "enabled": false},
-    {"targetDataPartition": "Log_Operations", "description": "AttackBox producer heartbeats and native host operational files", "nrql": "sensor_id = 'srv-000000' AND ((`service.name` = 'attackbox' AND stream = 'heartbeat') OR (collection_route = 'native-infrastructure' AND (logtype IS NULL OR logtype != 'linux_audit')))", "retentionPolicy": "STANDARD", "enabled": false}
-  ]
-}

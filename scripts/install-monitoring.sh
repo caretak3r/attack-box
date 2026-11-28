@@ -58,11 +58,6 @@ if [[ $mode == --apply ]]; then
   getent group abx-bait >/dev/null || fail 'base deployment abx-bait group missing'
   getent group abx-ship >/dev/null || fail 'base deployment abx-ship group missing'
   [[ -x /usr/local/sbin/attackbox-deploy ]] || fail 'base deployment refresh helper missing'
-  # Require the parent deployment firewall update, but never apply a new ruleset here.
-  for set_name in nr_otlp_ipv4 nr_otlp_ipv6 collector_uids; do
-    nft list set inet attackbox "$set_name" >/dev/null || fail "firewall set $set_name missing"
-  done
-  nft list table inet attackbox | python3 -c 'import sys; s=sys.stdin.read(); sys.exit(0 if "meta skuid @collector_uids" in s and "@nr_otlp_ipv4" in s and "tcp dport 443" in s else 1)' || fail 'Collector UID-scoped HTTPS egress rule missing'
 fi
 stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT
@@ -84,7 +79,6 @@ PY
 tar -xzf "$archive" -C "$stage" otelcol-contrib
 "$stage/otelcol-contrib" --version | python3 -c 'import sys; assert sys.stdin.read().strip() == "otelcol-contrib version " + sys.argv[1]' "$OTELCOL_VERSION"
 mkdir "$stage/credentials"
-printf '%s' validation-only > "$stage/credentials/newrelic_license_key"
 # --check does not read live keys, require root, write /etc, or start services.
 env ATTACKBOX_HOST_ID=validation ATTACKBOX_HOST_NAME=validation \
   ATTACKBOX_CAMPAIGN_ID=validation ATTACKBOX_BAIT_INSTANCE_ID=validation-bait \
@@ -97,13 +91,10 @@ if [[ $mode == --check ]]; then
   exit 0
 fi
 # Validate trusted values without sourcing shell code. License is never printed.
-python3 "$repo_root/deploy/otel/prepare-env.py" /etc/attackbox/monitoring.env /etc/attackbox/otel-license.key "$stage/shipper-monitoring.env"
 getent group abx-otel >/dev/null || groupadd --system abx-otel
 getent passwd abx-otel >/dev/null || useradd --system --gid abx-otel --home-dir /nonexistent --shell /usr/sbin/nologin abx-otel
-# Existing root-owned helper updates only destination and UID sets.
+# Existing root-owned helper refreshes the Ubuntu destination and UID sets.
 /usr/local/sbin/attackbox-deploy --refresh-sets
-collector_uid=$(id -u abx-otel)
-nft get element inet attackbox collector_uids "{ $collector_uid }" >/dev/null || fail 'Collector UID not permitted by refreshed firewall'
 install -d -m 0755 /usr/local/libexec /etc/attackbox/otel /etc/attackbox-otel /etc/systemd/system/attackbox-shipper.service.d
 install -d -o root -g root -m 0755 /run/attackbox-otel
 install -m 0755 "$stage/otelcol-contrib" /usr/local/bin/attackbox-otel
@@ -131,7 +122,7 @@ systemctl restart attackbox-otel.service
 systemctl is-active --quiet attackbox-otel.service
 curl --fail --silent --show-error --max-time 5 http://127.0.0.1:9465/metrics >/dev/null
 curl --fail --silent --show-error --max-time 5 http://127.0.0.1:13133/ >/dev/null
-printf '%s\n' 'Collector process healthy. Export and New Relic ingestion remain unverified.' \
+printf '%s\n' 'Collector process healthy. Export remains unverified.' \
   'Shipper drop-in installed; restart shipper separately. Bait overlay not applied.'
 
 if [[ -n $log_budget_binaries ]]; then bash "$repo_root/scripts/install-log-budget.sh" --apply "$log_budget_binaries"; fi

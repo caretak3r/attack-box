@@ -52,8 +52,7 @@ printf 'Checking commit %s\n' "$commit"
     cd -- "$run/source"
     # Permission tests need group-readable fixture modes to survive file creation.
     umask 022
-    unset ATTACKBOX_NR_LICENSE_KEY NEW_RELIC_LICENSE_KEY NEW_RELIC_API_KEY VULTR_API_KEY
-    export ATTACKBOX_NR_DISABLED=true
+	unset VULTR_API_KEY
     bash scripts/verify.sh
 )
 [[ $mode == release-check ]] || exit 0

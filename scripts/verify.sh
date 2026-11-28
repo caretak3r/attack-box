@@ -212,10 +212,6 @@ fi
 
 echo
 info "Deployment validation"
-if require_or_skip "native bootstrap tests" "command -v bats >/dev/null && [[ -f scripts/test-bootstrap-infrastructure.bats ]]" "install Bats and include the native bootstrap tests"; then
-	check "native bootstrap tests" bats scripts/test-bootstrap-infrastructure.bats
-	check "native agent configuration tests" python3 -B -m unittest discover -s deploy/newrelic -p 'test_*.py'
-fi
 if require_or_skip "deployment scripts" "[[ -f scripts/deploy-ubuntu.sh && -f scripts/test-deploy-ubuntu.sh ]]" "scripts/deploy-ubuntu.sh or test-deploy-ubuntu.sh not implemented"; then
 	check "deploy-ubuntu.sh syntax" bash -n scripts/deploy-ubuntu.sh
 	check "test-deploy-ubuntu.sh syntax" bash -n scripts/test-deploy-ubuntu.sh
@@ -265,13 +261,6 @@ if [[ $PARTIAL == false ]]; then
 	fi
 	if require_or_skip "architecture docs" "[[ -f docs/architecture.md ]]" "docs/architecture.md not present"; then
 		check "docs/architecture.md exists" test -f docs/architecture.md
-	fi
-	if require_or_skip "New Relic runbook" "[[ -f docs/newrelic-runbook.md ]]" "docs/newrelic-runbook.md not present"; then
-		check "docs/newrelic-runbook.md exists" test -f docs/newrelic-runbook.md
-	fi
-	if require_or_skip "New Relic artifacts" "[[ -d newrelic && -n \$(find newrelic -type f 2>/dev/null) ]]" "newrelic/ dashboard/alert artifacts not present"; then
-		artifact_count=$(find newrelic -type f 2>/dev/null | wc -l | tr -d ' ')
-		pass "New Relic artifacts: $artifact_count files in newrelic/"
 	fi
 fi
 

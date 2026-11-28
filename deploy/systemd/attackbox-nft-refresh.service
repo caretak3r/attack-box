@@ -7,7 +7,7 @@ Requires=nftables.service
 
 [Service]
 Type=oneshot
-# Re-resolve New Relic and Ubuntu mirror IPs and repopulate shipper_uids.
+# Re-resolve Ubuntu mirror IPs and repopulate shipper_uids.
 # /etc/nftables.conf restores the table with empty sets at boot.
 ExecStart=/usr/local/sbin/attackbox-deploy --refresh-sets
 TimeoutStartSec=60s
