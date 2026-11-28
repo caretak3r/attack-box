@@ -7,13 +7,20 @@ One TCP peer sent 43 requests to the simulated Ollama listener on port 11434 on 
 Each `P` number identifies one distinct prompt text, in order of first appearance. For generation, it represents the `prompt` field. For chat, it represents the **last user message**, not the system message or the entire conversation. Reusing an ID means the decoded text was identical, including case and whitespace. All 33 bodies parsed as JSON; none had the capture truncation flag. Times below are UTC and come from the host capture.
 
 ```mermaid
-flowchart TD
-  A[Nov 26: list models and check version] --> B[Same poem-related prompt on three models]
-  B --> C[Nearly 16 hours without a recorded request]
-  C --> D[Nov 27: one coding-language prompt on Llama]
-  D --> E[DeepSeek: greeting, then the same follow-up six times]
-  E --> F["Switch between Llama and DeepSeek; reuse a short command-related prompt"]
-  F --> G[Send longer chat contexts and fenced-text follow-ups]
+sequenceDiagram
+  accTitle: The Ollama peer's 43 requests
+  accDescr: The peer first asked for tags and version, then tried one prompt on three models. The next day it submitted histories and tool definitions. All responses were synthetic HTTP 200.
+  participant P as Peer A
+  participant O as Ollama listener on 11434
+  P->>O: GET /api/tags and GET /api/version
+  P->>O: 3 POST /api/generate · same 47-character P1
+  O-->>P: HTTP 200 for each model selection
+  Note over P,O: Nearly 16 hours between bursts
+  P->>O: POST /api/chat · 100-character P2
+  P->>O: 8 more GET /api/tags and 29 more POST /api/chat
+  Note over P,O: Five final user messages said hi in different histories
+  Note over P,O: 14 chats supplied one tool definition each
+  O-->>P: HTTP 200 · no model or tool execution
 ```
 
 | Capture time | Model | Last user prompt in request order | Evidence |
@@ -36,6 +43,8 @@ The [publication-ready prompt file](https://github.com/caretak3r/attack-box/blob
 All 43 request targets were origin-form paths with **no query string**. All used HTTP/1.1 and addressed the decoy by its IPv4 literal and port 11434 in `Host`, not by a product hostname. `Host` is the destination supplied by the client, not the source. The source is one anonymized TCP peer. No request had an `Authorization`, `X-API-Key`, or `Cookie` header.
 
 The first six requests had `aiohttp` in the user-agent. The remaining 37 identified as Python Requests and added `Connection: keep-alive`. Both profiles sent `Accept: */*`, a `User-Agent`, and `Accept-Encoding` advertising gzip, deflate, and zstd. POSTs added `Content-Type: application/json` and `Content-Length`; GETs sent neither. These are client claims, not proof of the program or OS behind the address.
+
+[Inspect all 43 requests on the site](https://silent.engineer/attack-box/findings/ollama-prompt-journey/#request-details) · [Download the redacted request data](https://github.com/caretak3r/attack-box/blob/main/findings/2026-11-27/ollama-prompt-journey.requests.json).
 
 ## Request ledger: all 43 requests
 
